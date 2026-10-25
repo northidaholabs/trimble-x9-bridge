@@ -74,6 +74,25 @@ const SURFACE_BAD_MM: f64 = 20.0;
 /// this much before it disagrees (pairs that count are left within 10 mm).
 const REFIT_BAD_MM: f64 = 15.0;
 const REFIT_BAD_DEG: f64 = 0.08;
+/// When judging whether other pairs back a join (not a station's own
+/// votes), the millimetre limits grow with the distance between the two
+/// stations: a turn the angle limit allows moves a station that far away by
+/// its lever arm (0.08° is 1.4 mm per metre). On the admin building, good
+/// pairs 22-38 m apart read 25-36 mm with turns under 0.05°. Surfaces get
+/// half the slope. A station's own votes keep the fixed limits: with the
+/// wider ones, 3 cm planted errors went uncaught (bench, 2026-10-24).
+const REFIT_BAD_PER_M: f64 = REFIT_BAD_DEG * std::f64::consts::PI / 180.0 * 1000.0;
+const SURFACE_BAD_PER_M: f64 = REFIT_BAD_PER_M / 2.0;
+
+/// The most a fresh fit may move a station `apart_m` from its neighbour (mm).
+fn refit_limit_mm(apart_m: f64) -> f64 {
+    REFIT_BAD_MM + REFIT_BAD_PER_M * apart_m
+}
+
+/// The most a station's surfaces may sit off a neighbour's `apart_m` away (mm).
+fn surface_limit_mm(apart_m: f64) -> f64 {
+    SURFACE_BAD_MM + SURFACE_BAD_PER_M * apart_m
+}
 /// Coarse: on grass a far station reads the ground a few centimetres high.
 const GROUND_BAD_M: f64 = 0.10;
 /// Direction bins of a station's depth map (0.5°).
@@ -1361,8 +1380,9 @@ pub struct Audit {
     /// `confirmed`: tied by two or more pairs that count, and no independent
     /// check disagrees; `single`: one such tie; `frame`: the only station;
     /// `doubtful`: an independent check disagrees with most of its
-    /// neighbours; `grouped`: tied to stations in a separate group, not yet to
-    /// the main one; `ambiguous`: only rival fits; `unplaced`.
+    /// neighbours, or it is tied only to stations in doubt; `grouped`: tied
+    /// to stations in a separate group, not yet to the main one, or in a
+    /// block joined to the main one by one pair only; `ambiguous`: only rival fits; `unplaced`.
     pub verdict: String,
     /// The stations its counting pairs tie it to (scan ids).
     pub ties: Vec<String>,
@@ -1454,7 +1474,7 @@ pub fn audit(ids: &[String], names: &[String], prep: &[&Prepared], poses: &[Opti
         let at = |q: f64| ((v[((v.len() - 1) as f64 * q) as usize] as f64) * 10_000.0).round() / 10.0;
         Some([at(0.5), at(0.9)])
     };
-    (0..n)
+    let mut out: Vec<Audit> = (0..n)
         .map(|k| {
             let mut a = Audit::default();
             if poses[k].is_none() {
@@ -1547,7 +1567,235 @@ pub fn audit(ids: &[String], names: &[String], prep: &[&Prepared], poses: &[Opti
             .into();
             a
         })
-        .collect()
+        .collect();
+    let evidence: Evidence = jobs
+        .iter()
+        .zip(&checks)
+        .filter_map(|(&(i, j), c)| {
+            let rel = rel_of(i, j);
+            pair_evidence(c, rel[1].hypot(rel[2])).map(|ok| ((i, j), ok))
+        })
+        .collect();
+    settle(ids, names, &mut out, &evidence);
+    out
+}
+
+/// Verdicts that depend on the whole tie graph, not one station's checks.
+///
+/// A block of stations tied among themselves vouches for itself: each has
+/// two or more ties and its neighbours agree with it, because they moved
+/// with it. So:
+///
+/// 1. **A block joined to the rest by one tie only** (a bridge in the tie
+///    graph, with two or more stations on each side) is `grouped`, unless
+///    other station pairs across the join back it up (`JOIN_BACKING`): a
+///    wrong tie between repeated facades moves the whole block where it
+///    overlaps nothing. The side whose own checks hold up is kept (more
+///    stations trusted before this pass, then the larger side).
+/// 2. **Ties only count to trusted stations.** A station is `confirmed` with
+///    two or more ties to trusted stations, `single` with one, and
+///    `doubtful` with none.
+/// 3. **Trusted stations hang together.** Trusted stations that reach the
+///    largest trusted block only through stations in doubt are `doubtful`,
+///    unless pairs between the two blocks back them up the same way.
+///
+/// 2 and 3 repeat until nothing changes.
+/// What the audit's checks say about a pair of stations under their current
+/// poses, keyed by (lower, higher) index: `true` when there is geometric
+/// evidence (a firm refit or a surface comparison) and no check disagrees,
+/// `false` when a check disagrees. Pairs with no evidence are left out.
+type Evidence = HashMap<(usize, usize), bool>;
+
+fn pair_evidence(c: &PairChecks, apart_m: f64) -> Option<bool> {
+    let surface_mm = (c.gaps.len() >= 300).then(|| {
+        let mut g = c.gaps.clone();
+        g.sort_by(|x, y| x.total_cmp(y));
+        g[g.len() / 2] as f64 * 1000.0
+    });
+    let bad = c.refit.is_some_and(|[mm, deg]| mm > refit_limit_mm(apart_m) || deg > REFIT_BAD_DEG)
+        || c.free_space.is_some_and(|f| f > FREE_SPACE_BAD)
+        || surface_mm.is_some_and(|mm| mm > surface_limit_mm(apart_m))
+        || c.ground.is_some_and(|d| d.abs() > GROUND_BAD_M);
+    if bad {
+        Some(false)
+    } else if c.refit.is_some() || surface_mm.is_some() {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// A join between two sets of stations counts as checked when at least this
+/// many pairs across it, other than the tie that makes it, agree, and they
+/// outnumber those that disagree (a strict majority, as in the audit's own
+/// votes: far pairs sometimes read just over a limit). A wrong join between
+/// repeated facades puts the two sides where they overlap nothing, so no
+/// pair across it has evidence.
+const JOIN_BACKING: usize = 2;
+
+fn settle(ids: &[String], names: &[String], audits: &mut [Audit], evidence: &Evidence) {
+    let n = audits.len();
+    let index: HashMap<&str, usize> = ids.iter().enumerate().map(|(k, s)| (s.as_str(), k)).collect();
+    let placed = |a: &Audit| matches!(a.verdict.as_str(), "confirmed" | "single" | "doubtful" | "frame");
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for (k, a) in audits.iter().enumerate() {
+        if !placed(a) {
+            continue;
+        }
+        for o in &a.ties {
+            if let Some(&j) = index.get(o.as_str()) {
+                if j > k && placed(&audits[j]) {
+                    edges.push((k, j));
+                }
+            }
+        }
+    }
+    // Stations reached from `from` without crossing edge `skip`.
+    let reach = |from: usize, skip: Option<usize>| -> Vec<bool> {
+        let mut seen = vec![false; n];
+        let mut stack = vec![from];
+        seen[from] = true;
+        while let Some(u) = stack.pop() {
+            for (e, &(a, b)) in edges.iter().enumerate() {
+                if Some(e) == skip {
+                    continue;
+                }
+                let v = if a == u { b } else if b == u { a } else { continue };
+                if !seen[v] {
+                    seen[v] = true;
+                    stack.push(v);
+                }
+            }
+        }
+        seen
+    };
+    let label = |ks: &[usize]| ks.iter().map(|&k| names[k].clone()).collect::<Vec<_>>().join(", ");
+    // Pairs across a join (one side to the other) that agree and disagree,
+    // leaving out the tie `skip` that makes the join.
+    let backing = |xs: &[usize], ys: &[usize], skip: Option<(usize, usize)>| -> (usize, usize) {
+        let (mut agree, mut disagree) = (0, 0);
+        for &x in xs {
+            for &y in ys {
+                let key = (x.min(y), x.max(y));
+                if Some(key) == skip {
+                    continue;
+                }
+                match evidence.get(&key) {
+                    Some(true) => agree += 1,
+                    Some(false) => disagree += 1,
+                    None => {}
+                }
+            }
+        }
+        (agree, disagree)
+    };
+    let backed = |(agree, disagree): (usize, usize)| agree >= JOIN_BACKING && agree > disagree;
+    // Which side of a join to keep: the one whose own checks hold up (more
+    // trusted stations before this pass), then the larger, then the one
+    // holding the lowest station.
+    let pre: Vec<bool> = audits.iter().map(Audit::trusted).collect();
+    let standing = |s: &[usize]| (s.iter().filter(|&&k| pre[k]).count(), s.len(), std::cmp::Reverse(s.iter().min().copied()));
+    let mut weak = vec![false; n];
+    for (e, &(a, b)) in edges.iter().enumerate() {
+        let whole = reach(a, None);
+        let side_a = reach(a, Some(e));
+        if side_a[b] {
+            continue; // another path: not a bridge
+        }
+        let sa: Vec<usize> = (0..n).filter(|&k| side_a[k]).collect();
+        let sb: Vec<usize> = (0..n).filter(|&k| whole[k] && !side_a[k]).collect();
+        if sa.len() < 2 || sb.len() < 2 {
+            continue; // a lone station on one pair is `single`, checked by the audit
+        }
+        let (small, big) = if standing(&sa) < standing(&sb) { (sa, sb) } else { (sb, sa) };
+        let (inner, outer) = if small.contains(&a) { (a, b) } else { (b, a) };
+        let across = backing(&small, &big, Some((a.min(b), a.max(b))));
+        if backed(across) {
+            continue; // other overlapping stations agree with the join
+        }
+        let check = match across {
+            (0, 0) => "no other pair across it has evidence".to_string(),
+            (ag, d) => format!("of the other pairs across it {ag} agree and {d} disagree"),
+        };
+        for &k in &small {
+            if weak[k] {
+                continue;
+            }
+            weak[k] = true;
+            audits[k].verdict = "grouped".into();
+            audits[k].reasons.push(format!(
+                "its block (stations {}) joins the other {} stations by one tie only ({}–{}), and {check}; a station overlapping both sides is needed",
+                label(&small), big.len(), names[inner], names[outer]
+            ));
+        }
+    }
+    // Ties count only to trusted stations.
+    loop {
+        let trusted: Vec<bool> = audits.iter().map(Audit::trusted).collect();
+        let mut changed = false;
+        for a in audits.iter_mut() {
+            if !matches!(a.verdict.as_str(), "confirmed" | "single") {
+                continue;
+            }
+            let good = a.ties.iter().filter(|o| index.get(o.as_str()).is_some_and(|&j| trusted[j])).count();
+            let v = match good {
+                0 => "doubtful",
+                1 => "single",
+                _ => "confirmed",
+            };
+            if v != a.verdict {
+                if v == "doubtful" {
+                    let doubted: Vec<usize> = a.ties.iter().filter_map(|o| index.get(o.as_str()).copied()).collect();
+                    a.reasons.push(format!("it is tied only to stations that are themselves in doubt ({})", label(&doubted)));
+                }
+                a.verdict = v.into();
+                changed = true;
+            }
+        }
+        // Blocks of trusted stations, through trusted ties only.
+        let trusted: Vec<bool> = audits.iter().map(Audit::trusted).collect();
+        let mut block = vec![usize::MAX; n];
+        let mut sizes: Vec<usize> = Vec::new();
+        for s in 0..n {
+            if !trusted[s] || block[s] != usize::MAX {
+                continue;
+            }
+            let id = sizes.len();
+            let (mut stack, mut size) = (vec![s], 0);
+            block[s] = id;
+            while let Some(u) = stack.pop() {
+                size += 1;
+                for &(a, b) in &edges {
+                    let v = if a == u { b } else if b == u { a } else { continue };
+                    if trusted[v] && block[v] == usize::MAX {
+                        block[v] = id;
+                        stack.push(v);
+                    }
+                }
+            }
+            sizes.push(size);
+        }
+        // The largest block (on a tie, the one found first: the lowest station).
+        if let Some(main) = (0..sizes.len()).max_by(|&x, &y| sizes[x].cmp(&sizes[y]).then(y.cmp(&x))) {
+            let members = |b: usize| (0..n).filter(|&k| block[k] == b).collect::<Vec<_>>();
+            let main_members = members(main);
+            let held: Vec<bool> = (0..sizes.len()).map(|b| b == main || backed(backing(&members(b), &main_members, None))).collect();
+            for k in 0..n {
+                if trusted[k] && !held[block[k]] {
+                    // The stations in doubt this block hangs on.
+                    let via: Vec<usize> = (0..n)
+                        .filter(|&j| !trusted[j] && edges.iter().any(|&(x, y)| (x == j && block[y] == block[k]) || (y == j && block[x] == block[k])))
+                        .collect();
+                    audits[k].verdict = "doubtful".into();
+                    audits[k].reasons.push(format!("it reaches the other trusted stations only through stations in doubt ({})", label(&via)));
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 // -------------------------------------------------------------- the record ---
@@ -2242,8 +2490,28 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     }
     let t = std::time::Instant::now();
     let refs: Vec<&Prepared> = prep.iter().collect();
-    let audits = audit(&ids, &ids, &refs, &poses, &pairs, &mut AuditCache::new());
+    let mut cache = AuditCache::new();
+    let audits = audit(&ids, &ids, &refs, &poses, &pairs, &mut cache);
     eprintln!("audit in {:.1} s", t.elapsed().as_secs_f64());
+    // Every pair the audit checked, with how far apart the two stations are:
+    // the evidence behind each verdict, for tuning the checks.
+    let mut checked: Vec<Value> = cache
+        .iter()
+        .map(|((a, b), (rel, c))| {
+            let mut g = c.gaps.clone();
+            g.sort_by(|x, y| x.total_cmp(y));
+            json!({
+                "a": a, "b": b,
+                "apart_m": (rel[1].hypot(rel[2]) * 100.0).round() / 100.0,
+                "refit": c.refit,
+                "surface_mm": (g.len() >= 300).then(|| (g[g.len() / 2] as f64 * 10_000.0).round() / 10.0),
+                "surface_points": g.len(),
+                "free_space": c.free_space,
+                "ground_mm": c.ground.map(|d| (d * 1000.0).round()),
+            })
+        })
+        .collect();
+    checked.sort_by(|x, y| x["apart_m"].as_f64().unwrap_or(0.0).total_cmp(&y["apart_m"].as_f64().unwrap_or(0.0)));
     for (k, a) in audits.iter().enumerate() {
         let off = truth.as_ref().and_then(|tr| Some((tr.get(k)?.as_ref()?, poses[k].as_ref()?))).map(|(t, p)| {
             let mm = ((t.xyz_m[0] - p.xyz_m[0]).powi(2) + (t.xyz_m[1] - p.xyz_m[1]).powi(2) + (t.xyz_m[2] - p.xyz_m[2]).powi(2)).sqrt() * 1000.0;
@@ -2269,6 +2537,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     std::fs::write(format!("{out}/poses.json"), serde_json::to_vec_pretty(&poses)?)?;
     std::fs::write(format!("{out}/pairs.json"), serde_json::to_vec_pretty(&pairs)?)?;
     std::fs::write(format!("{out}/audit.json"), serde_json::to_vec_pretty(&audits)?)?;
+    std::fs::write(format!("{out}/checks.json"), serde_json::to_vec_pretty(&checked)?)?;
     std::fs::write(format!("{out}/walls.json"), serde_json::to_vec_pretty(&ws)?)?;
     std::fs::write(format!("{out}/plan.png"), plan_png(&merged, &PlanMarks { stations: &stations, walls: &ws, faces: vec![] }))?;
     let map = crate::minimap::Minimap {
@@ -2312,6 +2581,186 @@ mod tests {
     fn smallest_eigenvector_of_a_flat_patch_is_its_normal() {
         let (v, curv) = smallest_eigen([[4.0, 0.0, 0.0], [0.0, 0.01, 0.0], [0.0, 0.0, 3.0]]);
         assert!(v[1].abs() > 0.999 && curv < 0.01);
+    }
+
+    /// Audits from (station, verdict, ties) as the per-station checks left them.
+    fn audits(rows: &[(&str, &str, &[&str])]) -> (Vec<String>, Vec<Audit>) {
+        let ids = rows.iter().map(|r| r.0.to_string()).collect();
+        let a = rows
+            .iter()
+            .map(|r| Audit { verdict: r.1.into(), ties: r.2.iter().map(|s| s.to_string()).collect(), ..Default::default() })
+            .collect();
+        (ids, a)
+    }
+
+    fn verdicts(a: &[Audit]) -> Vec<&str> {
+        a.iter().map(|a| a.verdict.as_str()).collect()
+    }
+
+    #[test]
+    fn a_block_joined_by_one_pair_is_not_confirmed() {
+        // 1-2-3-4 tied in a ring; 5 and 6 tied to each other and to the ring
+        // through 4-5 only; 7 hangs off 1 alone.
+        let (ids, mut a) = audits(&[
+            ("1", "confirmed", &["2", "4", "7"]),
+            ("2", "confirmed", &["1", "3"]),
+            ("3", "confirmed", &["2", "4"]),
+            ("4", "confirmed", &["3", "1", "5"]),
+            ("5", "confirmed", &["4", "6"]),
+            ("6", "single", &["5"]),
+            ("7", "single", &["1"]),
+        ]);
+        settle(&ids, &ids, &mut a, &Evidence::new());
+        assert_eq!(verdicts(&a), ["confirmed", "confirmed", "confirmed", "confirmed", "grouped", "grouped", "single"]);
+        assert!(a[4].reasons[0].contains("stations 5, 6") && a[4].reasons[0].contains("(5–4)"), "{:?}", a[4].reasons);
+    }
+
+    #[test]
+    fn the_smaller_side_is_marked_even_when_it_holds_the_frame() {
+        // Station 1 (the frame) and 2 form the small side; 3, 4, 5 the big one.
+        let (ids, mut a) = audits(&[
+            ("1", "single", &["2"]),
+            ("2", "confirmed", &["1", "3"]),
+            ("3", "confirmed", &["2", "4", "5"]),
+            ("4", "confirmed", &["3", "5"]),
+            ("5", "confirmed", &["3", "4"]),
+        ]);
+        settle(&ids, &ids, &mut a, &Evidence::new());
+        assert_eq!(verdicts(&a), ["grouped", "grouped", "confirmed", "confirmed", "confirmed"]);
+    }
+
+    #[test]
+    fn the_side_whose_checks_hold_up_is_kept_over_the_larger() {
+        // 1-3 hold up; 4-7 are larger but mostly doubtful already. They join
+        // through 3-4 only.
+        let (ids, mut a) = audits(&[
+            ("1", "confirmed", &["2", "3"]),
+            ("2", "confirmed", &["1", "3"]),
+            ("3", "confirmed", &["1", "2", "4"]),
+            ("4", "confirmed", &["3", "5", "6"]),
+            ("5", "doubtful", &["4", "6"]),
+            ("6", "doubtful", &["4", "5", "7"]),
+            ("7", "doubtful", &["6"]),
+        ]);
+        settle(&ids, &ids, &mut a, &Evidence::new());
+        assert_eq!(verdicts(&a), ["confirmed", "confirmed", "confirmed", "grouped", "grouped", "grouped", "grouped"]);
+    }
+
+    #[test]
+    fn ties_count_only_to_trusted_stations() {
+        // 4 is doubtful. 8 is tied only to 4. 5 and 7 are tied to each other
+        // and to 4, so they reach the rest only through 4. 6 is tied to 4 and 1.
+        let (ids, mut a) = audits(&[
+            ("1", "confirmed", &["2", "3", "6"]),
+            ("2", "confirmed", &["1", "3", "4"]),
+            ("3", "confirmed", &["1", "2", "4"]),
+            ("4", "doubtful", &["2", "3", "5", "6", "7", "8"]),
+            ("5", "confirmed", &["4", "7"]),
+            ("6", "confirmed", &["4", "1"]),
+            ("7", "confirmed", &["5", "4"]),
+            ("8", "single", &["4"]),
+        ]);
+        settle(&ids, &ids, &mut a, &Evidence::new());
+        assert_eq!(verdicts(&a), ["confirmed", "confirmed", "confirmed", "doubtful", "doubtful", "single", "doubtful", "doubtful"]);
+        for k in [4, 6, 7] {
+            assert!(a[k].reasons.iter().any(|r| r.contains("in doubt")), "{:?}", a[k].reasons);
+        }
+        assert!(a[4].reasons.iter().any(|r| r.contains("in doubt (4)")), "names the station it hangs on: {:?}", a[4].reasons);
+    }
+
+    #[test]
+    fn a_one_tie_join_backed_by_other_pairs_is_kept() {
+        // As in the first test: 5 and 6 join the ring through 4-5 only.
+        let rows: &[(&str, &str, &[&str])] = &[
+            ("1", "confirmed", &["2", "4"]),
+            ("2", "confirmed", &["1", "3"]),
+            ("3", "confirmed", &["2", "4"]),
+            ("4", "confirmed", &["3", "1", "5"]),
+            ("5", "confirmed", &["4", "6"]),
+            ("6", "single", &["5"]),
+        ];
+        // Two other pairs across the join agree: kept.
+        let (ids, mut a) = audits(rows);
+        let ev: Evidence = [((2, 4), true), ((3, 5), true), ((0, 1), true)].into();
+        settle(&ids, &ids, &mut a, &ev);
+        assert_eq!(verdicts(&a), ["confirmed", "confirmed", "confirmed", "confirmed", "confirmed", "single"]);
+        // One agrees: not enough.
+        let (ids, mut a) = audits(rows);
+        settle(&ids, &ids, &mut a, &[((2, 4), true)].into());
+        assert_eq!(verdicts(&a)[4..], ["grouped", "grouped"]);
+        assert!(a[4].reasons[0].contains("1 agree and 0 disagree"), "{:?}", a[4].reasons);
+        // Two agree and one disagrees: a majority, kept.
+        let (ids, mut a) = audits(rows);
+        settle(&ids, &ids, &mut a, &[((2, 4), true), ((3, 5), true), ((0, 5), false)].into());
+        assert_eq!(verdicts(&a)[4..], ["confirmed", "single"]);
+        // Two agree and two disagree: not kept.
+        let (ids, mut a) = audits(rows);
+        settle(&ids, &ids, &mut a, &[((2, 4), true), ((3, 5), true), ((0, 5), false), ((1, 4), false)].into());
+        assert_eq!(verdicts(&a)[4..], ["grouped", "grouped"]);
+        assert!(a[4].reasons[0].contains("2 agree and 2 disagree"), "{:?}", a[4].reasons);
+        // The tie itself doesn't count as its own backing.
+        let (ids, mut a) = audits(rows);
+        settle(&ids, &ids, &mut a, &[((3, 4), true), ((2, 4), true)].into());
+        assert_eq!(verdicts(&a)[4..], ["grouped", "grouped"]);
+    }
+
+    #[test]
+    fn a_trusted_block_behind_a_doubtful_station_is_kept_when_backed() {
+        // 5 and 7 reach the rest only through doubtful 4, but 5-1 and 7-2 agree.
+        let rows: &[(&str, &str, &[&str])] = &[
+            ("1", "confirmed", &["2", "3"]),
+            ("2", "confirmed", &["1", "3", "4"]),
+            ("3", "confirmed", &["1", "2", "4"]),
+            ("4", "doubtful", &["2", "3", "5", "7"]),
+            ("5", "confirmed", &["4", "7"]),
+            ("7", "confirmed", &["5", "4"]),
+        ];
+        let (ids, mut a) = audits(rows);
+        settle(&ids, &ids, &mut a, &[((0, 4), true), ((1, 5), true)].into());
+        assert_eq!(verdicts(&a), ["confirmed", "confirmed", "confirmed", "doubtful", "single", "single"]);
+    }
+
+    #[test]
+    fn limits_grow_with_the_lever_arm() {
+        assert_eq!(refit_limit_mm(0.0), REFIT_BAD_MM);
+        assert!((REFIT_BAD_PER_M - 1.396).abs() < 0.001, "0.08° is 1.4 mm per metre");
+        // The admin building's corner pairs, all right: 14-15 (22 m, 36 mm) and 14-16 (38 m, 25 mm).
+        assert!(refit_limit_mm(22.3) > 35.8 && refit_limit_mm(38.5) > 24.7);
+        // Near pairs stay strict: a 3 cm move 5 m away still disagrees.
+        assert!(refit_limit_mm(5.0) < 30.0 && surface_limit_mm(5.0) < 30.0);
+        assert!((surface_limit_mm(38.4) - (20.0 + 0.698 * 38.4)).abs() < 0.1);
+    }
+
+    #[test]
+    fn pair_evidence_needs_geometry_and_no_disagreement() {
+        let ok = PairChecks { refit: Some([3.0, 0.01]), ..Default::default() };
+        assert_eq!(pair_evidence(&ok, 10.0), Some(true));
+        let off = PairChecks { refit: Some([40.0, 0.01]), ..Default::default() };
+        assert_eq!(pair_evidence(&off, 10.0), Some(false));
+        assert_eq!(pair_evidence(&off, 22.0), Some(true), "40 mm is within the lever arm of a station 22 m away");
+        let ground_only = PairChecks { ground: Some(0.01), ..Default::default() };
+        assert_eq!(pair_evidence(&ground_only, 10.0), None, "ground alone is not enough to back a join");
+        let seen_through = PairChecks { refit: Some([3.0, 0.01]), free_space: Some(0.2), ..Default::default() };
+        assert_eq!(pair_evidence(&seen_through, 10.0), Some(false));
+        let surface = PairChecks { gaps: vec![0.004; 400], ..Default::default() };
+        assert_eq!(pair_evidence(&surface, 10.0), Some(true));
+        let far_surface = PairChecks { gaps: vec![0.0315; 400], ..Default::default() };
+        assert_eq!(pair_evidence(&far_surface, 5.0), Some(false));
+        assert_eq!(pair_evidence(&far_surface, 38.4), Some(true), "the admin corner pair 13-15 reads 31.5 mm at 38 m");
+    }
+
+    #[test]
+    fn a_well_tied_site_is_left_alone() {
+        let (ids, mut a) = audits(&[
+            ("1", "confirmed", &["2", "3"]),
+            ("2", "confirmed", &["1", "3", "4"]),
+            ("3", "confirmed", &["1", "2", "4"]),
+            ("4", "confirmed", &["2", "3"]),
+            ("5", "unplaced", &[]),
+        ]);
+        let before = verdicts(&a).iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        settle(&ids, &ids, &mut a, &Evidence::new());
+        assert_eq!(verdicts(&a), before);
     }
 
     #[test]
@@ -2506,10 +2955,11 @@ mod tests {
         assert_eq!(verdicts(&poses), ["confirmed", "confirmed", "confirmed"]);
         let mut moved = poses.clone();
         moved[1].as_mut().unwrap().xyz_m[0] += 0.3;
-        assert_eq!(verdicts(&moved), ["confirmed", "doubtful", "confirmed"]);
+        // The other two keep one trusted tie each (to one another): single, still trusted.
+        assert_eq!(verdicts(&moved), ["single", "doubtful", "single"]);
         let mut turned = poses.clone();
         turned[2].as_mut().unwrap().turn_deg += 2.0;
-        assert_eq!(verdicts(&turned), ["confirmed", "confirmed", "doubtful"]);
+        assert_eq!(verdicts(&turned), ["single", "single", "doubtful"]);
     }
 
     #[test]
