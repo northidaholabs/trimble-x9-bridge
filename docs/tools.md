@@ -208,6 +208,52 @@ cases run one after another, it uses `--threads` threads (default a quarter
 of the cores, at most 8), and it won't start with less than about 3 GB of
 memory free. On a shared machine, run it under `nice -n 19 ionice -c3`.
 
+## Deliverables: `x9-bridge analyze`
+
+Turns a registered survey into numbers and pictures for construction and
+site work. It reads a `register` output folder (poses, audit, walls) and the
+same station files, and goes back to each station's full-resolution points,
+one station at a time (about 1 GB at most; 34 s for a 19-station site).
+Only stations the audit trusts are used.
+
+```bash
+x9-bridge register REG_DIR station_*.tzf
+x9-bridge analyze [--straightedge 3] [--tolerance-mm 6] [--section x1,y1,x2,y2]… REG_DIR OUT_DIR station_*.tzf
+x9-bridge analyze --compare [--min-change-m 0.02] BEFORE_OUT AFTER_OUT CHANGE_DIR
+```
+
+| Output | What |
+| --- | --- |
+| `report.html` | Everything below on one page, with the pictures |
+| `wall-<id>.png`, `walls.csv` | Each building wall from the stations' side: departure from its best-fit plane (red proud, blue set back, grey openings and reliefs more than 50 mm off), its lean over its height and per metre-wide strip, flatness (RMS, 95th percentile), a straight-line check (windows of `--straightedge` metres along rows and columns, each within `--tolerance-mm` of its own straight line), and its top above the ground at its foot |
+| `ground.png` | The ground and floors: the lowest level surface in each 10 cm cell, cars and other things more than 25 cm above their surroundings left out, with contours |
+| `flatness.png` | Bumps and dips: each cell against the ground within half a straightedge around it, so slopes drop out and ruts, gutters, kerbs and potholes show |
+| `low_spots.png`, `low_spots.csv` | Where water would stand before spilling over the ground around it (0.5 m² or more, 10 mm or deeper): position, area, depth, volume. A drain the scan didn't see empties a low spot |
+| `section-N.png`, `section-N.csv` | The ground along a line, with the building walls it crosses at their measured height |
+| `plan.dxf` | Walls (by kind), stations and low spots, in metres, for CAD |
+| `ground.f32`, `ground.json` | The height grid, for `--compare` |
+| `analysis.json` | All of the above as data |
+
+`--compare` measures cut and fill between two visits' height grids in the
+same frame, counting cells that changed by `--min-change-m` or more (a scan's
+millimetres of noise, summed over a whole site, would otherwise add up to
+cubic metres), and draws the change. On the admin building's ground with a
+planted 18.85 m³ stockpile and a 2.40 m³ pit (synthetic), it reports 18.84
+and 2.40 m³.
+
+What the numbers are and aren't:
+
+- Coordinates are the project frame (station 1's), not north or site
+  coordinates. Two visits compare only when they share a frame.
+- A wall's plane mixes every station that saw it, so a few millimetres of
+  registration mismatch show up as roughness. Profiled cladding (ribbed
+  metal, siding) measures as its profile.
+- Heights are to the top of what was seen from the ground: a parapet or roof
+  edge, not a roof behind it.
+- Precision, not accuracy: nothing here is checked against an independent
+  measurement (tape, level, total station). Do that before using a number
+  for acceptance or payment.
+
 ## Tests
 
 ### Unit tests

@@ -13,6 +13,7 @@
 //! - `BRIDGE_RECIPES`  recipe directory (`*.toml`), default `$BRIDGE_DATA/recipes`
 
 mod aim;
+mod analyze;
 mod bench;
 mod export;
 mod files;
@@ -70,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         Some("register") => return register::cli(&args[1..]),
         Some("bench") => return bench::cli(&args[1..]),
+        Some("analyze") => return analyze::cli(&args[1..]),
         Some("worker") => return workmode::run(&args[1..]).await,
         _ => {}
     }
