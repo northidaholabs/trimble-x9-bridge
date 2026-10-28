@@ -20,8 +20,8 @@
 //!   two visits.
 //!
 //! Only stations the audit trusts are used. Numbers are as good as the
-//! registration and the scanner: a wall's plane mixes every station that saw
-//! it, so a few millimetres of registration mismatch show up as roughness.
+//! registration: a wall's plane mixes every station that saw it, so a few
+//! millimetres of registration mismatch show up as roughness.
 
 use crate::register::{Pose, Wall};
 use crate::station::Canvas;
@@ -256,6 +256,9 @@ pub struct WallResult {
     pub straightedge_worst_mm: Option<f64>,
     /// The surface's top (99th percentile) above the ground at its foot (m).
     pub top_above_ground_m: Option<f64>,
+    /// The height plumb is measured over (m): the surface's 1st to 99th
+    /// percentile of height.
+    pub plumb_over_m: Option<f64>,
     pub image: String,
     /// The gate's word on plumb and flatness (`answer`, `not_yet`,
     /// `does_not_fit`) and, when not an answer, why: the numbers are gone.
@@ -294,6 +297,7 @@ pub fn withhold(w: &mut WallResult, verdict: &str, reason: Option<String>) {
             w.flat_p95_mm = None;
             w.straightedge_ok_pct = None;
             w.straightedge_worst_mm = None;
+            w.plumb_over_m = None;
         }
         w.reason = reason;
     }
@@ -412,6 +416,7 @@ fn measure_wall(g: &WallGrid, ground: Option<&Ground>, opts: &Opts, img: &str) -
         straightedge_ok_pct: (!gaps.is_empty()).then(|| r1(100.0 * ok as f64 / gaps.len() as f64)),
         straightedge_worst_mm: gaps.iter().cloned().fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x)))).map(|v| r1(v * 1000.0)),
         top_above_ground_m: top.map(r2),
+        plumb_over_m: lean.map(|_| r2(zhi - zlo)),
         image: img.to_string(),
         verdict: None,
         reason: None,
@@ -427,6 +432,13 @@ fn wall_title(r: &WallResult) -> String {
     }
     let lean = r.out_of_plumb_mm.map(|v| format!("leans {v:+.0} mm over its height")).unwrap_or_else(|| "lean unknown".into());
     format!("Wall {} · {:.1} m long · {top} · flatness RMS {} mm · {lean}", r.wall_id, r.length_m, r.flat_rms_mm.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()))
+}
+
+/// The colour scale's ends: in millimetres only when the numbers are given.
+/// Otherwise the colours show where the face stands proud or sits back, and
+/// no figure can be read off them.
+pub(crate) fn legend_ends(r: &WallResult, mm: f64) -> Option<(String, String)> {
+    r.reason.is_none().then(|| (format!("-{mm:.0} mm"), format!("+{mm:.0} mm")))
 }
 
 /// The wall's face seen from the stations' side: colour by departure from
@@ -476,9 +488,10 @@ fn wall_png(g: &WallGrid, plane: Option<[f64; 3]>, r: &WallResult, opts: &Opts) 
             cv.put(12 + i, ly + y, diverging(t), 1.0);
         }
     }
-    let mm = range * 1000.0;
-    cv.text(&font, 12.0, (12.0, ly as f32 + 16.0), 0.0, &format!("-{mm:.0} mm"), DIM);
-    cv.text(&font, 12.0, (212.0, ly as f32 + 16.0), 1.0, &format!("+{mm:.0} mm"), DIM);
+    if let Some((lo, hi)) = legend_ends(r, range * 1000.0) {
+        cv.text(&font, 12.0, (12.0, ly as f32 + 16.0), 0.0, &lo, DIM);
+        cv.text(&font, 12.0, (212.0, ly as f32 + 16.0), 1.0, &hi, DIM);
+    }
     for y in 0..12 {
         for x in 0..14 {
             cv.put(230 + x, ly + y, FEATURE, 1.0);
@@ -1422,7 +1435,7 @@ pub fn run(reg: &str, out: &str, files: &[String], opts: &Opts) -> anyhow::Resul
         summary_out.as_object_mut().unwrap().remove("ground_flatness");
     }
     let (questions_html, questions) = match &opts.questions {
-        Some(m) => mission_questions(reg, out, m, &used.iter().map(|&k| (number(k, &files[k]), poses[k].unwrap(), files[k].clone().into())).collect::<Vec<_>>(), opts)?,
+        Some(m) => mission_questions(reg, out, m, &walls, &used.iter().map(|&k| (number(k, &files[k]), poses[k].unwrap(), files[k].clone().into())).collect::<Vec<_>>(), opts)?,
         None => (String::new(), Value::Null),
     };
     std::fs::write(format!("{out}/report.html"), report_html(&summary_out, &results, &ponds_found, &sections, opts, &questions_html))?;
@@ -1437,7 +1450,7 @@ pub fn run(reg: &str, out: &str, files: &[String], opts: &Opts) -> anyhow::Resul
 /// The mission's questions, each judged again on this registration
 /// (`merged.bin` in `reg`) from the stations' files: the report's opening
 /// section and its JSON. Evidence images go to `out`.
-fn mission_questions(reg: &str, out: &str, mission: &str, files: &[(u16, Pose, std::path::PathBuf)], opts: &Opts) -> anyhow::Result<(String, Value)> {
+fn mission_questions(reg: &str, out: &str, mission: &str, walls: &[Wall], files: &[(u16, Pose, std::path::PathBuf)], opts: &Opts) -> anyhow::Result<(String, Value)> {
     use crate::ask::{evidence, gate, look, questions_html, report_drawing, Asked, Gate};
     let m: crate::mission::Mission = serde_json::from_slice(&std::fs::read(mission).with_context(|| mission.to_string())?).with_context(|| format!("{mission}: a mission"))?;
     let merged = crate::register::Merged::from_bytes(&std::fs::read(format!("{reg}/merged.bin")).with_context(|| format!("{reg}/merged.bin: run `x9-bridge register` again"))?)
@@ -1468,15 +1481,18 @@ fn mission_questions(reg: &str, out: &str, mission: &str, files: &[(u16, Pose, s
             again_reading: if again == Gate::Pass { c.fit.clone() } else { None },
             again,
             image,
+            tolerance: t.tolerance.clone(),
+            face: f,
+            runs_on_m: crate::ask::runs_on(&f, walls),
         });
     }
     let json: Vec<Value> = asked
         .iter()
         .map(|a| {
-            json!({"target_id": a.target_id, "name": a.name, "on_site": crate::ask::public(&a.target_id, &a.on_site), "declined": a.declined,
-                   "final": match &a.again { Gate::Pass => json!({"verdict": "answer", "answer": a.again_reading}), Gate::NotYet(r) => json!({"verdict": "not_yet", "reason": r}),
+            json!({"target_id": a.target_id, "name": a.name, "on_site": crate::ask::public(&a.target_id, &a.on_site, a.tolerance.as_ref()), "declined": a.declined,
+                   "final": match &a.again { Gate::Pass => json!({"verdict": "answer", "answer": a.again_reading.as_ref().map(|r| crate::ask::reading_said(r, a.tolerance.as_ref()))}), Gate::NotYet(r) => json!({"verdict": "not_yet", "reason": r}),
                                              Gate::DoesNotFit(r) => json!({"verdict": "does_not_fit", "reason": r}) },
-                   "image": a.image})
+                   "face": crate::ask::face_said(&a.face, (a.face.to[0] - a.face.from[0]).hypot(a.face.to[1] - a.face.from[1]), walls), "image": a.image})
         })
         .collect();
     Ok((questions_html(&asked), json!(json)))
@@ -1621,6 +1637,7 @@ mod tests {
             lean_mm_per_m: Some(plumb + 0.2), out_of_plumb_mm: Some(plumb), worst_strip_mm_per_m: Some(plumb + 0.1), worst_strip_at_m: Some(1.5),
             flat_rms_mm: Some(rms), flat_p95_mm: Some(rms * 2.0), straightedge_windows: 40, straightedge_ok_pct: Some(plumb - 0.6),
             straightedge_worst_mm: Some(plumb + 0.3), top_above_ground_m: Some(5.2), image: format!("wall-{id}.png"), verdict: None, reason: None,
+            plumb_over_m: Some(4.0),
         }
     }
 
@@ -1650,6 +1667,19 @@ mod tests {
         assert!(rows[1].contains(",6.4,") && rows[1].contains(",answer,"), "{}", rows[1]);
         assert!(rows[3].contains(",not_yet,"), "{}", rows[3]);
         assert!(wall_title(&walls[0]).contains("+6 mm"));
+        // The evidence drawing marks the verdict first, so a face that doesn't fit loses its scale.
+        let mut drawn = measured("w9", 10.0, 92.0, 22.0, 104.0);
+        let rough = crate::ask::Question { verdict: Some(crate::ask::Verdict::DoesNotFit), reason: "rough".into(), ..crate::ask::Question::new("plumb") };
+        crate::ask::mark(&mut drawn, &rough);
+        assert!(legend_ends(&drawn, 18.0).is_none() && drawn.out_of_plumb_mm.is_none() && drawn.plumb_over_m.is_none());
+        let mut kept = measured("w9", 10.0, 92.0, 8.0, 6.4);
+        crate::ask::mark(&mut kept, &crate::ask::Question { verdict: Some(crate::ask::Verdict::Answer), ..crate::ask::Question::new("plumb") });
+        assert!(legend_ends(&kept, 18.0).is_some() && kept.plumb_over_m.is_some());
+        // Only an answer's heat map has a millimetre scale.
+        assert_eq!(legend_ends(&walls[0], 18.0), Some(("-18 mm".to_string(), "+18 mm".to_string())));
+        for w in &walls[1..] {
+            assert_eq!(legend_ends(w, 18.0), None);
+        }
         for w in &walls[1..] {
             let t = wall_title(w);
             assert!(!t.contains("104") && !t.contains("flatness RMS") && t.contains(w.verdict.as_deref().unwrap().replace('_', " ").as_str()), "{t}");

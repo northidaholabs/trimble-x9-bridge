@@ -917,6 +917,41 @@ and how long it took. `ready` refuses while any is open; one that doesn't fit
 is declined with its reason. Changing the target's face starts its question
 over, and `"question": ""` drops it.
 
+**Tolerance.** Point-and-click software asks for a tolerance in a dialog and
+colours the wall green or red. Here the job's tolerance goes on the target
+in the person's words, and the bridge does the arithmetic:
+
+```bash
+curl -s -X POST -H "$H" -d '{"targets":[{"target_id":"east","tolerance":{
+  "words":"¼ in in 10 ft, ⅜ in in 20 ft, ½ in max (TMS 602)",
+  "steps":[{"up_to_m":3.05,"mm":6.4},{"up_to_m":6.10,"mm":9.5},{"mm":12.7}]}}]}' \
+  $B/projects/$PROJECT/mission/targets
+# ask again: "answer":{"out_of_plumb_mm":7.2,"out_of_plumb_in":"5/16 in","over_m":5.4,
+#   "allowed_mm":9.5,"allowed_in":"3/8 in","within":true,…}
+```
+
+`steps` are allowances by height, as TMS 602 writes them; `mm_per_m` (with
+`max_mm`) is a rate, as ACI 117 writes it (`"mm_per_m":3,"max_mm":25.4`).
+The allowance is for `over_m`, the height the plumb is measured over. The
+bridge doesn't pick a standard: the job's specification does, and the
+report quotes the words beside the allowance so anyone can check the
+conversion. Without a tolerance an answer gives the figure and no call.
+`"tolerance": null` drops it.
+
+**The part of the wall.** Every response gives the face's ends and
+`length_m`. When a wall detected in the latest registration runs on more
+than 1 m past either end, `face.runs_on` says how far past each
+(`past_from_m`, `past_to_m`): the answer covers the face, not the whole
+wall. Set another target for the rest. The report says the same.
+
+A tolerance that gives no allowance for the face's height (steps that stop
+short of it, with no `max_mm`) leaves `allowed_mm` null and says why in
+`tolerance_note`. A misspelt tolerance field is refused, not ignored.
+
+The heat map has a millimetre scale only with an answer. With
+`does_not_fit` it shows where the face stands proud or sits back, without a
+figure.
+
 The fit reads the full-resolution files of the trusted stations that saw the
 face, as `analyze` does for walls; one ask on a face seen by seven stations
 takes about 7 s on a desktop.

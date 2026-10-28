@@ -6,7 +6,7 @@
 //! any target is open; the person then signs off once, and the mission is
 //! done. Kept in `missions.json` so a restart keeps them.
 
-use crate::ask::{Question, Verdict, KINDS};
+use crate::ask::{Question, Tolerance, Verdict, KINDS};
 use crate::register::{Face, Geo, FACE_COVERED};
 use crate::util::now_rfc3339;
 use serde::{Deserialize, Serialize};
@@ -74,6 +74,9 @@ pub struct Target {
     /// A question asked of the face (`ask`): covered only by its answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<Question>,
+    /// The plumb tolerance the job uses: an answer says within or outside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tolerance: Option<Tolerance>,
     #[serde(default)]
     pub updated_at: String,
 }
@@ -136,6 +139,14 @@ pub struct TargetUpdate {
     /// A question for its face (`plumb`), or "" to drop it.
     #[serde(default)]
     pub question: Option<String>,
+    /// The question's tolerance, or null to drop it.
+    #[serde(default, deserialize_with = "present")]
+    pub tolerance: Option<Option<Tolerance>>,
+}
+
+/// A field that was sent, even as null (`Some(None)`); absent is `None`.
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
 }
 
 pub const MAX_TARGETS: usize = 200;
@@ -201,7 +212,7 @@ impl Mission {
                     }
                     next.push(Target { target_id: id.into(), name: String::new(), kind: String::new(), status: Status::Open,
                                        stations: vec![], measurement_id: None, note: String::new(), face: None, geometry: None,
-                                       question: None, updated_at: String::new() });
+                                       question: None, tolerance: None, updated_at: String::new() });
                     next.len() - 1
                 }
             };
@@ -251,6 +262,18 @@ impl Mission {
                     }
                 }
                 _ => {}
+            }
+            if let Some(tol) = &u.tolerance {
+                if let Some(x) = tol {
+                    x.check().map_err(|e| format!("target {id}: {e}"))?;
+                }
+                t.tolerance = tol.clone().map(|x| Tolerance { words: x.words.trim().into(), ..x });
+            }
+            if t.question.is_none() {
+                if matches!(u.tolerance, Some(Some(_))) {
+                    return Err(format!("target {id}: a tolerance goes with a question; set question to \"plumb\""));
+                }
+                t.tolerance = None;
             }
             if t.question.is_some() && u.status == Some(Status::Covered) {
                 return Err(format!("target {id}: a question target is covered by its answer (scanner_ask), not by hand"));
@@ -423,6 +446,7 @@ fn judge(t: &mut Target, geo: &Geo) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn req() -> MissionRequest {
         MissionRequest { goal: "Scan the exterior of the house".into(), kind: MissionKind::Exterior,
@@ -431,7 +455,7 @@ mod tests {
     fn up(id: &str, status: Option<Status>, stations: &[&str], note: &str) -> TargetUpdate {
         TargetUpdate { target_id: id.into(), name: Some(format!("{id} facade")), kind: Some("facade".into()), status,
                        stations: Some(stations.iter().map(|s| s.to_string()).collect()), measurement_id: None, note: Some(note.into()),
-                       face: None, wall_id: None, question: None }
+                       face: None, wall_id: None, question: None, tolerance: None }
     }
 
     #[test]
@@ -489,7 +513,7 @@ mod tests {
         let mut m = Mission::new(&req(), "p1", "claude");
         let face = |id: &str, to: f64, status: Option<Status>| TargetUpdate {
             target_id: id.into(), name: Some(id.into()), kind: Some("facade".into()), status, stations: None, measurement_id: None,
-            note: None, face: Some(Face { from: [0.0, 5.0], to: [to, 5.0] }), wall_id: None, question: None,
+            note: None, face: Some(Face { from: [0.0, 5.0], to: [to, 5.0] }), wall_id: None, question: None, tolerance: None,
         };
         // Seen along its whole length: covered by the bridge, with its station.
         m.update(&[face("near", 8.0, None)], &scans, &g).unwrap();
@@ -524,7 +548,7 @@ mod tests {
         let mut m = Mission::new(&req(), "p1", "claude");
         let q = |id: &str, to: f64| TargetUpdate {
             target_id: id.into(), name: Some(format!("{id} facade")), kind: Some("facade".into()), status: None, stations: None,
-            measurement_id: None, note: None, face: Some(Face { from: [0.0, 5.0], to: [to, 5.0] }), wall_id: None, question: Some("plumb".into()),
+            measurement_id: None, note: None, face: Some(Face { from: [0.0, 5.0], to: [to, 5.0] }), wall_id: None, question: Some("plumb".into()), tolerance: None,
         };
         // Fully seen, never asked: open, not covered by its coverage.
         m.update(&[q("never", 8.0), q("rough", 8.0)], &scans, &g).unwrap();
@@ -543,7 +567,7 @@ mod tests {
         assert!(m.ready("done").unwrap_err().contains("2 targets are still open"));
         // The answer arrives with the next station, without being asked again.
         let r_of = |p: f64| Reading { out_of_plumb_mm: p, lean_mm_per_m: 0.5, flat_rms_mm: 6.0, flat_p95_mm: None, straightedge_ok_pct: None,
-                                       worst_strip_mm_per_m: None, stations: vec![1] };
+                                       worst_strip_mm_per_m: None, over_m: None, stations: vec![1] };
         let r = r_of(4.0);
         let said = m.record_question("never", verdict(Verdict::Answer, Some(r)), &numbers).unwrap();
         assert!(said.contains("never facade"), "{said}");
@@ -597,6 +621,25 @@ mod tests {
         assert_eq!(plain(&m), Status::Covered);
         m.update(&[q("plain", 8.0)], &scans, &g).unwrap();
         assert_eq!(plain(&m), Status::Open);
+        // A tolerance goes with a question, survives a new face, and null drops it.
+        let tms = crate::ask::Tolerance { words: "¼ in in 10 ft".into(), steps: vec![crate::ask::Step { up_to_m: None, mm: 6.4 }], mm_per_m: None, max_mm: None };
+        let tol = |id: &str, t: Option<crate::ask::Tolerance>| TargetUpdate { tolerance: Some(t), ..q(id, 8.0) };
+        let bare = TargetUpdate { question: None, tolerance: Some(Some(tms.clone())), ..q("bare", 8.0) };
+        assert!(m.update(&[bare], &scans, &g).unwrap_err().contains("question"));
+        let wordless = crate::ask::Tolerance { words: String::new(), ..tms.clone() };
+        assert!(m.update(&[tol("never", Some(wordless))], &scans, &g).unwrap_err().contains("words"));
+        m.update(&[tol("never", Some(tms.clone()))], &scans, &g).unwrap();
+        assert_eq!(m.targets[0].tolerance.as_ref(), Some(&tms));
+        m.update(&[TargetUpdate { face: Some(Face { from: [0.0, 5.0], to: [7.5, 5.0] }), ..q("never", 8.0) }], &scans, &g).unwrap();
+        assert_eq!(m.targets[0].tolerance.as_ref(), Some(&tms));
+        let sent: TargetUpdate = serde_json::from_value(json!({"target_id": "never", "tolerance": {"words": "  ¼ in in 10 ft ", "steps": [{"mm": 6.4}]}})).unwrap();
+        m.update(&[sent], &scans, &g).unwrap();
+        assert_eq!(m.targets[0].tolerance.as_ref(), Some(&tms));
+        let json: TargetUpdate = serde_json::from_value(json!({"target_id": "never", "tolerance": null})).unwrap();
+        m.update(&[json], &scans, &g).unwrap();
+        assert!(m.targets[0].tolerance.is_none());
+        let absent: TargetUpdate = serde_json::from_value(json!({"target_id": "never"})).unwrap();
+        assert!(absent.tolerance.is_none());
         // "" drops the question: the coverage rule applies again.
         m.update(&[TargetUpdate { question: Some(String::new()), ..q("never", 8.0) }], &scans, &g).unwrap();
         assert!(m.targets[0].question.is_none());

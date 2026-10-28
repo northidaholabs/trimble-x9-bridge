@@ -63,6 +63,10 @@ pub struct Reading {
     pub straightedge_ok_pct: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worst_strip_mm_per_m: Option<f64>,
+    /// The height plumb is measured over (m): the surface's 1st to 99th
+    /// percentile of height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over_m: Option<f64>,
     /// Station numbers it rests on.
     pub stations: Vec<u16>,
 }
@@ -94,6 +98,107 @@ impl Question {
     pub fn new(kind: &str) -> Question {
         Question { kind: kind.into(), verdict: None, reason: String::new(), asked: false, seen_share: None, stations: vec![], answer: None, checked_at: String::new() }
     }
+}
+
+/// An allowance up to a height, or for any height without `up_to_m`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Step {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_to_m: Option<f64>,
+    pub mm: f64,
+}
+
+/// The plumb tolerance the job uses, in the person's words and in one of the
+/// forms the standards write it: allowances by height (TMS 602), or per metre
+/// of height (ACI 117); either may have a cap. The bridge does the arithmetic.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Tolerance {
+    pub words: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<Step>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_per_m: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_mm: Option<f64>,
+}
+
+impl Tolerance {
+    pub fn check(&self) -> Result<(), String> {
+        let n = self.words.trim().chars().count();
+        if n == 0 || n > 200 {
+            return Err("tolerance: words, as the person said them (1–200 characters)".into());
+        }
+        if self.steps.is_empty() == self.mm_per_m.is_none() {
+            return Err("tolerance: give one of steps (allowances by height) or mm_per_m".into());
+        }
+        let positive = |v: f64| v.is_finite() && v > 0.0;
+        let values = self.steps.iter().flat_map(|s| [Some(s.mm), s.up_to_m]).chain([self.mm_per_m, self.max_mm]).flatten();
+        if !values.into_iter().all(positive) {
+            return Err("tolerance: every value is positive, in mm or m".into());
+        }
+        if self.steps.iter().rev().skip(1).any(|s| s.up_to_m.is_none()) {
+            return Err("tolerance: only the last step may leave out up_to_m".into());
+        }
+        if self.steps.windows(2).any(|w| matches!((w[0].up_to_m, w[1].up_to_m), (Some(a), Some(b)) if b <= a)) {
+            return Err("tolerance: steps in order of up_to_m".into());
+        }
+        Ok(())
+    }
+
+    /// The allowance (mm) for a face whose plumb is measured over `over_m`;
+    /// none when no step reaches that height and there is no cap.
+    pub fn allowed_mm(&self, over_m: f64) -> Option<f64> {
+        let base = match self.mm_per_m {
+            Some(rate) => Some(rate * over_m),
+            None => self.steps.iter().find(|s| s.up_to_m.is_none_or(|u| over_m <= u + 1e-9)).map(|s| s.mm),
+        };
+        let allowed = match (base, self.max_mm) {
+            (Some(b), Some(m)) => b.min(m),
+            (b, m) => b.or(m)?,
+        };
+        Some((allowed * 10.0).round() / 10.0)
+    }
+}
+
+/// Millimetres as inches to the nearest 1/16 ("1 3/16 in").
+pub fn inches(mm: f64) -> String {
+    let sixteenths = (mm.abs() / 25.4 * 16.0).round() as u64;
+    let (whole, mut num, mut den) = (sixteenths / 16, sixteenths % 16, 16);
+    while num > 0 && num % 2 == 0 {
+        (num, den) = (num / 2, den / 2);
+    }
+    match (whole, num) {
+        (w, 0) => format!("{w} in"),
+        (0, n) => format!("{n}/{den} in"),
+        (w, n) => format!("{w} {n}/{den} in"),
+    }
+}
+
+/// How far (m) walls detected along the face's line run on past its `from`
+/// and `to` ends, when either is more than 1 m: the answer covers the face only.
+pub fn runs_on(face: &Face, walls: &[crate::register::Wall]) -> Option<[f64; 2]> {
+    let (dx, dy) = (face.to[0] - face.from[0], face.to[1] - face.from[1]);
+    let len = dx.hypot(dy);
+    if len < 1e-6 {
+        return None;
+    }
+    let (ux, uy) = (dx / len, dy / len);
+    let along = |p: [f64; 2]| (p[0] - face.from[0]) * ux + (p[1] - face.from[1]) * uy;
+    let off = |p: [f64; 2]| ((p[0] - face.from[0]) * uy - (p[1] - face.from[1]) * ux).abs();
+    let (mut lo, mut hi) = (0.0f64, len);
+    for w in walls {
+        let (a, b) = (along(w.from), along(w.to));
+        let (wx, wy) = (w.to[0] - w.from[0], w.to[1] - w.from[1]);
+        let across = (wx * uy - wy * ux).abs() / wx.hypot(wy).max(1e-6);
+        let on_line = off(w.from) <= 0.3 && off(w.to) <= 0.3 && across <= 5f64.to_radians().sin();
+        if on_line && a.max(b) >= -1.0 && a.min(b) <= len + 1.0 {
+            (lo, hi) = (lo.min(a.min(b)), hi.max(a.max(b)));
+        }
+    }
+    let r1 = |v: f64| (v * 10.0).round() / 10.0;
+    (-lo > 1.0 || hi - len > 1.0).then(|| [r1(-lo), r1(hi - len)])
 }
 
 /// One look at a face: its share seen, length, the stations that saw it, and
@@ -213,8 +318,9 @@ pub fn shows_evidence(v: Option<Verdict>) -> bool {
     matches!(v, Some(Verdict::Answer | Verdict::DoesNotFit))
 }
 
-/// The answer as the model sees it: numbers only with `answer`.
-pub fn public(target_id: &str, q: &Question) -> Value {
+/// The answer as the model sees it: numbers only with `answer`, judged
+/// against the job's tolerance when it has one.
+pub fn public(target_id: &str, q: &Question, tolerance: Option<&Tolerance>) -> Value {
     let verdict = q.verdict.map_or(Value::String("not_asked".into()), |v| serde_json::to_value(v).unwrap_or(Value::Null));
     let mut v = json!({
         "target_id": target_id,
@@ -226,10 +332,52 @@ pub fn public(target_id: &str, q: &Question) -> Value {
     });
     if q.verdict == Some(Verdict::Answer) {
         if let Some(a) = &q.answer {
-            v["answer"] = serde_json::to_value(a).unwrap_or(Value::Null);
+            v["answer"] = reading_said(a, tolerance);
         }
     }
+    if let Some(t) = tolerance {
+        v["tolerance"] = serde_json::to_value(t).unwrap_or(Value::Null);
+    }
     v
+}
+
+/// The face asked about: its length and how far the detected wall runs on
+/// past each end.
+pub fn face_said(face: &Face, length_m: f64, walls: &[crate::register::Wall]) -> Value {
+    let past = runs_on(face, walls);
+    json!({"from": face.from, "to": face.to, "length_m": (length_m * 100.0).round() / 100.0,
+           "runs_on": past.map(|[a, b]| json!({"past_from_m": a, "past_to_m": b}))})
+}
+
+/// A reading as the answer gives it: inches, which way it leans, and against
+/// the tolerance when there is one.
+pub fn reading_said(a: &Reading, tolerance: Option<&Tolerance>) -> Value {
+    let mut ans = serde_json::to_value(a).unwrap_or(Value::Null);
+    ans["out_of_plumb_in"] = json!(inches(a.out_of_plumb_mm));
+    if a.out_of_plumb_mm != 0.0 {
+        ans["leans"] = json!(if a.out_of_plumb_mm > 0.0 { "toward the side it was scanned from" } else { "away from the side it was scanned from" });
+    }
+    if let Some(t) = tolerance {
+        match a.over_m.and_then(|h| t.allowed_mm(h)) {
+            Some(allowed) => {
+                ans["allowed_mm"] = json!(allowed);
+                ans["allowed_in"] = json!(inches(allowed));
+                ans["within"] = json!(within(a, allowed));
+            }
+            None => {
+                ans["allowed_mm"] = Value::Null;
+                ans["tolerance_note"] = json!(match a.over_m {
+                    Some(h) => format!("the tolerance gives no allowance for {h:.1} m of height: add a step for it, or max_mm"),
+                    None => "this answer has no measured height to apply the tolerance to: ask again".to_string(),
+                });
+            }
+        }
+    }
+    ans
+}
+
+fn within(a: &Reading, allowed: f64) -> bool {
+    a.out_of_plumb_mm.abs() <= allowed + 1e-9
 }
 
 /// Preview columns `(x0, x1)` framing the stretch `a`–`b` (project frame) as
@@ -265,6 +413,10 @@ pub struct Asked {
     pub again: Gate,
     pub again_reading: Option<Reading>,
     pub image: Option<String>,
+    pub tolerance: Option<Tolerance>,
+    /// The face's ends, and how far the detected wall runs on past each (m), when it does.
+    pub face: Face,
+    pub runs_on_m: Option<[f64; 2]>,
 }
 
 /// An answer recomputed from the final registration may move this much from
@@ -291,8 +443,23 @@ pub fn questions_html(asked: &[Asked]) -> String {
         let _ = write!(h, "<section class=question id=\"q-{}\"><h3>{}</h3><p><span class=verdict>{}</span> ", esc(&a.target_id), esc(&a.name), label(q.verdict));
         match (q.verdict, &q.answer) {
             (Some(Verdict::Answer), Some(r)) => {
-                let _ = write!(h, "{:.1} mm out of plumb ({:.1} mm/m lean), {:.1} mm RMS against one plane; stations {}</p>",
-                               r.out_of_plumb_mm, r.lean_mm_per_m, r.flat_rms_mm, list(&r.stations));
+                let over = r.over_m.map(|m| format!(" over {m:.1} m")).unwrap_or_default();
+                let _ = write!(h, "{:.1} mm ({}) out of plumb{over} ({:.1} mm/m lean), {:.1} mm RMS against one plane; stations {}</p>",
+                               r.out_of_plumb_mm, inches(r.out_of_plumb_mm), r.lean_mm_per_m, r.flat_rms_mm, list(&r.stations));
+                if let Some(t) = &a.tolerance {
+                    let call = |r: &Reading| r.over_m.and_then(|m| t.allowed_mm(m)).map(|allowed| (allowed, if within(r, allowed) { "within" } else { "outside" }));
+                    let _ = match call(r) {
+                        Some((allowed, said)) => write!(h, "<p class=tolerance>Tolerance: “{}”; allowed {allowed:.1} mm ({}){over}: <strong>{said}</strong>.</p>", esc(&t.words), inches(allowed)),
+                        None => write!(h, "<p class=tolerance>Tolerance: “{}”; it gives no allowance for this height.</p>", esc(&t.words)),
+                    };
+                    if let (Gate::Pass, Some(f)) = (&a.again, &a.again_reading) {
+                        if let (Some((_, before)), Some((allowed, after))) = (call(r), call(f)) {
+                            if before != after {
+                                let _ = write!(h, "<p class=flag>From the final registration: {:.1} mm, <strong>{after}</strong> the {allowed:.1} mm allowed.</p>", f.out_of_plumb_mm);
+                            }
+                        }
+                    }
+                }
                 match (&a.again, &a.again_reading) {
                     (Gate::Pass, Some(f)) => {
                         let moved = (f.out_of_plumb_mm - r.out_of_plumb_mm).abs();
@@ -312,6 +479,12 @@ pub fn questions_html(asked: &[Asked]) -> String {
             _ => {
                 let _ = write!(h, "{}; stations {}</p>", esc(&q.reason), list(&q.stations));
             }
+        }
+        if let Some([past_from, past_to]) = a.runs_on_m {
+            let end = |m: f64, p: [f64; 2]| (m > 1.0).then(|| format!("{m:.1} m past ({:.1}, {:.1})", p[0], p[1]));
+            let past: Vec<String> = [end(past_from, a.face.from), end(past_to, a.face.to)].into_iter().flatten().collect();
+            let _ = write!(h, "<p class=extent>This covers the face asked about, {:.1} m; the wall detected along it runs on {}.</p>",
+                           (a.face.to[0] - a.face.from[0]).hypot(a.face.to[1] - a.face.from[1]), past.join(" and "));
         }
         if let Some(note) = &a.declined {
             let _ = write!(h, "<p class=declined>declined: {}</p>", esc(note));
@@ -349,6 +522,7 @@ pub fn look(target_id: &str, f: &Face, coverage: &Value, files: &[(u16, Pose, Pa
             flat_p95_mm: r.flat_p95_mm,
             straightedge_ok_pct: r.straightedge_ok_pct,
             worst_strip_mm_per_m: r.worst_strip_mm_per_m,
+            over_m: r.plumb_over_m,
             stations: c.stations.clone(),
         })
     });
@@ -358,13 +532,18 @@ pub fn look(target_id: &str, f: &Face, coverage: &Value, files: &[(u16, Pose, Pa
 /// The evidence image for a verdict: the face's heat map, its title carrying
 /// numbers only for an answer.
 pub fn evidence(fit: &mut FaceFit, q: &Question, opts: &Opts) -> Vec<u8> {
+    mark(&mut fit.result, q);
+    fit.png(opts)
+}
+
+/// The verdict on the wall it draws: anything but an answer loses its numbers.
+pub(crate) fn mark(r: &mut crate::analyze::WallResult, q: &Question) {
     let v = q.verdict.map_or("not_yet", |v| match v {
         Verdict::Answer => "answer",
         Verdict::NotYet => "not_yet",
         Verdict::DoesNotFit => "does_not_fit",
     });
-    withhold(&mut fit.result, v, (v != "answer").then(|| q.reason.clone()));
-    fit.png(opts)
+    withhold(r, v, (v != "answer").then(|| q.reason.clone()));
 }
 
 /// What `ask` keeps between counts: the last verdict and the reading waiting
@@ -431,7 +610,10 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     if let (Some(p), Some(mut fit)) = (&png, fit) {
         std::fs::write(p, evidence(&mut fit, &q, &Opts::default()))?;
     }
-    let mut out = public(&id, &q);
+    let mut out = public(&id, &q, None);
+    let walls: Vec<crate::register::Wall> = std::fs::read(format!("{reg}/walls.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| serde_json::from_value(if v["walls"].is_array() { v["walls"].clone() } else { v }).ok()).unwrap_or_default();
+    out["face"] = face_said(&face, c.length_m, &walls);
     out["seconds"] = json!((t0.elapsed().as_secs_f64() * 10.0).round() / 10.0);
     out["unseen"] = coverage["unseen"].clone();
     println!("{}", serde_json::to_string(&out)?);
@@ -454,14 +636,14 @@ pub async fn on_bridge(st: &std::sync::Arc<AppState>, project_id: &str, target_i
     // would otherwise each write over the other's verdict.
     let lock = st.inner.lock().unwrap().asking.entry(key.clone()).or_default().clone();
     let _one = lock.lock().await;
-    let (face, name, prev, settling, reg) = {
+    let (face, name, prev, settling, reg, tolerance) = {
         let inner = st.inner.lock().unwrap();
         let m = inner.missions.get(project_id).ok_or_else(|| ApiError::not_found("mission"))?;
         let t = m.targets.iter().find(|t| t.target_id == target_id).ok_or_else(|| ApiError::not_found("target"))?;
         let q = t.question.clone().ok_or_else(|| ApiError::invalid(format!("target {target_id} asks no question: set its question to \"plumb\" first")))?;
         let face = t.face.ok_or_else(|| ApiError::invalid(format!("target {target_id} has no wall face")))?;
         let settling = settling_for(&q, &face, inner.settling.get(&key)).cloned();
-        (face, t.name.clone(), q, settling, inner.registrations.get(project_id).cloned())
+        (face, t.name.clone(), q, settling, inner.registrations.get(project_id).cloned(), t.tolerance.clone())
     };
     let geo = st.geo(project_id);
     let scans = reg.as_ref().map(|r| r.station_scans()).unwrap_or_default();
@@ -505,7 +687,8 @@ pub async fn on_bridge(st: &std::sync::Arc<AppState>, project_id: &str, target_i
         inner.missions.get_mut(project_id).map(|m| (m.record_question(target_id, q.clone(), &scans), m.clone()))
     };
     let secs = t0.elapsed().as_secs_f64();
-    let mut out = public(target_id, &q);
+    let mut out = public(target_id, &q, tolerance.as_ref());
+    out["face"] = face_said(&face, check.length_m, &geo.walls);
     out["seconds"] = json!((secs * 10.0).round() / 10.0);
     if q.verdict == Some(Verdict::NotYet) && q.reason != "settling" {
         out["unseen"] = unseen_with_subjects(st, reg.as_ref(), &coverage).await;
@@ -602,7 +785,132 @@ mod tests {
 
     fn reading(plumb: f64, stations: &[u16]) -> Reading {
         Reading { out_of_plumb_mm: plumb, lean_mm_per_m: plumb / 10.0, flat_rms_mm: 8.0, flat_p95_mm: Some(16.0), straightedge_ok_pct: Some(90.0),
-                  worst_strip_mm_per_m: Some(1.0), stations: stations.to_vec() }
+                  worst_strip_mm_per_m: Some(1.0), over_m: Some(5.0), stations: stations.to_vec() }
+    }
+    fn tms(words: &str) -> Tolerance {
+        let step = |up_to_m: Option<f64>, mm: f64| Step { up_to_m, mm };
+        Tolerance { words: words.into(), steps: vec![step(Some(3.05), 6.4), step(Some(6.10), 9.5), step(None, 12.7)], mm_per_m: None, max_mm: None }
+    }
+    fn aci() -> Tolerance {
+        Tolerance { words: "0.3% of the height, 1 in at most".into(), steps: vec![], mm_per_m: Some(3.0), max_mm: Some(25.4) }
+    }
+
+    #[test]
+    fn a_tolerance_is_the_allowance_for_the_height_measured() {
+        let t = tms("¼ in in 10 ft, ⅜ in in 20 ft, ½ in max");
+        assert_eq!([2.9, 5.0, 8.0].map(|h| t.allowed_mm(h)), [Some(6.4), Some(9.5), Some(12.7)]);
+        assert_eq!(t.allowed_mm(3.05), Some(6.4));
+        assert_eq!([5.0, 10.0].map(|h| aci().allowed_mm(h)), [Some(15.0), Some(25.4)]);
+        // A cap applies to steps too; a face taller than every step has none.
+        let capped = Tolerance { max_mm: Some(8.0), ..t.clone() };
+        assert_eq!(capped.allowed_mm(8.0), Some(8.0));
+        let short = Tolerance { steps: vec![Step { up_to_m: Some(3.05), mm: 6.4 }], ..t.clone() };
+        assert_eq!(short.allowed_mm(5.0), None);
+        assert_eq!(Tolerance { max_mm: Some(12.7), ..short }.allowed_mm(5.0), Some(12.7));
+        assert!(t.check().is_ok() && aci().check().is_ok());
+    }
+
+    #[test]
+    fn a_tolerance_needs_words_and_one_form() {
+        let t = tms("¼ in in 10 ft");
+        let refused = |x: Tolerance, why: &str| {
+            let e = x.check().unwrap_err();
+            assert!(e.contains(why), "{e}");
+        };
+        refused(Tolerance { words: "  ".into(), ..t.clone() }, "words");
+        refused(Tolerance { words: "x".repeat(201), ..t.clone() }, "words");
+        assert!(Tolerance { words: "x".repeat(200), ..t.clone() }.check().is_ok());
+        refused(Tolerance { mm_per_m: Some(3.0), ..t.clone() }, "one of");
+        refused(Tolerance { steps: vec![], ..t.clone() }, "one of");
+        refused(Tolerance { steps: vec![Step { up_to_m: Some(6.1), mm: 9.5 }, Step { up_to_m: Some(3.05), mm: 6.4 }], ..t.clone() }, "order");
+        refused(Tolerance { steps: vec![Step { up_to_m: None, mm: 9.5 }, Step { up_to_m: Some(3.05), mm: 6.4 }], ..t.clone() }, "last");
+        refused(Tolerance { steps: vec![Step { up_to_m: Some(3.05), mm: 0.0 }], ..t.clone() }, "positive");
+        refused(Tolerance { max_mm: Some(-1.0), ..t.clone() }, "positive");
+        refused(Tolerance { mm_per_m: Some(f64::NAN), ..aci() }, "positive");
+        // A misspelt field is refused, not dropped: a lost cap would pass a wall it shouldn't.
+        assert!(serde_json::from_value::<Tolerance>(json!({"words": "x", "mm_per_m": 3, "max": 25.4})).is_err());
+        assert!(serde_json::from_value::<Tolerance>(json!({"words": "x", "steps": [{"upto_m": 3.05, "mm": 6.4}]})).is_err());
+        assert!(serde_json::from_value::<Tolerance>(json!({"words": "x", "mm_per_m": 3, "max_mm": 25.4})).is_ok());
+    }
+
+    #[test]
+    fn an_answer_says_within_or_outside_its_tolerance_in_mm_and_inches() {
+        let (settling, _) = decide(None, None, &check(0.9, 8.0, 8.0, 9.5, &[1]));
+        let (q, _) = decide(Some(&settling), Some(&reading(9.5, &[1])), &check(0.9, 8.0, 8.0, 9.5, &[1, 2]));
+        let t = tms("¼ in in 10 ft, ⅜ in in 20 ft, ½ in max");
+        let v = public("t1", &q, Some(&t));
+        assert_eq!(v["answer"]["allowed_mm"], 9.5);
+        assert_eq!(v["answer"]["within"], true);
+        assert_eq!(v["answer"]["out_of_plumb_in"], "3/8 in");
+        assert_eq!(v["answer"]["leans"], "toward the side it was scanned from");
+        assert_eq!(v["tolerance"]["words"], t.words);
+        let (q2, _) = decide(Some(&settling), Some(&reading(-9.6, &[1])), &check(0.9, 8.0, 8.0, -9.6, &[1, 2]));
+        let v2 = public("t1", &q2, Some(&t));
+        assert_eq!(v2["answer"]["within"], false);
+        assert_eq!(v2["answer"]["leans"], "away from the side it was scanned from");
+        // No tolerance: the figure, and no within.
+        assert!(public("t1", &q, None)["answer"].get("within").is_none());
+        // Not an answer: the words are echoed, nothing is judged.
+        let (rough, _) = decide(None, None, &check(0.9, 8.0, 22.0, 104.0, &[1]));
+        for q in [&settling, &rough] {
+            let v = public("t1", q, Some(&t));
+            assert!(!v.to_string().contains("within") && !v.to_string().contains("allowed"), "{v}");
+            assert_eq!(v["tolerance"]["words"], t.words);
+        }
+        assert_eq!([0.0, 1.6, 6.4, 12.7, 25.4, 30.0].map(inches), ["0 in", "1/16 in", "1/4 in", "1/2 in", "1 in", "1 3/16 in"]);
+        // Dead plumb leans no way.
+        assert!(reading_said(&reading(0.0, &[1]), None).get("leans").is_none());
+        // A tolerance with no allowance for this height says so, rather than nothing.
+        let short = Tolerance { steps: vec![Step { up_to_m: Some(3.05), mm: 6.4 }], ..t.clone() };
+        let v3 = reading_said(&reading(4.0, &[1]), Some(&short));
+        assert!(v3["allowed_mm"].is_null() && v3.get("within").is_none() && v3["tolerance_note"].as_str().unwrap().contains("5.0 m"), "{v3}");
+        let unmeasured = Reading { over_m: None, ..reading(4.0, &[1]) };
+        assert!(reading_said(&unmeasured, Some(&t))["tolerance_note"].as_str().unwrap().contains("ask again"));
+    }
+
+    #[test]
+    fn a_detected_wall_that_runs_on_past_the_face() {
+        let face = Face { from: [0.0, 0.0], to: [10.0, 0.0] };
+        let wall = |a: [f64; 2], b: [f64; 2]| face_wall("w", &Face { from: a, to: b }, [0.0, 3.0], vec![1]);
+        assert_eq!(runs_on(&face, &[wall([0.0, 0.1], [13.0, 0.1])]), Some([0.0, 3.0]));
+        assert_eq!(runs_on(&face, &[wall([-2.0, 0.0], [4.0, 0.0]), wall([5.0, 0.0], [12.5, 0.0])]), Some([2.0, 2.5]));
+        // Either end, not the two added up.
+        assert_eq!(runs_on(&face, &[wall([-0.6, 0.0], [10.6, 0.0])]), None);
+        // A short wall 12° across, its ends within 0.3 m of the line: not on it.
+        let (s12, c12) = 12f64.to_radians().sin_cos();
+        assert_eq!(runs_on(&face, &[wall([10.0, -0.12], [10.0 + 1.2 * c12, -0.12 + 1.2 * s12])]), None);
+        assert_eq!(runs_on(&face, &[wall([0.0, 0.5], [13.0, 0.5])]), None);
+        let (s, c) = 20f64.to_radians().sin_cos();
+        assert_eq!(runs_on(&face, &[wall([0.0, 0.0], [13.0 * c, 13.0 * s])]), None);
+        assert_eq!(runs_on(&face, &[wall([0.0, 0.0], [10.8, 0.0])]), None);
+        assert_eq!(runs_on(&face, &[wall([20.0, 0.0], [30.0, 0.0])]), None);
+        // Exactly 1 m past an end is not running on; one end alone is enough.
+        assert_eq!(runs_on(&face, &[wall([0.0, 0.0], [11.0, 0.0])]), None);
+        assert_eq!(runs_on(&face, &[wall([-1.0, 0.0], [10.0, 0.0])]), None);
+        assert_eq!(runs_on(&face, &[wall([-3.0, 0.0], [10.0, 0.0])]), Some([3.0, 0.0]));
+        // A wall that starts within 1 m of an end counts; one ending short of it, too.
+        assert_eq!(runs_on(&face, &[wall([10.5, 0.0], [13.0, 0.0])]), Some([0.0, 3.0]));
+        assert_eq!(runs_on(&face, &[wall([-4.0, 0.0], [-0.5, 0.0])]), Some([4.0, 0.0]));
+        // A short piece 12° across past the end, its ends within 0.3 m of the line.
+        assert_eq!(runs_on(&face, &[wall([10.8, 0.0], [10.8 + 0.49 * c12, 0.49 * s12])]), None);
+        // The same cases anywhere in the frame, the face turned 30° and moved.
+        let (s30, c30) = 30f64.to_radians().sin_cos();
+        let at = |p: [f64; 2]| [5.0 + p[0] * c30 - p[1] * s30, -3.0 + p[0] * s30 + p[1] * c30];
+        let moved = Face { from: at(face.from), to: at(face.to) };
+        let mwall = |a: [f64; 2], b: [f64; 2]| wall(at(a), at(b));
+        assert_eq!(runs_on(&moved, &[mwall([0.0, 0.1], [13.0, 0.1])]), Some([0.0, 3.0]));
+        assert_eq!(runs_on(&moved, &[mwall([-2.0, 0.0], [4.0, 0.0]), mwall([5.0, 0.0], [12.5, 0.0])]), Some([2.0, 2.5]));
+        assert_eq!(runs_on(&moved, &[mwall([0.0, 0.5], [13.0, 0.5])]), None);
+        assert_eq!(runs_on(&moved, &[mwall([0.0, -0.5], [13.0, -0.5])]), None);
+        assert_eq!(runs_on(&moved, &[mwall([10.0, -0.12], [10.0 + 1.2 * c12, -0.12 + 1.2 * s12])]), None);
+        assert_eq!(runs_on(&moved, &[mwall([-3.0, 0.0], [10.0, 0.0])]), Some([3.0, 0.0]));
+        assert_eq!(runs_on(&Face { from: [2.0, 2.0], to: [2.0, 2.0] }, &[mwall([0.0, 0.0], [13.0, 0.0])]), None);
+        // As the response gives it.
+        let said = face_said(&moved, 10.0, &[mwall([0.0, 0.1], [13.0, 0.1])]);
+        assert_eq!(said["length_m"], 10.0);
+        assert_eq!(said["runs_on"], json!({"past_from_m": 0.0, "past_to_m": 3.0}));
+        assert_eq!(said["from"], json!(moved.from));
+        assert!(face_said(&moved, 10.0, &[])["runs_on"].is_null());
     }
     fn check(seen: f64, len: f64, rms: f64, plumb: f64, stations: &[u16]) -> Check {
         let mut r = reading(plumb, stations);
@@ -687,15 +995,15 @@ mod tests {
         let (not_yet, _) = decide(None, None, &check(0.5, 8.0, 8.0, 5.0, &[1]));
         let (rough, _) = decide(None, None, &check(0.9, 8.0, 22.0, 104.0, &[1]));
         for q in [&settling, &not_yet, &rough] {
-            let v = public("t1", q);
+            let v = public("t1", q, None);
             assert!(!has_any(&v), "{v}");
             assert!(!v.to_string().contains("104"), "{v}");
             assert_eq!(v["target_id"], "t1");
             assert!(v["verdict"].is_string() && v["reason"].is_string(), "{v}");
         }
-        assert_eq!(public("t1", &rough)["verdict"], "does_not_fit");
+        assert_eq!(public("t1", &rough, None)["verdict"], "does_not_fit");
         let (q, _) = decide(Some(&settling), Some(&reading(5.0, &[1])), &check(0.9, 8.0, 8.0, 5.5, &[1, 2]));
-        let v = public("t1", &q);
+        let v = public("t1", &q, None);
         assert_eq!(v["verdict"], "answer");
         assert_eq!(v["answer"]["out_of_plumb_mm"], 5.5);
         assert_eq!(v["answer"]["stations"], json!([1, 2]));
@@ -803,13 +1111,16 @@ mod tests {
         let asked = vec![
             Asked { target_id: "long".into(), name: "Long facade".into(), declined: None,
                     on_site: q(Verdict::Answer, "", Some(reading(4.0, &[3, 4]))), again: Gate::Pass, again_reading: Some(reading(10.0, &[3, 4, 9])),
-                    image: Some("question-long.png".into()) },
+                    image: Some("question-long.png".into()), tolerance: Some(tms("¼ in in 10 ft, ⅜ in in 20 ft, ½ in max")),
+                    face: Face { from: [0.0, 0.0], to: [30.2, 0.0] }, runs_on_m: Some([1.0, 14.1]) },
             Asked { target_id: "back".into(), name: "Back wall".into(), declined: None,
                     on_site: q(Verdict::NotYet, "62% of the face is seen; 80% needed", None), again: Gate::NotYet("62% of the face is seen; 80% needed".into()),
-                    again_reading: None, image: None },
+                    again_reading: None, image: None, tolerance: Some(tms("¼ in in 10 ft")),
+                    face: Face { from: [0.0, 0.0], to: [8.0, 0.0] }, runs_on_m: None },
             Asked { target_id: "porch".into(), name: "Porch".into(), declined: Some("stepped facade: piers proud of the wall".into()),
                     on_site: q(Verdict::DoesNotFit, "rough", None), again: Gate::DoesNotFit("rough".into()), again_reading: None,
-                    image: Some("question-porch.png".into()) },
+                    image: Some("question-porch.png".into()), tolerance: None,
+                    face: Face { from: [0.0, 0.0], to: [8.0, 0.0] }, runs_on_m: None },
         ];
         let h = questions_html(&asked);
         let at = |s: &str| h.find(s).unwrap_or_else(|| panic!("{s} missing from {h}"));
@@ -827,6 +1138,13 @@ mod tests {
         for e in &entries[1..] {
             assert!(!e.contains(" mm out of plumb") && !e.contains("moved"), "{e}");
         }
+        // The tolerance in the person's words, the allowance and the call; the
+        // part of the wall the answer covers.
+        assert!(entries[0].contains("¼ in in 10 ft, ⅜ in in 20 ft, ½ in max") && entries[0].contains("allowed 9.5 mm") && entries[0].contains("within"), "{}", entries[0]);
+        assert!(entries[0].contains("30.2 m") && entries[0].contains("runs on 14.1 m past (30.2, 0.0)") && !entries[0].contains("past (0.0, 0.0)"), "{}", entries[0]);
+        // 4.0 mm on site was within 9.5; the final 10.0 mm is outside: the report says so.
+        assert!(entries[0].contains("<strong>outside</strong> the 9.5 mm allowed"), "{}", entries[0]);
+        assert!(!entries[1].contains("within") && !entries[1].contains("allowed"), "{}", entries[1]);
         // Within 5 mm: no flag.
         let mut calm = asked[0].clone();
         calm.again_reading = Some(reading(9.0, &[3, 4, 9]));

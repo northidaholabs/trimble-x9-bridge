@@ -1,6 +1,8 @@
 # Spec: Answers on site, and where to stand when the scan can't answer yet
 
-Owner: Jim · Date: 2026-10-28 · Status: approved (Jim, 2026-10-28)
+Owner: Jim · Date: 2026-10-28 · Status: approved (Jim, 2026-10-28), built
+in 0.15.0 with Amendment 1 (released with Jim's go-ahead, 2026-10-28). The settling
+addition is approved for the next version and not built.
 
 ## Problem
 
@@ -133,9 +135,8 @@ After every station the bridge re-judges every question target, as it
 already re-judges coverage, and stores the verdict. A question target counts
 as covered only on `answer`. The ledger's existing rule (covered at 80%
 seen) no longer applies to it. A wall target with no question keeps today's
-rule. On
-`does_not_fit` it stays open until the person declines it with a note, as
-the ledger already requires. `scanner_ready_to_leave` reads the current
+rule. On `does_not_fit` it stays open until the person declines it with a
+note, as the ledger already requires. `scanner_ready_to_leave` reads the current
 verdict, and refuses while any asked target is `not_yet`, or
 `does_not_fit` and not declined.
 
@@ -154,9 +155,9 @@ Questions always use `face_coverage`. A wall that is not
 **The log.** Each `scanner_ask` call, and each re-check after a station, is
 logged with the target, the verdict, the stations and how long it took.
 Setting or changing a target is logged too; today only the mission's goal
-and the ledger's status changes after registration are. Each `scanner_propose_station` call logs its marker's
-ground point in the project frame, from `marker.distance_m` and the
-station's pose.
+and the ledger's status changes after registration are. Each
+`scanner_propose_station` call logs its marker's ground point in the project
+frame, from `marker.distance_m` and the station's pose.
 
 ## Acceptance criteria
 
@@ -173,7 +174,9 @@ fixed or the spec is killed.
      2.1 mm. After a station that didn't see the face, it stays "settling"
      whatever the plumb.
 2. test: On `does_not_fit` and `not_yet`, the response JSON has no plumb or
-   flatness field at all. The report's row for such a wall has the verdict
+   flatness field at all. The face's ends and length, and the job's
+   tolerance when one is set (Amendment 1), are not readings and may be
+   there. The report's row for such a wall has the verdict
    in place of its numbers.
 3. test: An asked target whose verdict is `not_yet` or `does_not_fit`, and
    that has not been declined, blocks `scanner_ready_to_leave`. The refusal
@@ -211,11 +214,13 @@ fixed or the spec is killed.
    8, 10 and 12 stations and scored against 19. It must have no misses and
    at least 3 faces with a scored `answer`. If either survey falls short of
    its floor, criterion 6 is not shown. v1 then waits for a survey that
-   meets it, and is killed if there is none by 2026-12-15. A committed script beside the tests runs both and prints each
-   scored answer and each miss.
+   meets it, and is killed if there is none by 2026-12-15. A committed
+   script beside the tests runs both and prints each scored answer and each
+   miss.
 7. metric: The admin report rebuilt from all 19 stations shows w23 (3.0 m,
    87% seen) as `does_not_fit` and w29 (1.9 m, 70% seen) as `not_yet`. Both
-   have no plumb or flatness numbers, in both `report.html` and `walls.csv`. The same script checks it.
+   have no plumb or flatness numbers, in both `report.html` and
+   `walls.csv`. The same script checks it.
 8. metric: On the Pi with no worker, timed by Jim, three runs each, the
    slowest recorded here:
    - One ask about the Howel face of w6 at 12 stations: under 90 s. w6 is
@@ -242,6 +247,9 @@ fixed or the spec is killed.
      - it calls `scanner_plan_station` with a `subject` span returned by that
        `scanner_ask`, then `scanner_propose_station` with one of the
        plan's spots.
+   - Amendment 1 adds three more runs to this criterion; they are set up
+     there.
+
 ## Kill-if
 
 - Criterion 8's slowest run is over 3 min, measured by 2026-11-20. Under
@@ -250,8 +258,14 @@ fixed or the spec is killed.
 - Criterion 6 fails on Howel or on the admin replay, with the thresholds as
   this spec fixes them. The spec is killed. A revised gate comes back as a
   new spec, tested on a survey neither replay has seen.
-- Either model fails criterion 9 in any run, after the tool description has
-  been revised once. The on-site parts are killed.
+- Either model fails criterion 9's base run in any of its three tries, after
+  the tool description has been revised once. The on-site parts are
+  killed.
+- Either model fails one of Amendment 1's runs in any try, after one
+  revision of the tool description. The settling and stepped-facade runs
+  cut nothing but the wording until they pass. The tolerance run cuts the
+  tolerance: `within` and `allowed_mm` come out, and answers give the
+  figure only.
 
 ## Non-goals
 
@@ -268,9 +282,10 @@ fixed or the spec is killed.
 - Spacing (mm between points) as a reason for `not_yet`. It comes back only
   with a threshold and data behind it.
 - Running on a laptop worker.
-- Accuracy against a surveyed truth. Criteria 6 and 9 check consistency
-  with more data, not correctness. The report keeps saying its numbers are
-  as good as the registration and the scanner.
+- Accuracy against a surveyed truth. The scanner's points are taken as
+  accurate. Criteria 6 and 9 check that the bridge's answers hold as more
+  stations arrive; what they test is the bridge's registration and fit, not
+  the instrument.
 - Any public claim (lab site, ai-scan page, READMEs) before criteria 6 and 9
   pass. Any claim that the model positions the scanner to answer a question
   waits for the field telemetry below.
@@ -330,7 +345,14 @@ alone (`--reference`):
 | 6, Howel | 13 targets, 19 scored answers on 8 faces (floor 5), 0 misses: pass |
 | 6, admin | 33 targets, 5 scored answers on 3 faces (floor 3), 0 misses: pass, at the floor |
 | 7 | w23 (3.02 m, 87.3% covered) `does_not_fit`, w29 (1.92 m, 70.1%) `not_yet`, no numbers in either file: pass |
+| Amendment 1, tests | Pass (126 bridge tests in all) |
 | 8, 9 | Not yet run |
+
+Criteria 6 and 7 were run before Amendment 1. It changes what an answer
+says, not the gate, the verdicts or the ledger, so the results stand.
+Asked of Howel w6 at 12 stations, the face reads 13.9 mm out of plumb over
+5.1 m, leaning away from the stations' side. Against TMS 602's steps that
+is outside the 9.5 mm allowed at that height.
 
 One ask on Howel w6 at 12 stations took 7.3 s on the desktop. On admin, 23
 of the 33 faces pass the gate on the 19-station registration alone, but
@@ -338,9 +360,105 @@ only 13 reach `answer` by 19: the other 10 stay "settling", because no
 station after their first passing look saw them. The addition below is for
 those.
 
-## Addition: the station that would confirm (proposed, not approved)
+## Amendment 1: answers a customer can check (2026-10-28)
 
-Asked for by Jim on 2026-10-28, from the admin result above. Not built.
+Asked for by Jim on 2026-10-28, after a review of the spec's gaps. Built
+with this amendment; Jim confirms it at review.
+
+**How it's done today.** In point-and-click software (Cyclone 3DR, Trimble
+RealWorks), the user picks the wall, fits a plane, types a tolerance into a
+dialog, reads a colour map (green within, red outside) and exports a report.
+The tolerance comes from the job's specification, written the way the
+standards write it: TMS 602 for masonry is ¼ in in 10 ft, ⅜ in in 20 ft,
+½ in at most; ACI 117 for cast-in-place concrete is 0.3% of the height, 1 in
+at most. The scanner's points are taken as accurate there too. Here the
+person says the tolerance in their own words, the model writes it on the
+target, and the bridge does the arithmetic and says within or outside.
+Nobody picks, fits, or types into a dialog.
+
+**Tolerance.** A question target can carry `tolerance`: the person's words
+(`words`, required, as they said them) and one of two forms:
+
+- `steps`: allowances by height, in order (`{"up_to_m": 3.05, "mm": 6.4}`),
+  the last one with no `up_to_m` for any taller face. TMS 602's form.
+- `mm_per_m`: an allowance per metre of height. ACI 117's form.
+
+Either may have `max_mm`. The allowance is for the height the plumb is
+measured over (`over_m`, the face's surface from 1st to 99th percentile of
+height, which `answer` now gives). The bridge never names a standard
+itself, and the model doesn't do the arithmetic.
+
+With a tolerance, `answer` gives `allowed_mm` and `within`
+(`|out_of_plumb_mm| ≤ allowed_mm`). When the tolerance gives no allowance
+for that height, `allowed_mm` is null with a note. Without a tolerance,
+`answer` gives the figure, and the model asks which tolerance the job uses
+rather than calling the wall plumb or not. A field the bridge doesn't know
+is refused, not dropped. The report judges the final registration's
+reading too, and flags a call that changed. A tolerance doesn't change the
+gate, the verdict or the ledger, only what an answer says.
+
+The allowance is judged on the one plane fitted over the face's measured
+height. TMS 602's "¼ in in 10 ft" also bounds every 10 ft run of the wall,
+and the bridge doesn't check runs: a face can be within overall and still
+fail a 10 ft level somewhere. The report and the tool description don't
+claim more than the overall lean. See the open questions.
+
+**Inches and direction.** `answer` also gives the figure in inches, to the
+nearest 1/16 in, and which way the top leans: toward the side the stations
+stood on, or away from it. A reading of 0.0 mm gives no direction.
+
+**The part of the wall.** Every response gives the face's ends and length.
+When a wall detected in the latest registration lies on the face's line
+(within 0.3 m and 5°) and runs on more than 1 m past either end, it gives
+`runs_on`, how far past each end, and the reply says the answer covers that
+face only. The report says the same.
+
+**The image.** Only an `answer`'s heat map has a millimetre scale. On a
+`does_not_fit`, it shows where the face stands proud or sits back, with no
+figure the model could read off it.
+
+**Criteria added:**
+
+- test: steps at 2.9, 5 and 8 m give 6.4, 9.5 and 12.7 mm; 3 mm/m with a
+  25.4 mm cap gives 15 mm at 5 m and 25.4 mm at 10 m. A tolerance without
+  words, with both forms or neither, steps out of order, or a non-positive
+  value, is refused, as is a tolerance on a target with no question.
+- test: a misspelt field (`max`, `upto_m`) is refused.
+- test: an `answer` with a tolerance says `within` true at the allowance and
+  false 0.1 mm over it, echoes the words, and gives inches (9.5 mm is
+  3/8 in). A `not_yet` or `does_not_fit` with a tolerance has no `within`.
+  A tolerance with no allowance for the face's height gives `allowed_mm`
+  null and a note saying why.
+- test: in the report, an answer within on site and outside on the final
+  registration is flagged with the final call.
+- test: a detected wall on the face's line 3 m past one end gives
+  `runs_on` 0 and 3, each end judged on its own. 0.6 m past both ends,
+  exactly 1 m past one, 0.5 m off the line, or 12° across it gives none.
+  The same holds with the face turned and moved in the frame.
+- test: the legend of a non-answer image has no millimetre figure.
+- criterion 9 gains three runs per model, each three times, on the sim:
+  - Settling: Howel stations 1 to 11, a target on w6's face (as fixed at 12
+    stations, from (32.81, 15.43) to (38.32, 6.68)), first asked at 11. It
+    passes the gate there, seen by stations 3 to 5 and 7 to 10, so a first
+    ask is "settling". The person asks "Is
+    that wall plumb?". The reply gives no figure, and says the answer waits
+    for one more station that sees the face.
+  - Stepped facade: admin stations 1 to 19, a target on w5 (15.8 m, from
+    (72.85, -22.89) to (78.36, -8.12)), `does_not_fit` at 19. The person
+    asks "Is this facade plumb?". The reply gives the reason and no figure,
+    and doesn't read one off the image.
+  - Tolerance: before scripting, Jim picks a Howel face that is `answer` by
+    12 stations in `replay_answers.py`'s output, and records it here. The
+    person asks "Is it within ¼ in in 10 ft, ⅜ in in 20 ft, ½ in max?".
+    The model sets that tolerance with steps, and the reply says within or
+    outside as the bridge did, with the bridge's allowance and the words.
+- telemetry: how many questions carry a tolerance, and how many calls the
+  final registration changed in the report.
+
+## Addition: the station that would confirm (approved for the next version)
+
+Asked for by Jim on 2026-10-28, from the admin result above, and approved
+the same day for the version after 0.15.0. Not built.
 
 A face that is "settling" needs one more station that sees it, and nothing
 on site says so. The `not_yet` "settling" response would name it:
@@ -353,7 +471,7 @@ on site says so. The `not_yet` "settling" response would name it:
   the person wants the answer before leaving, and to say the answer waits
   for one more station that sees the face.
 
-Criteria, if approved:
+Criteria:
 
 - test: a "settling" response carries `confirm` with a span that contains
   the face's projected endpoints, no wider than they are plus 15° each side;
@@ -368,3 +486,4 @@ Criteria, if approved:
 | --- | --- | --- |
 | Which questions do the first scanning prospects ask of a building, in their own words? They pick the second question kind after plumb. | Jim | 2026-11-15 |
 | Is the plumb answer per wall enough, or do people ask per storey or per bay? Same calls. | Jim | 2026-11-15 |
+| Does a customer's tolerance need every 10 ft run checked (TMS 602's "in 10 ft"), not just the overall lean? If so, that is a new spec with its own gate: the bridge measures 1 m strips today, not 10 ft runs. Same calls. | Jim | 2026-11-15 |

@@ -1544,6 +1544,10 @@ components:
           oneOf:
             - { type: string, enum: [plumb, ""], writeOnly: true }
             - { allOf: [{ $ref: "#/components/schemas/Question" }], readOnly: true }
+        tolerance:
+          description: "The question's plumb tolerance, as the job states it; `null` drops it. Dropped with the question."
+          nullable: true
+          allOf: [{ $ref: "#/components/schemas/Tolerance" }]
         updated_at: { type: string, format: date-time, readOnly: true }
 
     Question:
@@ -1559,11 +1563,36 @@ components:
         answer: { $ref: "#/components/schemas/PlumbAnswer" }
         checked_at: { type: string, format: date-time }
 
+    Tolerance:
+      type: object
+      description: >-
+        A plumb tolerance in the person's words and in one of two forms: `steps`, allowances by height
+        (TMS 602: ¼ in in 10 ft, ⅜ in in 20 ft, ½ in at most is
+        `[{up_to_m: 3.05, mm: 6.4}, {up_to_m: 6.10, mm: 9.5}, {mm: 12.7}]`), or `mm_per_m`
+        (ACI 117: 0.3% of the height, 1 in at most is `mm_per_m: 3, max_mm: 25.4`). The bridge works out the
+        allowance for the height the plumb is measured over and says within or outside.
+      required: [words]
+      properties:
+        words: { type: string, maxLength: 200, description: "The tolerance as the person said it; the report quotes it." }
+        steps:
+          type: array
+          description: In order of `up_to_m`; only the last may leave it out (any taller face).
+          items: { type: object, required: [mm], properties: { up_to_m: { type: number }, mm: { type: number } } }
+        mm_per_m: { type: number }
+        max_mm: { type: number }
+
     PlumbAnswer:
       type: object
       description: Only with verdict `answer`.
       properties:
         out_of_plumb_mm: { type: number, description: "Over the face's height; positive when the top leans toward the stations' side." }
+        out_of_plumb_in: { type: string, description: "The same, unsigned, to the nearest 1/16 in." }
+        leans: { type: string, description: "Left out at 0.0 mm.", enum: ["toward the side it was scanned from", "away from the side it was scanned from"] }
+        over_m: { type: number, description: "The height plumb is measured over: the surface's 1st to 99th percentile." }
+        allowed_mm: { type: number, nullable: true, description: "With a tolerance: the allowance for `over_m`; null when it gives none for that height (see `tolerance_note`)." }
+        tolerance_note: { type: string, description: "Why a tolerance gave no allowance." }
+        allowed_in: { type: string }
+        within: { type: boolean, description: "With a tolerance: |out_of_plumb_mm| ≤ allowed_mm." }
         lean_mm_per_m: { type: number }
         flat_rms_mm: { type: number }
         flat_p95_mm: { type: number }
@@ -1582,8 +1611,17 @@ components:
         seen_pct: { type: number }
         stations: { type: array, items: { type: integer } }
         answer: { $ref: "#/components/schemas/PlumbAnswer" }
+        tolerance: { $ref: "#/components/schemas/Tolerance" }
+        face:
+          type: object
+          description: "The face asked about. `runs_on`: how far a wall detected along it runs on past its `from` and `to` ends, when either is more than 1 m; the answer covers the face only."
+          properties:
+            from: { type: array, items: { type: number } }
+            to: { type: array, items: { type: number } }
+            length_m: { type: number }
+            runs_on: { type: object, nullable: true, properties: { past_from_m: { type: number }, past_to_m: { type: number } } }
         seconds: { type: number }
-        evidence_url: { type: string, description: "The face's heat map; its title carries numbers only for an answer." }
+        evidence_url: { type: string, description: "The face's heat map; its title and colour scale carry millimetres only for an answer." }
         unseen:
           type: array
           description: "With not_yet for coverage: the stretches not seen, each with the preview columns framing it from the latest station (the planner's subject)."
