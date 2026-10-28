@@ -193,7 +193,7 @@ internet (a wheelhouse built elsewhere) and the launcher, which reads
   laptop whether to use it (`scanner_processing`); on a yes, on the laptop:
 
   ```bash
-  tag=v0.14.0; t=aarch64-apple-darwin      # x86_64-apple-darwin on Intel
+  tag=v0.15.0; t=aarch64-apple-darwin      # x86_64-apple-darwin on Intel
   f=trimble-x9-bridge-$tag-$t
   curl -LO https://github.com/northidaholabs/trimble-x9-bridge/releases/download/$tag/$f.tar.gz
   curl -LO https://github.com/northidaholabs/trimble-x9-bridge/releases/download/$tag/$f.tar.gz.sha256
