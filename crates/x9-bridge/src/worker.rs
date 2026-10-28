@@ -485,6 +485,7 @@ async fn register_once(st: &Arc<AppState>, job_id: &str, project_id: &str) -> Re
             st.log("note", format!("Ledger from the registration: {}", changed.join("; ")), "bridge", Some(project_id), &[("mission_id", &m.mission_id)]);
         }
     }
+    crate::ask::recheck(st, project_id).await;
     let placed = reg.stations.iter().filter(|s| s.pose.is_some()).count();
     Ok(serde_json::json!({"project_id": project_id, "stations": reg.stations.len(), "placed": placed, "summary": reg.summary}))
 }

@@ -54,6 +54,13 @@ pub struct Inner {
     pub next_stations: HashMap<String, (Value, Vec<u8>)>,
     /// Each project's mission (what the job is for, and its ledger).
     pub missions: HashMap<String, crate::mission::Mission>,
+    /// A question's reading waiting for its second pass, by (project, target):
+    /// kept here, out of the mission, so no client can quote it.
+    pub settling: HashMap<(String, String), (crate::register::Face, crate::ask::Reading)>,
+    /// One look at a question target at a time, by (project, target).
+    pub asking: HashMap<(String, String), std::sync::Arc<tokio::sync::Mutex<()>>>,
+    /// A question's latest evidence image, by (project, target).
+    pub evidence: HashMap<(String, String), Vec<u8>>,
     /// Each project's registration (`registrations.json`).
     pub registrations: HashMap<String, crate::register::Registration>,
     /// Each registered project's merged wall points, loaded on first use.

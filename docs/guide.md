@@ -874,9 +874,61 @@ curl -s -X POST -H "$OPERATOR" -d '{"confirmed_via":"web UI"}' $B/projects/$PROJ
 
 Every change is announced as a `mission` event and saved to
 `missions.json` in the data directory, so a restart keeps the job. The field
-log gets the mission, "Ready to leave" and the sign-off with its tally. The
+log gets the mission, each target set or changed (with its face and
+question), "Ready to leave" and the sign-off with its tally. The
 web UI shows the mission and its ledger at the top of Now, with **Sign off
 the job** for operators when it is ready.
+
+### Questions on site
+
+You scan to answer questions. A wall target can carry one, and the bridge
+answers it from the point cloud while the operator is still there
+(`specs/on-site-answers.md`). v1 asks one kind: is this wall plumb, and how
+flat is it.
+
+```bash
+curl -s -X POST -H "$H" -d '{"targets":[{"target_id":"east","name":"East facade","kind":"facade",
+  "wall_id":"w6","question":"plumb"}]}' $B/projects/$PROJECT/mission/targets
+curl -s -X POST -H "$H" $B/projects/$PROJECT/mission/targets/east/ask
+# {"target_id":"east","verdict":"not_yet","reason":"62% of the face is seen; 80% needed",
+#  "unseen":[{"from":[..],"to":[..],"length_m":3.5,"subject":{"scan_id":"…","x0":812,"x1":1040,"query":"812,1040"}}],...}
+```
+
+The question is judged on the target's fixed face (its `face`, or the
+`wall_id`'s line when the target was set), never on a wall the registration
+detects later. One gate decides it, in this order:
+
+| Verdict | When | The response |
+| --- | --- | --- |
+| `not_yet` | Under 80% of the face seen, too few points to fit, or `settling` | What is missing. For coverage, each unseen stretch with a `subject`: the preview columns on the latest station that frame it, for `GET /scans/{id}/next-station/plan?subject=x0,x1` |
+| `does_not_fit` | Shorter than 4 m, or rougher than 15 mm RMS against one plane | The reason and the heat map (`evidence_url`). A short face stays so; a rough one can still answer once more stations see it |
+| `answer` | Passed twice: once, and again after a later station that saw the face, with plumb moving 2 mm or less | `answer`: `out_of_plumb_mm` (over the face's height, positive when the top leans toward the stations' side), `lean_mm_per_m`, `flat_rms_mm` and the stations, with the heat map |
+
+Only an `answer` carries plumb or flatness numbers. A first passing reading
+waits in the bridge's memory for its second pass and is never sent to
+clients: the model can't quote what it doesn't have. A face whose new data
+moves the answer by more than 2 mm goes back to settling; one that drops
+under 80% seen loses it.
+
+A question target is covered only by its answer: never by coverage, and a
+manual `covered` is refused. After every registration the bridge re-checks
+every question target, asked or not, and logs each verdict with its stations
+and how long it took. `ready` refuses while any is open; one that doesn't fit
+is declined with its reason. Changing the target's face starts its question
+over, and `"question": ""` drops it.
+
+The fit reads the full-resolution files of the trusted stations that saw the
+face, as `analyze` does for walls; one ask on a face seen by seven stations
+takes about 7 s on a desktop.
+
+`x9-bridge ask [--state STATE.json] REGISTER_DIR x0,y0,x1,y1` asks the same
+question offline, of a `x9-bridge register` output, with `--state` carrying
+settling from one count of stations to the next. `x9-bridge analyze
+--questions MISSION.json` opens the report with the mission's questions,
+each recomputed from the final registration and flagged when it moved more
+than 5 mm from the answer given on site. The report applies the same gate
+once to every detected wall: a wall that isn't an answer shows its verdict
+instead of numbers, in `report.html`, `walls.csv` and the wall image.
 
 ### Registration: every station in one frame
 

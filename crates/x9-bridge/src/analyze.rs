@@ -59,11 +59,13 @@ pub struct Opts {
     pub straightedge_m: f64,
     pub tolerance_mm: f64,
     pub sections: Vec<[f64; 4]>,
+    /// A mission (`missions.json` entry) whose questions open the report.
+    pub questions: Option<String>,
 }
 
 impl Default for Opts {
     fn default() -> Opts {
-        Opts { straightedge_m: 3.0, tolerance_mm: 6.0, sections: vec![] }
+        Opts { straightedge_m: 3.0, tolerance_mm: 6.0, sections: vec![], questions: None }
     }
 }
 
@@ -255,6 +257,51 @@ pub struct WallResult {
     /// The surface's top (99th percentile) above the ground at its foot (m).
     pub top_above_ground_m: Option<f64>,
     pub image: String,
+    /// The gate's word on plumb and flatness (`answer`, `not_yet`,
+    /// `does_not_fit`) and, when not an answer, why: the numbers are gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The on-site gate (`ask::gate`), once, on every wall of a finished survey:
+/// a wall under 80% covered, under 4 m, or rougher than 15 mm RMS keeps its
+/// place and coverage and loses its plumb and flatness numbers.
+pub fn gate_walls(walls: &mut [WallResult]) {
+    use crate::ask::Gate;
+    for w in walls {
+        let (verdict, reason) = match crate::ask::gate(w.covered_pct / 100.0, w.length_m, w.flat_rms_mm) {
+            Gate::Pass => ("answer", None),
+            Gate::NotYet(r) => ("not_yet", Some(r)),
+            Gate::DoesNotFit(r) => ("does_not_fit", Some(r)),
+        };
+        withhold(w, verdict, reason);
+    }
+}
+
+/// Give a measured wall its verdict; anything but an answer loses its plumb
+/// and flatness numbers.
+pub fn withhold(w: &mut WallResult, verdict: &str, reason: Option<String>) {
+    {
+        w.verdict = Some(verdict.into());
+        if reason.is_some() {
+            w.lean_mm_per_m = None;
+            w.out_of_plumb_mm = None;
+            w.worst_strip_mm_per_m = None;
+            w.worst_strip_at_m = None;
+            w.flat_rms_mm = None;
+            w.flat_p95_mm = None;
+            w.straightedge_ok_pct = None;
+            w.straightedge_worst_mm = None;
+        }
+        w.reason = reason;
+    }
+}
+
+/// "not yet", "does not fit"
+fn said(verdict: &str) -> String {
+    verdict.replace('_', " ")
 }
 
 fn percentile(v: &mut [f64], q: f64) -> Option<f64> {
@@ -280,7 +327,8 @@ fn diverging(t: f64) -> [u8; 3] {
     [0, 1, 2].map(|k| (a[k] + (b[k] - a[k]) * s) as u8)
 }
 
-fn analyze_wall(g: &WallGrid, ground: Option<&Ground>, opts: &Opts, img: &str) -> (WallResult, Vec<u8>) {
+/// Measure one wall's grid; the plane comes back for drawing it.
+fn measure_wall(g: &WallGrid, ground: Option<&Ground>, opts: &Opts, img: &str) -> (WallResult, Option<[f64; 3]>) {
     let cells = g.cells();
     let w = &g.wall;
     let total = ((w.length_m / g.cell) * ((w.z_m[1] - w.z_m[0]) / g.cell)).max(1.0);
@@ -365,8 +413,20 @@ fn analyze_wall(g: &WallGrid, ground: Option<&Ground>, opts: &Opts, img: &str) -
         straightedge_worst_mm: gaps.iter().cloned().fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x)))).map(|v| r1(v * 1000.0)),
         top_above_ground_m: top.map(r2),
         image: img.to_string(),
+        verdict: None,
+        reason: None,
     };
-    (r.clone(), wall_png(g, plane, &r, opts))
+    (r, plane)
+}
+
+/// The wall image's title: its numbers only when the gate let them through.
+fn wall_title(r: &WallResult) -> String {
+    let top = r.top_above_ground_m.map(|t| format!("top {t:.1} m above ground")).unwrap_or_else(|| "height unknown".into());
+    if let (Some(v), Some(_)) = (&r.verdict, &r.reason) {
+        return format!("Wall {} · {:.1} m long · {top} · plumb and flatness: {}", r.wall_id, r.length_m, said(v));
+    }
+    let lean = r.out_of_plumb_mm.map(|v| format!("leans {v:+.0} mm over its height")).unwrap_or_else(|| "lean unknown".into());
+    format!("Wall {} · {:.1} m long · {top} · flatness RMS {} mm · {lean}", r.wall_id, r.length_m, r.flat_rms_mm.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()))
 }
 
 /// The wall's face seen from the stations' side: colour by departure from
@@ -407,16 +467,7 @@ fn wall_png(g: &WallGrid, plane: Option<[f64; 3]>, r: &WallResult, opts: &Opts) 
         }
     }
     let font = crate::station::font();
-    let lean = r.out_of_plumb_mm.map(|v| format!("leans {v:+.0} mm over its height")).unwrap_or_else(|| "lean unknown".into());
-    let title = format!(
-        "Wall {} · {:.1} m long · {} · flatness RMS {} mm · {}",
-        r.wall_id,
-        r.length_m,
-        r.top_above_ground_m.map(|t| format!("top {t:.1} m above ground")).unwrap_or_else(|| "height unknown".into()),
-        r.flat_rms_mm.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()),
-        lean
-    );
-    cv.text(&font, 15.0, (12.0, 10.0), 0.0, &title, TEXT);
+    cv.text(&font, 15.0, (12.0, 10.0), 0.0, &wall_title(r), TEXT);
     // Legend.
     let ly = (top + ih + 14) as i64;
     for i in 0..200 {
@@ -1066,7 +1117,7 @@ fn dxf(walls: &[Wall], stations: &[(u16, [f64; 2])], ponds: &[Pond]) -> String {
     s
 }
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
@@ -1074,7 +1125,7 @@ fn opt(v: Option<f64>, unit: &str) -> String {
     v.map(|v| format!("{v}{unit}")).unwrap_or_else(|| "–".into())
 }
 
-fn report_html(summary: &Value, walls: &[WallResult], ponds: &[Pond], sections: &[Section], opts: &Opts) -> String {
+fn report_html(summary: &Value, walls: &[WallResult], ponds: &[Pond], sections: &[Section], opts: &Opts, questions: &str) -> String {
     let mut h = String::new();
     let _ = write!(
         h,
@@ -1082,15 +1133,31 @@ fn report_html(summary: &Value, walls: &[WallResult], ponds: &[Pond], sections: 
 <style>body{{font:15px/1.5 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:24px auto;max-width:1200px;padding:0 16px;color:#1f2328;background:#fff}}
 h1{{font-size:24px}}h2{{font-size:19px;margin-top:32px;border-bottom:1px solid #d0d7de}}table{{border-collapse:collapse;width:100%;font-size:13px}}
 th,td{{border:1px solid #d0d7de;padding:4px 6px;text-align:right}}th:first-child,td:first-child{{text-align:left}}img{{max-width:100%;border-radius:6px}}
-.note{{color:#57606a}}.bad{{color:#cf222e;font-weight:600}}
+.note{{color:#57606a}}.bad{{color:#cf222e;font-weight:600}}.question{{border:1px solid #d0d7de;border-radius:6px;padding:4px 12px;margin:12px 0}}.question h3{{margin:6px 0}}.verdict{{font-weight:600;text-transform:uppercase;font-size:12px;letter-spacing:.04em;margin-right:6px}}.flag{{color:#cf222e}}.declined{{color:#57606a}}
 @media (prefers-color-scheme:dark){{body{{background:#0d1117;color:#e6edf3}}th,td{{border-color:#30363d}}.note{{color:#8b949e}}h2{{border-color:#30363d}}}}</style>
 <h1>Survey report</h1>
 <p class="note">{} stations used: those the registration audit trusts. Project frame of station {}: x and y in metres, not north. Flatness tolerance {} mm over a {} m straight line. Made by x9-bridge {}.</p>"#,
         summary["stations_used"], summary["frame_station"], opts.tolerance_mm, opts.straightedge_m, env!("CARGO_PKG_VERSION")
     );
-    let _ = write!(h, "<h2>Walls</h2><p class=note>Building walls only. <b>Lean</b>: the best-fit plane's tilt over the wall's height, positive when the top leans toward the side the stations stood on (outward, for a facade scanned from outside). <b>Flatness</b>: the surface's departure from that plane, leaving out openings and reliefs more than 50 mm off. <b>Straight-line check</b>: windows of {} m along rows and columns, each within {} mm of its own straight line.</p>", opts.straightedge_m, opts.tolerance_mm);
+    h.push_str(questions);
+    let _ = write!(h, "<h2>Walls</h2><p class=note>Building walls only. <b>Lean</b>: the best-fit plane's tilt over the wall's height, positive when the top leans toward the side the stations stood on (outward, for a facade scanned from outside). <b>Flatness</b>: the surface's departure from that plane, leaving out openings and reliefs more than 50 mm off. <b>Straight-line check</b>: windows of {} m along rows and columns, each within {} mm of its own straight line. A wall less than {:.0}% covered, shorter than {:.0} m, or rougher than {:.0} mm RMS against one plane gives the reason instead of these numbers: not seen enough yet, or not one flat face.</p>", opts.straightedge_m, opts.tolerance_mm, crate::register::FACE_COVERED * 100.0, crate::ask::MIN_LENGTH_M, crate::ask::MAX_RMS_MM);
     h.push_str("<table><tr><th>Wall</th><th>Length m</th><th>Top above ground m</th><th>Lean mm</th><th>Worst strip mm/m</th><th>Flat RMS mm</th><th>Flat p95 mm</th><th>Straight-line OK %</th><th>Worst mm</th><th>Openings etc. %</th><th>Covered %</th><th>Seen by</th></tr>");
     for w in walls {
+        if let (Some(v), Some(why)) = (&w.verdict, &w.reason) {
+            let _ = write!(
+                h,
+                "<tr><td><a href=\"#{id}\">{id}</a></td><td>{}</td><td>{}</td><td colspan=6 class=note style=\"text-align:left\"><b>{}</b>: {}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                w.length_m,
+                opt(w.top_above_ground_m, ""),
+                said(v),
+                esc(why),
+                w.features_pct,
+                w.covered_pct,
+                w.seen_by.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(" "),
+                id = esc(&w.wall_id)
+            );
+            continue;
+        }
         let ok_class = if w.straightedge_ok_pct.is_some_and(|p| p < 90.0) { " class=bad" } else { "" };
         let _ = write!(
             h,
@@ -1139,7 +1206,7 @@ th,td{{border:1px solid #d0d7de;padding:4px 6px;text-align:right}}th:first-child
 
 // -------------------------------------------------------------------- cli ---
 
-const USAGE: &str = "usage: x9-bridge analyze [--straightedge M] [--tolerance-mm MM] [--section x1,y1,x2,y2]… REGISTER_DIR OUT_DIR STATION.tzf…\n       x9-bridge analyze --compare [--min-change-m M] BEFORE_DIR AFTER_DIR OUT_DIR";
+const USAGE: &str = "usage: x9-bridge analyze [--straightedge M] [--tolerance-mm MM] [--section x1,y1,x2,y2]… [--questions MISSION.json] REGISTER_DIR OUT_DIR STATION.tzf…\n       x9-bridge analyze --compare [--min-change-m M] BEFORE_DIR AFTER_DIR OUT_DIR";
 
 pub fn cli(args: &[String]) -> anyhow::Result<()> {
     let mut opts = Opts::default();
@@ -1157,6 +1224,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
                 anyhow::ensure!(v.len() == 4, "--section x1,y1,x2,y2");
                 opts.sections.push([v[0], v[1], v[2], v[3]]);
             }
+            "--questions" => opts.questions = Some(val()?),
             "--compare" => compare = true,
             "--min-change-m" => min_change = val()?.parse()?,
             "-h" | "--help" => {
@@ -1173,6 +1241,68 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     let [reg, out, files @ ..] = &rest[..] else { anyhow::bail!(USAGE) };
     anyhow::ensure!(!files.is_empty(), USAGE);
     run(reg, out, files, &opts)
+}
+
+/// Every point of a station file at full resolution: `(scanner frame,
+/// project frame, range)`, past half a metre. Returns how many were decoded.
+fn station_points(f: &std::path::Path, pose: &Pose, mut each: impl FnMut([f32; 3], [f64; 3], f64)) -> anyhow::Result<usize> {
+    let t = trimble_tzf::Tzf::open(f).with_context(|| format!("opening {}", f.display()))?;
+    let pts = t.grid_points().with_context(|| format!("{}: decoding", f.display()))?;
+    for g in &pts {
+        let p = [g.point.x, g.point.y, g.point.z];
+        if !p.iter().all(|v| v.is_finite()) {
+            continue;
+        }
+        let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt() as f64;
+        if r < 0.5 {
+            continue;
+        }
+        let w = pose.apply(p);
+        each(p, [w[0] as f64, w[1] as f64, w[2] as f64], r);
+    }
+    Ok(pts.len())
+}
+
+/// A face measured as `run` measures a wall, kept for drawing once the gate
+/// has had its say (`png` draws `result` as it then stands).
+pub struct FaceFit {
+    pub result: WallResult,
+    grid: WallGrid,
+    plane: Option<[f64; 3]>,
+}
+
+impl FaceFit {
+    pub fn png(&self, opts: &Opts) -> Vec<u8> {
+        wall_png(&self.grid, self.plane, &self.result, opts)
+    }
+}
+
+/// Walls measured from the full-resolution points of the stations that saw
+/// them (`files`: station number, pose, file), without the ground. Each file
+/// is read once, and only if one of the walls lists its station.
+pub fn measure_faces(walls: &[Wall], files: &[(u16, Pose, std::path::PathBuf)], opts: &Opts) -> anyhow::Result<Vec<FaceFit>> {
+    let xy: HashMap<u16, [f64; 2]> = files.iter().map(|(n, p, _)| (*n, [p.xyz_m[0], p.xyz_m[1]])).collect();
+    let mut grids: Vec<WallGrid> = walls.iter().map(|w| WallGrid::new(w, &w.seen_by.iter().filter_map(|s| xy.get(s).copied()).collect::<Vec<_>>())).collect();
+    for (n, pose, f) in files {
+        let mine: Vec<usize> = (0..walls.len()).filter(|&k| walls[k].seen_by.contains(n)).collect();
+        if mine.is_empty() {
+            continue;
+        }
+        station_points(f, pose, |_, w, r| {
+            if r <= WALL_RANGE_M {
+                for &k in &mine {
+                    grids[k].add(w);
+                }
+            }
+        })?;
+    }
+    Ok(grids
+        .into_iter()
+        .map(|grid| {
+            let (result, plane) = measure_wall(&grid, None, opts, &format!("wall-{}.png", grid.wall.wall_id));
+            FaceFit { result, grid, plane }
+        })
+        .collect())
 }
 
 pub fn run(reg: &str, out: &str, files: &[String], opts: &Opts) -> anyhow::Result<()> {
@@ -1203,20 +1333,8 @@ pub fn run(reg: &str, out: &str, files: &[String], opts: &Opts) -> anyhow::Resul
     for &k in &used {
         let f = &files[k];
         let pose = poses[k].unwrap();
-        let t = trimble_tzf::Tzf::open(std::path::Path::new(f)).with_context(|| format!("opening {f}"))?;
-        let pts = t.grid_points().with_context(|| format!("{f}: decoding"))?;
         let mut n = 0usize;
-        for g in &pts {
-            let p = [g.point.x, g.point.y, g.point.z];
-            if !p.iter().all(|v| v.is_finite()) {
-                continue;
-            }
-            let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt() as f64;
-            if r < 0.5 {
-                continue;
-            }
-            let w = pose.apply(p);
-            let w = [w[0] as f64, w[1] as f64, w[2] as f64];
+        let total = station_points(std::path::Path::new(f), &pose, |p, w, r| {
             if r <= WALL_RANGE_M {
                 for gr in grids.iter_mut() {
                     gr.add(w);
@@ -1227,17 +1345,22 @@ pub fn run(reg: &str, out: &str, files: &[String], opts: &Opts) -> anyhow::Resul
                 cells.entry(((w[0] / CELL).floor() as i32, (w[1] / CELL).floor() as i32)).or_insert_with(Lowest::new).add(w[2] as f32);
                 n += 1;
             }
-        }
-        eprintln!("  station {}: {} k points, {} k on or below the ground ({:.0} s)", number(k, f), pts.len() / 1000, n / 1000, t0.elapsed().as_secs_f64());
+        })?;
+        eprintln!("  station {}: {} k points, {} k on or below the ground ({:.0} s)", number(k, f), total / 1000, n / 1000, t0.elapsed().as_secs_f64());
     }
     let ground = Ground::from_cells(&cells, CELL);
     drop(cells);
     // Walls.
     let mut results = Vec::new();
+    let mut planes = Vec::new();
     for g in &grids {
-        let img = format!("wall-{}.png", g.wall.wall_id);
-        let (r, png) = analyze_wall(g, ground.as_ref(), opts, &img);
-        std::fs::write(format!("{out}/{img}"), png)?;
+        let (r, plane) = measure_wall(g, ground.as_ref(), opts, &format!("wall-{}.png", g.wall.wall_id));
+        results.push(r);
+        planes.push(plane);
+    }
+    gate_walls(&mut results);
+    for ((g, r), plane) in grids.iter().zip(&results).zip(&planes) {
+        std::fs::write(format!("{out}/{}", r.image), wall_png(g, *plane, r, opts))?;
         eprintln!(
             "  wall {:<4} {:>5.1} m: lean {} mm, flat RMS {} mm, straight-line ok {}%, top {} m",
             r.wall_id,
@@ -1247,7 +1370,6 @@ pub fn run(reg: &str, out: &str, files: &[String], opts: &Opts) -> anyhow::Resul
             opt(r.straightedge_ok_pct, ""),
             opt(r.top_above_ground_m, "")
         );
-        results.push(r);
     }
     grids.clear();
     // Ground.
@@ -1274,30 +1396,7 @@ pub fn run(reg: &str, out: &str, files: &[String], opts: &Opts) -> anyhow::Resul
         }
     }
     // Files.
-    let mut csv = String::from("wall_id,kind,length_m,top_above_ground_m,out_of_plumb_mm,lean_mm_per_m,worst_strip_mm_per_m,worst_strip_at_m,flat_rms_mm,flat_p95_mm,straightedge_windows,straightedge_ok_pct,straightedge_worst_mm,features_pct,covered_pct,seen_by\n");
-    let o = |v: Option<f64>| v.map(|v| v.to_string()).unwrap_or_default();
-    for r in &results {
-        let _ = writeln!(
-            csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-            r.wall_id,
-            r.kind,
-            r.length_m,
-            o(r.top_above_ground_m),
-            o(r.out_of_plumb_mm),
-            o(r.lean_mm_per_m),
-            o(r.worst_strip_mm_per_m),
-            o(r.worst_strip_at_m),
-            o(r.flat_rms_mm),
-            o(r.flat_p95_mm),
-            r.straightedge_windows,
-            o(r.straightedge_ok_pct),
-            o(r.straightedge_worst_mm),
-            r.features_pct,
-            r.covered_pct,
-            r.seen_by.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(" ")
-        );
-    }
+    let csv = walls_csv(&results);
     std::fs::write(format!("{out}/walls.csv"), csv)?;
     let mut pcsv = String::from("low_spot,x_m,y_m,area_m2,max_depth_mm,volume_l\n");
     for (k, p) in ponds_found.iter().enumerate() {
@@ -1322,13 +1421,95 @@ pub fn run(reg: &str, out: &str, files: &[String], opts: &Opts) -> anyhow::Resul
     if summary_out["ground_flatness"].is_null() {
         summary_out.as_object_mut().unwrap().remove("ground_flatness");
     }
-    std::fs::write(format!("{out}/report.html"), report_html(&summary_out, &results, &ponds_found, &sections, opts))?;
+    let (questions_html, questions) = match &opts.questions {
+        Some(m) => mission_questions(reg, out, m, &used.iter().map(|&k| (number(k, &files[k]), poses[k].unwrap(), files[k].clone().into())).collect::<Vec<_>>(), opts)?,
+        None => (String::new(), Value::Null),
+    };
+    std::fs::write(format!("{out}/report.html"), report_html(&summary_out, &results, &ponds_found, &sections, opts, &questions_html))?;
     std::fs::write(
         format!("{out}/analysis.json"),
-        serde_json::to_vec_pretty(&json!({"version": env!("CARGO_PKG_VERSION"), "summary": summary, "walls": results, "low_spots": ponds_found, "sections": sections}))?,
+        serde_json::to_vec_pretty(&json!({"version": env!("CARGO_PKG_VERSION"), "summary": summary, "questions": questions, "walls": results, "low_spots": ponds_found, "sections": sections}))?,
     )?;
     eprintln!("wrote {out}/report.html: {} walls, {} low spots, building height {} m ({:.0} s)", results.len(), ponds_found.len(), opt(height, ""), t0.elapsed().as_secs_f64());
     Ok(())
+}
+
+/// The mission's questions, each judged again on this registration
+/// (`merged.bin` in `reg`) from the stations' files: the report's opening
+/// section and its JSON. Evidence images go to `out`.
+fn mission_questions(reg: &str, out: &str, mission: &str, files: &[(u16, Pose, std::path::PathBuf)], opts: &Opts) -> anyhow::Result<(String, Value)> {
+    use crate::ask::{evidence, gate, look, questions_html, report_drawing, Asked, Gate};
+    let m: crate::mission::Mission = serde_json::from_slice(&std::fs::read(mission).with_context(|| mission.to_string())?).with_context(|| format!("{mission}: a mission"))?;
+    let merged = crate::register::Merged::from_bytes(&std::fs::read(format!("{reg}/merged.bin")).with_context(|| format!("{reg}/merged.bin: run `x9-bridge register` again"))?)
+        .map_err(anyhow::Error::msg)?;
+    let scans: HashMap<u16, String> = files.iter().map(|(n, _, _)| (*n, n.to_string())).collect();
+    let mut asked = Vec::new();
+    for t in m.targets.iter().filter(|t| t.question.is_some()) {
+        let (Some(f), Some(q)) = (t.face, &t.question) else { continue };
+        let coverage = crate::register::face_coverage(&merged, &f, &scans);
+        let (c, fit) = look(&t.target_id, &f, &coverage, files, opts)?;
+        let again = gate(c.seen_share, c.length_m, c.fit.as_ref().map(|r| r.flat_rms_mm));
+        let image = match fit {
+            Some(mut fit) => match report_drawing(q, &again) {
+                Some(drawn) => {
+                    let name = format!("question-{}.png", t.target_id);
+                    std::fs::write(format!("{out}/{name}"), evidence(&mut fit, &drawn, opts))?;
+                    Some(name)
+                }
+                None => None,
+            },
+            None => None,
+        };
+        asked.push(Asked {
+            target_id: t.target_id.clone(),
+            name: t.name.clone(),
+            declined: (t.status == crate::mission::Status::Declined).then(|| t.note.clone()),
+            on_site: q.clone(),
+            again_reading: if again == Gate::Pass { c.fit.clone() } else { None },
+            again,
+            image,
+        });
+    }
+    let json: Vec<Value> = asked
+        .iter()
+        .map(|a| {
+            json!({"target_id": a.target_id, "name": a.name, "on_site": crate::ask::public(&a.target_id, &a.on_site), "declined": a.declined,
+                   "final": match &a.again { Gate::Pass => json!({"verdict": "answer", "answer": a.again_reading}), Gate::NotYet(r) => json!({"verdict": "not_yet", "reason": r}),
+                                             Gate::DoesNotFit(r) => json!({"verdict": "does_not_fit", "reason": r}) },
+                   "image": a.image})
+        })
+        .collect();
+    Ok((questions_html(&asked), json!(json)))
+}
+
+fn walls_csv(results: &[WallResult]) -> String {
+    let mut csv = String::from("wall_id,kind,length_m,top_above_ground_m,out_of_plumb_mm,lean_mm_per_m,worst_strip_mm_per_m,worst_strip_at_m,flat_rms_mm,flat_p95_mm,straightedge_windows,straightedge_ok_pct,straightedge_worst_mm,features_pct,covered_pct,seen_by,verdict,reason\n");
+    let o = |v: Option<f64>| v.map(|v| v.to_string()).unwrap_or_default();
+    for r in results {
+        let _ = writeln!(
+            csv,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\"{}\"",
+            r.wall_id,
+            r.kind,
+            r.length_m,
+            o(r.top_above_ground_m),
+            o(r.out_of_plumb_mm),
+            o(r.lean_mm_per_m),
+            o(r.worst_strip_mm_per_m),
+            o(r.worst_strip_at_m),
+            o(r.flat_rms_mm),
+            o(r.flat_p95_mm),
+            r.straightedge_windows,
+            o(r.straightedge_ok_pct),
+            o(r.straightedge_worst_mm),
+            r.features_pct,
+            r.covered_pct,
+            r.seen_by.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(" "),
+            r.verdict.as_deref().unwrap_or(""),
+            r.reason.as_deref().unwrap_or("").replace('"', "\"\"")
+        );
+    }
+    csv
 }
 
 fn ground_flatness(g: &Ground, dep: &[f32], slope_pct: Option<f64>, opts: &Opts) -> Value {
@@ -1432,6 +1613,47 @@ mod tests {
 
     fn flat_ground(w: usize, h: usize, z: f32) -> Ground {
         Ground { x0: 0.0, y0: 0.0, cell: 0.1, w, h, z: vec![z; w * h] }
+    }
+
+    fn measured(id: &str, length_m: f64, covered_pct: f64, rms: f64, plumb: f64) -> WallResult {
+        WallResult {
+            wall_id: id.into(), kind: "building".into(), length_m, seen_by: vec![1, 2], covered_pct, features_pct: 3.0,
+            lean_mm_per_m: Some(plumb + 0.2), out_of_plumb_mm: Some(plumb), worst_strip_mm_per_m: Some(plumb + 0.1), worst_strip_at_m: Some(1.5),
+            flat_rms_mm: Some(rms), flat_p95_mm: Some(rms * 2.0), straightedge_windows: 40, straightedge_ok_pct: Some(plumb - 0.6),
+            straightedge_worst_mm: Some(plumb + 0.3), top_above_ground_m: Some(5.2), image: format!("wall-{id}.png"), verdict: None, reason: None,
+        }
+    }
+
+    /// Criterion 2, the report: a wall that isn't an answer shows its verdict, not numbers.
+    #[test]
+    fn the_report_shows_numbers_only_for_answers() {
+        let mut walls = vec![measured("w1", 10.0, 92.0, 8.0, 6.4), measured("w2", 3.0, 87.0, 8.0, 104.0), measured("w3", 9.0, 70.0, 8.0, 104.0),
+                             measured("w4", 9.0, 95.0, 22.0, 104.0)];
+        gate_walls(&mut walls);
+        let v: Vec<Option<&str>> = walls.iter().map(|w| w.verdict.as_deref()).collect();
+        assert_eq!(v, [Some("answer"), Some("does_not_fit"), Some("not_yet"), Some("does_not_fit")]);
+        for w in &walls[1..] {
+            assert!(w.out_of_plumb_mm.is_none() && w.flat_rms_mm.is_none() && w.straightedge_ok_pct.is_none() && w.worst_strip_mm_per_m.is_none(), "{w:?}");
+            assert!(w.reason.as_deref().is_some_and(|r| !r.is_empty()));
+            // Where it is and how much was seen stay: they aren't the answer.
+            assert!(w.length_m > 0.0 && w.covered_pct > 0.0 && w.top_above_ground_m.is_some());
+        }
+        let summary = json!({"stations_used": 2, "frame_station": 1});
+        let h = report_html(&summary, &walls, &[], &[], &Opts::default(), "");
+        let csv = walls_csv(&walls);
+        for text in [&h, &csv] {
+            assert!(!text.contains("103.") && !text.contains("104"), "{text}");
+        }
+        assert!(h.contains("6.4") && h.contains("not yet") && h.contains("does not fit"), "{h}");
+        let rows: Vec<&str> = csv.lines().collect();
+        assert!(rows[0].ends_with(",verdict,reason"), "{}", rows[0]);
+        assert!(rows[1].contains(",6.4,") && rows[1].contains(",answer,"), "{}", rows[1]);
+        assert!(rows[3].contains(",not_yet,"), "{}", rows[3]);
+        assert!(wall_title(&walls[0]).contains("+6 mm"));
+        for w in &walls[1..] {
+            let t = wall_title(w);
+            assert!(!t.contains("104") && !t.contains("flatness RMS") && t.contains(w.verdict.as_deref().unwrap().replace('_', " ").as_str()), "{t}");
+        }
     }
 
     #[test]

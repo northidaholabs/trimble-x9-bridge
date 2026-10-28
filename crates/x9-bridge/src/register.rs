@@ -2539,6 +2539,14 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     std::fs::write(format!("{out}/audit.json"), serde_json::to_vec_pretty(&audits)?)?;
     std::fs::write(format!("{out}/checks.json"), serde_json::to_vec_pretty(&checked)?)?;
     std::fs::write(format!("{out}/walls.json"), serde_json::to_vec_pretty(&ws)?)?;
+    // For `ask`: the same merged cloud and trusted stations the server judges faces on.
+    std::fs::write(format!("{out}/merged.bin"), merged.to_bytes())?;
+    let listed: Vec<Value> = files
+        .iter()
+        .enumerate()
+        .map(|(k, f)| json!({"station": ids[k].parse::<u16>().unwrap_or(k as u16 + 1), "file": f, "pose": poses[k], "trusted": poses[k].is_some() && audits[k].trusted()}))
+        .collect();
+    std::fs::write(format!("{out}/stations.json"), serde_json::to_vec_pretty(&listed)?)?;
     std::fs::write(format!("{out}/plan.png"), plan_png(&merged, &PlanMarks { stations: &stations, walls: &ws, faces: vec![] }))?;
     let map = crate::minimap::Minimap {
         title: format!("{} stations placed (offline)", stations.len()),

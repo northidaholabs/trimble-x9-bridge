@@ -97,6 +97,12 @@ need a person at the kit.
   criteria and a ledger of targets (each facade, each window): covered,
   measured or declined. "Ready to leave" is refused while anything is open;
   the person signs the job off once. Saved across restarts.
+- **Questions on site:** a wall target can ask whether the wall is plumb and
+  how flat it is. The bridge answers from the point cloud during the visit,
+  on the target's fixed face, and gives numbers only once the data can carry
+  them: otherwise `not yet` (with what is missing and where to set up to see
+  it) or `does not fit`. Re-checked after every station; the report opens
+  with the questions and their evidence.
 - **Registration:** after every full dome the bridge brings the station
   into the project frame by itself (4-DOF: the X9 levels its scans), adjusts
   all stations together so loops close, finds the walls in the merged plan,

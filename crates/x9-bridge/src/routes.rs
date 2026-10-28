@@ -65,6 +65,8 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/v1/work/:job_id/fail", post(work_fail))
         .route("/v1/projects/:project_id/mission", get(get_mission).put(put_mission))
         .route("/v1/projects/:project_id/mission/targets", post(update_targets))
+        .route("/v1/projects/:project_id/mission/targets/:target_id/ask", post(ask_target))
+        .route("/v1/projects/:project_id/mission/targets/:target_id/ask/image", get(ask_image))
         .route("/v1/projects/:project_id/mission/ready", post(mission_ready))
         .route("/v1/projects/:project_id/mission/sign-off", post(mission_sign_off))
         .route("/v1/scans/:scan_id/exports", post(start_export))
@@ -627,7 +629,15 @@ async fn put_next_station(State(st): St, h: HeaderMap, Path(id): Path<String>, b
     v["preview_size"] = json!([pw, ph]);
     v["image_url"] = json!(format!("/v1/scans/{id}/next-station/image"));
     st.inner.lock().unwrap().next_stations.insert(id.clone(), (v.clone(), png));
-    st.log("note", format!("Next station proposed from station {}: {}", scan["station"], p.note), &c.name, Some(&project_id), &[("scan_id", &id)]);
+    // Where the marker stands in the project frame, when the station is placed.
+    let pose = st.inner.lock().unwrap().registrations.get(&project_id).and_then(|r| r.stations.iter().find(|s| s.scan_id == id).and_then(|s| s.pose));
+    let at = ground.zip(pose).map(|(g, pose)| {
+        let w = pose.apply([(g.out_m * g.az_rad.cos()) as f32, (g.out_m * g.az_rad.sin()) as f32, 0.0]);
+        let xy = [((w[0] as f64) * 100.0).round() / 100.0, ((w[1] as f64) * 100.0).round() / 100.0];
+        v["marker"]["project_xy_m"] = json!(xy);
+        format!(" (marker at ({:.2}, {:.2}) m, project frame)", xy[0], xy[1])
+    });
+    st.log("note", format!("Next station proposed from station {}: {}{}", scan["station"], p.note, at.unwrap_or_default()), &c.name, Some(&project_id), &[("scan_id", &id)]);
     st.emit("next_station", v.clone());
     Ok(Json(v).into_response())
 }
@@ -709,12 +719,45 @@ struct TargetsReq {
 }
 
 async fn update_targets(State(st): St, h: HeaderMap, Path(project_id): Path<String>, body: Bytes) -> ApiResult<Json<Value>> {
-    st.require(&h, |r| r != Role::Viewer, "update missions")?;
+    let c = st.require(&h, |r| r != Role::Viewer, "update missions")?;
     let req: TargetsReq = parse(&body)?;
     let mut m = mission_of(&st, &project_id)?;
+    let before = m.clone();
     let known = project_scans(&st, &project_id).await?;
     m.update(&req.targets, &known, &st.geo(&project_id)).map_err(|e| if e.contains("signed off") { ApiError::conflict(e) } else { ApiError::invalid(e) })?;
+    for t in &m.targets {
+        let Some(u) = req.targets.iter().find(|u| u.target_id.trim() == t.target_id) else { continue };
+        let face = t.face.map(|f| format!(", face ({:.2}, {:.2}) to ({:.2}, {:.2})", f.from[0], f.from[1], f.to[0], f.to[1])).unwrap_or_default();
+        let asks = t.question.as_ref().map(|q| format!(", asks {}", q.kind)).unwrap_or_default();
+        let text = match before.targets.iter().find(|b| b.target_id == t.target_id) {
+            None => format!("Target set: {} ({}){face}{asks}", t.name, if t.kind.is_empty() { "no kind" } else { &t.kind }),
+            Some(_) => {
+                let fields: Vec<&str> = [("name", u.name.is_some()), ("kind", u.kind.is_some()), ("status", u.status.is_some()), ("stations", u.stations.is_some()),
+                                         ("note", u.note.is_some()), ("face", u.face.is_some() || u.wall_id.is_some()), ("question", u.question.is_some())]
+                    .iter()
+                    .filter(|f| f.1)
+                    .map(|f| f.0)
+                    .collect();
+                format!("Target changed: {} ({}): {:?}{face}{asks}", t.name, fields.join(", "), t.status)
+            }
+        };
+        st.log("note", text, &c.name, Some(&project_id), &[("target_id", &t.target_id), ("mission_id", &m.mission_id)]);
+    }
     Ok(mission_changed(&st, &m))
+}
+
+/// Ask a question target of the point cloud now: its verdict, the answer
+/// only when the gate passes, and (when not yet) the unseen stretches with
+/// the preview columns to plan the next station on.
+async fn ask_target(State(st): St, h: HeaderMap, Path((project_id, target_id)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+    let c = st.require(&h, |r| r != Role::Viewer, "ask questions")?;
+    Ok(Json(crate::ask::on_bridge(&st, &project_id, &target_id, &c.name).await?))
+}
+
+async fn ask_image(State(st): St, h: HeaderMap, Path((project_id, target_id)): Path<(String, String)>) -> ApiResult<Response> {
+    st.caller(&h)?;
+    let png = st.inner.lock().unwrap().evidence.get(&(project_id, target_id)).cloned().ok_or_else(|| ApiError::not_found("question evidence"))?;
+    Ok(([(header::CONTENT_TYPE, "image/png")], png).into_response())
 }
 
 #[derive(Deserialize)]

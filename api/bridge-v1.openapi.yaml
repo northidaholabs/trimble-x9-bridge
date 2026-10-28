@@ -486,6 +486,29 @@ paths:
         "200": { description: The mission., content: { application/json: { schema: { $ref: "#/components/schemas/Mission" } } } }
         default: { $ref: "#/components/responses/Problem" }
 
+  /projects/{project_id}/mission/targets/{target_id}/ask:
+    parameters:
+      - { name: project_id, in: path, required: true, schema: { type: string } }
+      - { name: target_id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [projects]
+      operationId: askMissionTarget
+      summary: Ask a question target of the point cloud now (up to 90 s on the Pi). See guide.md, Questions on site.
+      responses:
+        "200": { description: The verdict; numbers only with an answer., content: { application/json: { schema: { $ref: "#/components/schemas/AskResult" } } } }
+        default: { $ref: "#/components/responses/Problem" }
+
+  /projects/{project_id}/mission/targets/{target_id}/ask/image:
+    parameters:
+      - { name: project_id, in: path, required: true, schema: { type: string } }
+      - { name: target_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [projects]
+      operationId: askMissionTargetImage
+      responses:
+        "200": { description: The latest evidence image., content: { image/png: {} } }
+        default: { $ref: "#/components/responses/Problem" }
+
   /projects/{project_id}/mission/ready:
     parameters:
       - { name: project_id, in: path, required: true, schema: { type: string } }
@@ -1514,7 +1537,63 @@ components:
         wall_id: { type: string, writeOnly: true, description: "A wall of the registration; sets `face`." }
         face: { $ref: "#/components/schemas/Face" }
         geometry: { allOf: [{ $ref: "#/components/schemas/FaceCoverage" }], readOnly: true, description: "The bridge's judgement of `face`, kept current after every registration." }
+        question:
+          description: >-
+            Write `"plumb"` to ask whether the face is plumb and how flat it is (needs a face), `""` to drop it.
+            Read back as a Question. A target with a question is covered only by its answer.
+          oneOf:
+            - { type: string, enum: [plumb, ""], writeOnly: true }
+            - { allOf: [{ $ref: "#/components/schemas/Question" }], readOnly: true }
         updated_at: { type: string, format: date-time, readOnly: true }
+
+    Question:
+      type: object
+      description: A question asked of a target's face, and its latest verdict (re-checked after every registration).
+      properties:
+        kind: { type: string, enum: [plumb] }
+        verdict: { type: string, enum: [not_yet, does_not_fit, answer] }
+        reason: { type: string, description: "Why not an answer: the share seen, too few points, \"settling\", or not one flat face." }
+        asked: { type: boolean }
+        seen_share: { type: number }
+        stations: { type: array, items: { type: integer } }
+        answer: { $ref: "#/components/schemas/PlumbAnswer" }
+        checked_at: { type: string, format: date-time }
+
+    PlumbAnswer:
+      type: object
+      description: Only with verdict `answer`.
+      properties:
+        out_of_plumb_mm: { type: number, description: "Over the face's height; positive when the top leans toward the stations' side." }
+        lean_mm_per_m: { type: number }
+        flat_rms_mm: { type: number }
+        flat_p95_mm: { type: number }
+        straightedge_ok_pct: { type: number }
+        worst_strip_mm_per_m: { type: number }
+        stations: { type: array, items: { type: integer } }
+
+    AskResult:
+      type: object
+      required: [target_id, verdict, reason]
+      properties:
+        target_id: { type: string }
+        kind: { type: string }
+        verdict: { type: string, enum: [not_yet, does_not_fit, answer] }
+        reason: { type: string }
+        seen_pct: { type: number }
+        stations: { type: array, items: { type: integer } }
+        answer: { $ref: "#/components/schemas/PlumbAnswer" }
+        seconds: { type: number }
+        evidence_url: { type: string, description: "The face's heat map; its title carries numbers only for an answer." }
+        unseen:
+          type: array
+          description: "With not_yet for coverage: the stretches not seen, each with the preview columns framing it from the latest station (the planner's subject)."
+          items:
+            type: object
+            properties:
+              from: { type: array, items: { type: number } }
+              to: { type: array, items: { type: number } }
+              length_m: { type: number }
+              subject: { type: object, properties: { scan_id: { type: string }, station: { type: integer }, x0: { type: integer }, x1: { type: integer }, query: { type: string } } }
 
     Face:
       type: object

@@ -14,6 +14,7 @@
 
 mod aim;
 mod analyze;
+mod ask;
 mod bench;
 mod export;
 mod files;
@@ -73,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
         Some("register") => return register::cli(&args[1..]),
         Some("bench") => return bench::cli(&args[1..]),
         Some("analyze") => return analyze::cli(&args[1..]),
+        Some("ask") => return ask::cli(&args[1..]),
         Some("plan") => return planner::cli(&args[1..]),
         Some("worker") => return workmode::run(&args[1..]).await,
         _ => {}

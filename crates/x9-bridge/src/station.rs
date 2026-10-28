@@ -426,6 +426,8 @@ pub struct Ground {
     pub out_m: f64,
     pub below_m: f64,
     pub px_per_rad: (f64, f64),
+    /// Its bearing in the scanner's frame (rad, x toward y).
+    pub az_rad: f64,
 }
 
 /// The ground under preview pixel `at`, from the scan's points (`grid` its
@@ -473,7 +475,8 @@ pub fn ground_at(pts: &[GridPoint], grid: (u32, u32), preview: (usize, usize), a
     };
     let kx = slope(&mut near.iter().map(|(d, p)| (wrap(p.0 - az0, 2.0 * pi), d.0)))?;
     let ky = slope(&mut near.iter().map(|(d, p)| (p.1, d.1)))?;
-    (kx.abs() > 1.0 && ky.abs() > 1.0).then_some(Ground { out_m, below_m: -z, px_per_rad: (kx, ky) })
+    let nearest = near.iter().min_by(|a, b| a.0 .0.hypot(a.0 .1).total_cmp(&b.0 .0.hypot(b.0 .1)))?;
+    (kx.abs() > 1.0 && ky.abs() > 1.0).then_some(Ground { out_m, below_m: -z, px_per_rad: (kx, ky), az_rad: nearest.1 .0 })
 }
 
 /// Places on the ground round the marker, and above it, on the canvas.
@@ -751,7 +754,7 @@ mod tests {
         let (kx, ky) = (pw as f64 / std::f64::consts::TAU, -(ph as f64) / 140f64.to_radians());
         let at = |out: f64| {
             let (x, y) = ground_px(out, 1.0);
-            let g = Ground { out_m: out, below_m: 1.6, px_per_rad: (kx, ky) };
+            let g = Ground { out_m: out, below_m: 1.6, px_per_rad: (kx, ky), az_rad: 0.0 };
             let (c, _, m) = draw(&grey, pw, ph, &bare(x, y), Some(g));
             amber_extent(&c, m)
         };
@@ -771,7 +774,7 @@ mod tests {
         let grey = vec![120u8; pw * ph];
         let (kx, ky) = (pw as f64 / std::f64::consts::TAU, -(ph as f64) / 140f64.to_radians());
         let (x, y) = ground_px(8.0, 1.0);
-        let (c, _, _) = draw(&grey, pw, ph, &bare(x, y), Some(Ground { out_m: 8.0, below_m: 1.6, px_per_rad: (kx, ky) }));
+        let (c, _, _) = draw(&grey, pw, ph, &bare(x, y), Some(Ground { out_m: 8.0, below_m: 1.6, px_per_rad: (kx, ky), az_rad: 0.0 }));
         let grey_px: Vec<u8> = c.px.chunks(3).filter(|p| p[0] == p[1] && p[1] == p[2]).map(|p| p[0]).collect();
         let dark = grey_px.iter().filter(|&&g| g < 120).count();
         let darkest = *grey_px.iter().min().unwrap();
@@ -811,9 +814,9 @@ mod tests {
         let (pw, ph) = (400usize, 300usize);
         let grey = vec![90u8; pw * ph];
         for g in [
-            Ground { out_m: 0.4, below_m: 1.6, px_per_rad: (60.0, -120.0) },
-            Ground { out_m: 300.0, below_m: 1.6, px_per_rad: (60.0, -120.0) },
-            Ground { out_m: 12.0, below_m: 0.1, px_per_rad: (-60.0, 120.0) },
+            Ground { out_m: 0.4, below_m: 1.6, px_per_rad: (60.0, -120.0), az_rad: 0.0 },
+            Ground { out_m: 300.0, below_m: 1.6, px_per_rad: (60.0, -120.0), az_rad: 0.0 },
+            Ground { out_m: 12.0, below_m: 0.1, px_per_rad: (-60.0, 120.0), az_rad: 0.0 },
         ] {
             assert_eq!(&draw(&grey, pw, ph, &proposal(), Some(g)).0.png()[1..4], b"PNG", "{g:?}");
         }

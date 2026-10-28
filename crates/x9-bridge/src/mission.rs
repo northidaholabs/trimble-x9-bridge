@@ -6,6 +6,7 @@
 //! any target is open; the person then signs off once, and the mission is
 //! done. Kept in `missions.json` so a restart keeps them.
 
+use crate::ask::{Question, Verdict, KINDS};
 use crate::register::{Face, Geo, FACE_COVERED};
 use crate::util::now_rfc3339;
 use serde::{Deserialize, Serialize};
@@ -70,6 +71,9 @@ pub struct Target {
     pub face: Option<Face>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geometry: Option<Value>,
+    /// A question asked of the face (`ask`): covered only by its answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<Question>,
     #[serde(default)]
     pub updated_at: String,
 }
@@ -129,6 +133,9 @@ pub struct TargetUpdate {
     /// … or by a wall of the registration (`w3`).
     #[serde(default)]
     pub wall_id: Option<String>,
+    /// A question for its face (`plumb`), or "" to drop it.
+    #[serde(default)]
+    pub question: Option<String>,
 }
 
 pub const MAX_TARGETS: usize = 200;
@@ -194,7 +201,7 @@ impl Mission {
                     }
                     next.push(Target { target_id: id.into(), name: String::new(), kind: String::new(), status: Status::Open,
                                        stations: vec![], measurement_id: None, note: String::new(), face: None, geometry: None,
-                                       updated_at: String::new() });
+                                       question: None, updated_at: String::new() });
                     next.len() - 1
                 }
             };
@@ -217,11 +224,36 @@ impl Mission {
             if let Some(v) = &u.note {
                 t.note = v.trim().into();
             }
+            let was = t.face;
             if let Some(w) = &u.wall_id {
                 t.face = Some(geo.wall(w.trim()).ok_or_else(|| format!("target {id}: there is no wall {w:?} in the registration (its walls list them)"))?);
             }
             if let Some(f) = u.face {
                 t.face = Some(f);
+            }
+            // A new face is a new question: its answer was about the old one.
+            if t.face != was {
+                if let Some(q) = &mut t.question {
+                    *q = Question::new(&q.kind);
+                    if t.status == Status::Covered {
+                        t.status = Status::Open;
+                    }
+                }
+            }
+            match u.question.as_deref().map(str::trim) {
+                Some("") => t.question = None,
+                Some(k) if !KINDS.contains(&k) => return Err(format!("target {id}: question {k:?}: v1 asks {}", KINDS.join(", "))),
+                Some(_) if t.face.is_none() => return Err(format!("target {id}: a question is asked of a wall face; give face or wall_id")),
+                Some(k) if t.question.as_ref().is_none_or(|q| q.kind != k) => {
+                    t.question = Some(Question::new(k));
+                    if t.status == Status::Covered {
+                        t.status = Status::Open;
+                    }
+                }
+                _ => {}
+            }
+            if t.question.is_some() && u.status == Some(Status::Covered) {
+                return Err(format!("target {id}: a question target is covered by its answer (scanner_ask), not by hand"));
             }
             judge(t, geo)?;
             t.updated_at = now_rfc3339();
@@ -273,6 +305,43 @@ impl Mission {
             self.ready_summary = None;
         }
         changed
+    }
+
+    /// A question's new verdict (from `ask` or the re-check after a station):
+    /// its answer covers the target, anything else leaves it open. `scans`
+    /// maps station numbers to scan ids. Returns what changed, for the log.
+    pub fn record_question(&mut self, target_id: &str, q: Question, scans: &std::collections::HashMap<u16, String>) -> Option<String> {
+        if self.state == State::SignedOff {
+            return None;
+        }
+        let t = self.targets.iter_mut().find(|t| t.target_id == target_id && t.question.as_ref().is_some_and(|tq| tq.kind == q.kind))?;
+        let (status, verdict) = (t.status, t.question.as_ref().and_then(|q| q.verdict));
+        match (&q.verdict, &q.answer) {
+            (Some(Verdict::Answer), Some(a)) => {
+                t.status = Status::Covered;
+                t.stations = a.stations.iter().filter_map(|n| scans.get(n).cloned()).collect();
+            }
+            _ if t.status == Status::Covered => t.status = Status::Open,
+            _ => {}
+        }
+        let said = match q.verdict {
+            Some(Verdict::Answer) => "answered".to_string(),
+            Some(Verdict::DoesNotFit) => format!("does not fit ({})", q.reason),
+            Some(Verdict::NotYet) => format!("not yet ({})", q.reason),
+            None => "not asked".into(),
+        };
+        let changed = t.status != status || q.verdict != verdict;
+        t.question = Some(Question { checked_at: now_rfc3339(), ..q });
+        if !changed {
+            return None;
+        }
+        t.updated_at = now_rfc3339();
+        let line = format!("{}: {said}", t.name);
+        if self.state == State::Ready && !t.status.is_final() {
+            self.state = State::Active;
+            self.ready_summary = None;
+        }
+        Some(line)
     }
 
     /// Ready to leave: every target settled. Returns the open ones otherwise.
@@ -331,6 +400,9 @@ fn judge(t: &mut Target, geo: &Geo) -> Result<(), String> {
     let scans: Vec<String> = v["stations"].as_array().map(|a| a.iter().filter_map(|s| s["scan_id"].as_str().map(str::to_string)).collect()).unwrap_or_default();
     let share = v["seen_share"].as_f64().unwrap_or(0.0);
     t.geometry = Some(v);
+    if t.question.is_some() {
+        return Ok(());
+    }
     match t.status {
         Status::Open if covered => {
             t.status = Status::Covered;
@@ -359,7 +431,7 @@ mod tests {
     fn up(id: &str, status: Option<Status>, stations: &[&str], note: &str) -> TargetUpdate {
         TargetUpdate { target_id: id.into(), name: Some(format!("{id} facade")), kind: Some("facade".into()), status,
                        stations: Some(stations.iter().map(|s| s.to_string()).collect()), measurement_id: None, note: Some(note.into()),
-                       face: None, wall_id: None }
+                       face: None, wall_id: None, question: None }
     }
 
     #[test]
@@ -417,7 +489,7 @@ mod tests {
         let mut m = Mission::new(&req(), "p1", "claude");
         let face = |id: &str, to: f64, status: Option<Status>| TargetUpdate {
             target_id: id.into(), name: Some(id.into()), kind: Some("facade".into()), status, stations: None, measurement_id: None,
-            note: None, face: Some(Face { from: [0.0, 5.0], to: [to, 5.0] }), wall_id: None,
+            note: None, face: Some(Face { from: [0.0, 5.0], to: [to, 5.0] }), wall_id: None, question: None,
         };
         // Seen along its whole length: covered by the bridge, with its station.
         m.update(&[face("near", 8.0, None)], &scans, &g).unwrap();
@@ -440,5 +512,94 @@ mod tests {
         assert!(m.targets[3].geometry.is_none());
         let changed = m.refresh(&g);
         assert!(changed.is_empty(), "{changed:?}");
+    }
+
+    /// Criterion 3: a question target is done only by its answer, asked or not.
+    #[test]
+    fn a_question_target_is_covered_only_by_its_answer() {
+        use crate::ask::{Reading, Verdict};
+        let scans = vec!["s1".to_string()];
+        let g = geo();
+        let numbers: std::collections::HashMap<u16, String> = [(1u16, "s1".to_string())].into();
+        let mut m = Mission::new(&req(), "p1", "claude");
+        let q = |id: &str, to: f64| TargetUpdate {
+            target_id: id.into(), name: Some(format!("{id} facade")), kind: Some("facade".into()), status: None, stations: None,
+            measurement_id: None, note: None, face: Some(Face { from: [0.0, 5.0], to: [to, 5.0] }), wall_id: None, question: Some("plumb".into()),
+        };
+        // Fully seen, never asked: open, not covered by its coverage.
+        m.update(&[q("never", 8.0), q("rough", 8.0)], &scans, &g).unwrap();
+        assert_eq!(m.targets[0].status, Status::Open);
+        assert_eq!(m.targets[0].geometry.as_ref().unwrap()["seen_share"], 1.0);
+        assert_eq!(m.targets[0].question.as_ref().unwrap().kind, "plumb");
+        let err = m.ready("done").unwrap_err();
+        assert!(err.contains("never facade") && err.contains("rough facade"), "{err}");
+        // Calling it covered by hand is refused.
+        let by_hand = TargetUpdate { status: Some(Status::Covered), stations: Some(scans.clone()), ..q("never", 8.0) };
+        assert!(m.update(&[by_hand], &scans, &g).unwrap_err().contains("answer"));
+        // A re-check after a station: not yet, then does not fit. Both block.
+        let verdict = |v: Verdict, answer: Option<Reading>| Question { verdict: Some(v), reason: "x".into(), answer, ..Question::new("plumb") };
+        m.record_question("never", verdict(Verdict::NotYet, None), &numbers);
+        m.record_question("rough", verdict(Verdict::DoesNotFit, None), &numbers);
+        assert!(m.ready("done").unwrap_err().contains("2 targets are still open"));
+        // The answer arrives with the next station, without being asked again.
+        let r_of = |p: f64| Reading { out_of_plumb_mm: p, lean_mm_per_m: 0.5, flat_rms_mm: 6.0, flat_p95_mm: None, straightedge_ok_pct: None,
+                                       worst_strip_mm_per_m: None, stations: vec![1] };
+        let r = r_of(4.0);
+        let said = m.record_question("never", verdict(Verdict::Answer, Some(r)), &numbers).unwrap();
+        assert!(said.contains("never facade"), "{said}");
+        assert_eq!(m.targets[0].status, Status::Covered);
+        assert_eq!(m.targets[0].stations, scans);
+        assert!(m.ready("done").unwrap_err().contains("rough facade"));
+        // Does not fit: the person declines it, with the reason.
+        m.update(&[TargetUpdate { status: Some(Status::Declined), note: Some("stepped facade: piers proud of the wall".into()), ..q("rough", 8.0) }], &scans, &g).unwrap();
+        m.ready("Long facade answered; the stepped one declined.").unwrap();
+        // An answer that later drops opens the target again, and the mission with it.
+        assert!(m.record_question("never", verdict(Verdict::NotYet, None), &numbers).is_some());
+        assert_eq!(m.targets[0].status, Status::Open);
+        assert_eq!(m.state, State::Active);
+        // A question needs a face, and a kind the bridge asks.
+        let no_face = TargetUpdate { face: None, ..q("nowhere", 8.0) };
+        assert!(m.update(&[no_face], &scans, &g).unwrap_err().contains("face"));
+        let odd = TargetUpdate { question: Some("colour".into()), ..q("odd", 8.0) };
+        assert!(m.update(&[odd], &scans, &g).unwrap_err().contains("plumb"));
+        // A new face is a new question: the old answer doesn't carry over.
+        m.update(&[TargetUpdate { face: Some(Face { from: [0.0, 5.0], to: [6.0, 5.0] }), ..q("never", 8.0) }], &scans, &g).unwrap();
+        m.record_question("never", verdict(Verdict::Answer, Some(Reading { stations: vec![1], ..r_of(4.0) })), &numbers);
+        assert_eq!(m.targets[0].status, Status::Covered);
+        m.update(&[TargetUpdate { face: Some(Face { from: [0.0, 5.0], to: [7.0, 5.0] }), question: None, ..q("never", 8.0) }], &scans, &g).unwrap();
+        assert_eq!(m.targets[0].status, Status::Open);
+        assert_eq!(m.targets[0].question.as_ref().unwrap().verdict, None);
+        // The same face again changes nothing.
+        m.record_question("never", verdict(Verdict::Answer, Some(Reading { stations: vec![1], ..r_of(4.0) })), &numbers);
+        m.update(&[TargetUpdate { face: Some(Face { from: [0.0, 5.0], to: [7.0, 5.0] }), question: None, ..q("never", 8.0) }], &scans, &g).unwrap();
+        assert_eq!(m.targets[0].status, Status::Covered);
+        // A verdict for a question dropped meanwhile is not recorded.
+        m.update(&[TargetUpdate { question: Some(String::new()), ..q("odd2", 8.0) }], &scans, &g).unwrap();
+        assert!(m.record_question("odd2", verdict(Verdict::NotYet, None), &numbers).is_none());
+        assert!(m.targets.iter().find(|t| t.target_id == "odd2").unwrap().question.is_none());
+        // Asking the same question again keeps its verdict and its cover.
+        m.update(&[q("never", 7.0)], &scans, &g).unwrap();
+        assert_eq!(m.targets[0].status, Status::Covered);
+        assert_eq!(m.targets[0].question.as_ref().unwrap().verdict, Some(Verdict::Answer));
+        assert!(!m.targets[0].question.as_ref().unwrap().checked_at.is_empty());
+        // The same verdict again is nothing new to log.
+        assert!(m.record_question("never", verdict(Verdict::Answer, Some(Reading { stations: vec![1], ..r_of(4.5) })), &numbers).is_none());
+        // A declined target stays declined whatever its re-check says, and a
+        // ready mission stays ready.
+        m.ready("Long facade answered; the stepped one declined.").unwrap();
+        assert!(m.record_question("rough", verdict(Verdict::NotYet, None), &numbers).is_some());
+        assert_eq!(m.targets[1].status, Status::Declined);
+        assert_eq!(m.state, State::Ready);
+        // A question added to a target its coverage had covered opens it.
+        m.update(&[TargetUpdate { question: None, ..q("plain", 8.0) }], &scans, &g).unwrap();
+        m.update(&[TargetUpdate { question: Some(String::new()), ..q("plain", 8.0) }], &scans, &g).unwrap();
+        let plain = |m: &Mission| m.targets.iter().find(|t| t.target_id == "plain").unwrap().status;
+        assert_eq!(plain(&m), Status::Covered);
+        m.update(&[q("plain", 8.0)], &scans, &g).unwrap();
+        assert_eq!(plain(&m), Status::Open);
+        // "" drops the question: the coverage rule applies again.
+        m.update(&[TargetUpdate { question: Some(String::new()), ..q("never", 8.0) }], &scans, &g).unwrap();
+        assert!(m.targets[0].question.is_none());
+        assert_eq!(m.targets[0].status, Status::Covered);
     }
 }
