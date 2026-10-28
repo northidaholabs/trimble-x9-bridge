@@ -181,7 +181,7 @@ tools, with previews returned as images and recipes as a prompt.
 
 ## Status
 
-Version 0.13.0: the API is a draft, tested against the simulator and on a real X9
+Version 0.14.0: the API is a draft, tested against the simulator and on a real X9
 (scans, measurements, multi-station registration, laptop workers). To build a
 field kit from a fresh Raspberry Pi, see [ops/README.md](ops/README.md).
 

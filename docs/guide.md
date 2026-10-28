@@ -60,7 +60,7 @@ a `.sha256` file. It contains:
 | `README.md`, `PROVENANCE.md`, `LICENSE`, `NOTICE` | |
 
 ```bash
-tag=v0.13.0; target=aarch64-unknown-linux-gnu
+tag=v0.14.0; target=aarch64-unknown-linux-gnu
 curl -LO https://github.com/northidaholabs/trimble-x9-bridge/releases/download/$tag/trimble-x9-bridge-$tag-$target.tar.gz
 curl -LO https://github.com/northidaholabs/trimble-x9-bridge/releases/download/$tag/trimble-x9-bridge-$tag-$target.tar.gz.sha256
 sha256sum -c trimble-x9-bridge-$tag-$target.tar.gz.sha256
