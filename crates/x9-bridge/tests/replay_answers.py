@@ -2,7 +2,7 @@
 """Criteria 6 and 7 of specs/on-site-answers.md: replay recorded surveys as
 they arrive, ask each target's face at every count, and score the answers.
 
-    replay_answers.py [--bin target/release/x9-bridge] [--work /tmp/answers] [howel] [admin]
+    replay_answers.py [--bin target/release/x9-bridge] [--work /tmp/answers] [held-out] [admin]
 
 Targets are set as on site: at each set count, every building wall of 4 m or
 more in that registration gets one, unless an existing target already covers
@@ -18,6 +18,7 @@ Criterion 7 rebuilds the admin report from all 19 stations and checks w23 and
 w29 carry their verdicts and no numbers.
 
 Recordings are real properties: they stay outside git, under ~/x9-sim.
+The held-out survey's folder comes from X9_HELDOUT (default ~/x9-sim/held-out).
 """
 import argparse
 import csv
@@ -31,7 +32,7 @@ from pathlib import Path
 
 SURVEYS = {
     # name: (recordings, set counts, final count, scored faces needed)
-    "howel": (Path.home() / "x9-sim/howel", [4, 6, 8, 10], 12, 5),
+    "held-out": (Path(os.environ.get("X9_HELDOUT", Path.home() / "x9-sim/held-out")), [4, 6, 8, 10], 12, 5),
     "admin": (Path.home() / "x9-sim/admin-color", [4, 8, 10, 12], 19, 3),
 }
 MIN_LENGTH_M = 4.0
@@ -186,7 +187,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", default=str(Path(__file__).resolve().parents[3] / "target/release/x9-bridge"))
     ap.add_argument("--work", default="/tmp/answers")
-    ap.add_argument("surveys", nargs="*", default=["howel", "admin"])
+    ap.add_argument("surveys", nargs="*", default=["held-out", "admin"])
     a = ap.parse_args()
     work = Path(a.work)
     results = {}

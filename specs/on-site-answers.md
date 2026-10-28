@@ -59,7 +59,7 @@ On that survey, replayed at 4, 8, 9, 10, 11, 12 and 19 stations (run
   tolerates windows.
 - The 80% threshold above was fitted on `analyze`'s `covered_pct`, a share
   of the face's surface grid, not on `face_coverage`'s share of length.
-- Held-out: the Howel survey (`~/x9-sim/howel`) registers all 12 stations as
+- Held-out: a second, private survey registers all 12 stations as
   confirmed. 8 of its 13 walls of 4 m or more pass the gate at 12 stations.
 
 Answering on site is Jim's product call: he expects customers who plan ahead
@@ -112,7 +112,7 @@ the trusted stations that saw the face are read.
    is the `subject` the existing planner takes.
 2. `does_not_fit`: shorter than 4 m, or rougher than 15 mm RMS. The response
    gives the reason and the heat map. A short face stays short. A rough one
-   is not always final: in the Howel replay (2026-10-28), the face fixed
+   is not always final: in the held-out replay (2026-10-28), the face fixed
    from w10 at 10 stations was over 15 mm RMS while only stations 1 and 10
    saw it, and fitted at 6.6 mm RMS, an `answer`, once 11 and 12 did. The
    re-check after each station still runs on it, and the reason doesn't
@@ -192,7 +192,7 @@ fixed or the spec is killed.
 5. test: For a synthetic `not_yet` face, the preview span of its unseen
    stretch contains the stretch's projected endpoints on that station's
    preview. It is no wider than those endpoints plus 15° on each side.
-6. metric: Held-out survey: Howel (`~/x9-sim/howel`, 12 stations), which the
+6. metric: Held-out survey: a second, private survey (12 stations), which the
    thresholds were not fitted to. Targets are set as on site: at 4, 6, 8
    and 10 stations, every building wall of 4 m or more in that
    registration gets a target, unless an existing target already covers
@@ -223,10 +223,10 @@ fixed or the spec is killed.
    `walls.csv`. The same script checks it.
 8. metric: On the Pi with no worker, timed by Jim, three runs each, the
    slowest recorded here:
-   - One ask about the Howel face of w6 at 12 stations: under 90 s. w6 is
+   - One ask about the held-out survey's face w6 at 12 stations: under 90 s. w6 is
      seen by 7 stations at 91.6%, so the ask fits the plane and doesn't stop
      at `not_yet`.
-   - The re-check after a new station, with targets on all 13 Howel walls of
+   - The re-check after a new station, with targets on all 13 held-out walls of
      4 m or more, at 12 stations: under 120 s on top of registration.
 9. demo: The gate in the chat. Jim runs it in the sim, three times with
    Claude Opus 5.5 and three times with Grok 4.6:
@@ -255,7 +255,7 @@ fixed or the spec is killed.
 - Criterion 8's slowest run is over 3 min, measured by 2026-11-20. Under
   3 min but over 90 s, the spec gets one performance pass before it is
   killed.
-- Criterion 6 fails on Howel or on the admin replay, with the thresholds as
+- Criterion 6 fails on the held-out survey or on the admin replay, with the thresholds as
   this spec fixes them. The spec is killed. A revised gate comes back as a
   new spec, tested on a survey neither replay has seen.
 - Either model fails criterion 9's base run in any of its three tries, after
@@ -342,7 +342,7 @@ alone (`--reference`):
 | Criterion | Result |
 | --- | --- |
 | 1–5 | Tests in `ask.rs`, `mission.rs` and `analyze.rs` pass |
-| 6, Howel | 13 targets, 19 scored answers on 8 faces (floor 5), 0 misses: pass |
+| 6, held-out | 13 targets, 19 scored answers on 8 faces (floor 5), 0 misses: pass |
 | 6, admin | 33 targets, 5 scored answers on 3 faces (floor 3), 0 misses: pass, at the floor |
 | 7 | w23 (3.02 m, 87.3% covered) `does_not_fit`, w29 (1.92 m, 70.1%) `not_yet`, no numbers in either file: pass |
 | Amendment 1, tests | Pass (126 bridge tests in all) |
@@ -350,11 +350,7 @@ alone (`--reference`):
 
 Criteria 6 and 7 were run before Amendment 1. It changes what an answer
 says, not the gate, the verdicts or the ledger, so the results stand.
-Asked of Howel w6 at 12 stations, the face reads 13.9 mm out of plumb over
-5.1 m, leaning away from the stations' side. Against TMS 602's steps that
-is outside the 9.5 mm allowed at that height.
-
-One ask on Howel w6 at 12 stations took 7.3 s on the desktop. On admin, 23
+One ask on held-out w6 at 12 stations took 7.3 s on the desktop. On admin, 23
 of the 33 faces pass the gate on the 19-station registration alone, but
 only 13 reach `answer` by 19: the other 10 stay "settling", because no
 station after their first passing look saw them. The addition below is for
@@ -437,7 +433,7 @@ figure the model could read off it.
   The same holds with the face turned and moved in the frame.
 - test: the legend of a non-answer image has no millimetre figure.
 - criterion 9 gains three runs per model, each three times, on the sim:
-  - Settling: Howel stations 1 to 11, a target on w6's face (as fixed at 12
+  - Settling: Held-out stations 1 to 11, a target on w6's face (as fixed at 12
     stations, from (32.81, 15.43) to (38.32, 6.68)), first asked at 11. It
     passes the gate there, seen by stations 3 to 5 and 7 to 10, so a first
     ask is "settling". The person asks "Is
@@ -447,7 +443,7 @@ figure the model could read off it.
     (72.85, -22.89) to (78.36, -8.12)), `does_not_fit` at 19. The person
     asks "Is this facade plumb?". The reply gives the reason and no figure,
     and doesn't read one off the image.
-  - Tolerance: before scripting, Jim picks a Howel face that is `answer` by
+  - Tolerance: before scripting, Jim picks a held-out face that is `answer` by
     12 stations in `replay_answers.py`'s output, and records it here. The
     person asks "Is it within ¼ in in 10 ft, ⅜ in in 20 ft, ½ in max?".
     The model sets that tolerance with steps, and the reply says within or
