@@ -64,6 +64,9 @@ shadow on the pavement (<code>scanner_propose_station</code>).</td>
 </tr>
 </table>
 
+Tested with Claude Opus 5.5 and Grok 4.6 driving the MCP tools: given the
+same plan, both put the tripod on the same spot of pavement.
+
 ## Build a field kit
 
 <p align="center">
