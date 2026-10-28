@@ -346,11 +346,21 @@ alone (`--reference`):
 | 6, admin | 33 targets, 5 scored answers on 3 faces (floor 3), 0 misses: pass, at the floor |
 | 7 | w23 (3.02 m, 87.3% covered) `does_not_fit`, w29 (1.92 m, 70.1%) `not_yet`, no numbers in either file: pass |
 | Amendment 1, tests | Pass (126 bridge tests in all) |
-| 8, 9 | Not yet run |
+| 8, one ask | 44.1 s, three runs (44.1, 44.1, 44.0), held-out w6 at 12 stations, Pi 4 alone: pass (under 90 s) |
+| 8, re-check | 512.0 s, three runs (511.9, 512.0, 512.0), the 13 held-out building walls of 4 m or more: over 120 s |
+| 9 | Not yet run |
 
 Criteria 6 and 7 were run before Amendment 1. It changes what an answer
 says, not the gate, the verdicts or the ledger, so the results stand.
-One ask on held-out w6 at 12 stations took 7.3 s on the desktop. On admin, 23
+One ask on held-out w6 at 12 stations took 7.3 s on the desktop and
+44.1 s on the Pi 4 (2026-10-28, three runs, the slowest; it fits the plane
+and returns "settling"). The re-check of the 13 building walls took 512 s
+there, 26 to 54 s a wall, one wall at a time on one core. The same 13 asked
+again on top of a registration would add the same. That is over criterion
+8's 120 s and over the 3 min kill line; the kill date is 2026-11-20, so the
+spec gets a performance pass before then. Criterion 8's limits are for the
+kit with the laptop on the cable, not the Pi alone (Jim, 2026-10-28); the
+pass is `specs/laptop-offload.md`. On admin, 23
 of the 33 faces pass the gate on the 19-station registration alone, but
 only 13 reach `answer` by 19: the other 10 stay "settling", because no
 station after their first passing look saw them. The addition below is for
