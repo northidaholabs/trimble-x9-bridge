@@ -44,6 +44,26 @@ proposing the next station.</td>
 </tr>
 </table>
 
+### Where to set up next
+
+<table>
+<tr>
+<td width="50%"><img src="docs/img/admin-next-plan.jpg" alt="Station 1 from above: ground in grey, walls and trunks in white, canopy in green, and three numbered picks on open ground 25 to 38 m out, each with its landmark."></td>
+<td width="50%"><img src="docs/img/admin-next-station.jpg" alt="Station 1's preview: the clock tower marked as seen, the wing's far side as hidden, a lamp post as the landmark, and a tripod drawn its real size on the pavement beyond it, casting a shadow."></td>
+</tr>
+<tr>
+<td valign="top"><b>The plan</b>, from the station's own points: ground,
+things standing at body height, canopy. It tries every spot a person can
+walk to, casts rays from each, and picks the one that sees the most of what
+this station couldn't while sharing enough surface to register
+(<code>scanner_plan_station</code>).</td>
+<td valign="top"><b>The proposal</b> on the person's view: the pick, the
+landmark beside it, one sentence. The bridge reads the ground there from
+the scan and draws the tripod its real size where it will stand, with its
+shadow on the pavement (<code>scanner_propose_station</code>).</td>
+</tr>
+</table>
+
 ## Build a field kit
 
 <p align="center">

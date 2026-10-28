@@ -361,6 +361,69 @@ paths:
               schema: { $ref: "#/components/schemas/NextStation" }
         default: { $ref: "#/components/responses/Problem" }
 
+  /scans/{scan_id}/next-station/plan:
+    parameters: [{ $ref: "#/components/parameters/ScanId" }]
+    get:
+      tags: [scans]
+      operationId: planNextStation
+      summary: Where to set up next, computed from a full dome's points.
+      description: |
+        Up to three spots on open ground reachable on foot, a step out, seeing
+        the most ground this station couldn't while sharing enough surface to
+        be registered (greedy: each later pick covers what the earlier left).
+        Each has its preview pixel and a landmark beside it. No candidates
+        comes with a `reason`. The plan without a subject is cached per scan.
+        See the guide, "Plan the next station". Any role.
+      parameters:
+        - name: subject
+          in: query
+          required: false
+          description: Preview columns `x0,x1` framing the job's subject (`x1 < x0` crosses the seam).
+          schema: { type: string, pattern: "^[0-9]+,[0-9]+$" }
+      responses:
+        "200":
+          description: The plan.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cell_m, radius_m, candidates]
+                properties:
+                  scan_id: { type: string }
+                  cell_m: { type: number }
+                  radius_m: { type: number }
+                  min_step_m: { type: number }
+                  hidden_m2: { type: number }
+                  still_hidden_m2: { type: number }
+                  spots_tried: { type: integer }
+                  preview_size: { type: array, items: { type: integer } }
+                  subject_px: { type: array, items: { type: integer } }
+                  subject_hidden_m2: { type: number }
+                  reason: { type: string }
+                  candidates:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        rank: { type: integer }
+                        xy_m: { type: array, items: { type: number } }
+                        distance_m: { type: number }
+                        walk_m: { type: number }
+                        sees_hidden_m2: { type: number }
+                        shared_surface_m: { type: number }
+                        preview_px: { type: array, nullable: true, items: { type: integer } }
+                        landmark:
+                          type: object
+                          nullable: true
+                          properties:
+                            xy_m: { type: array, items: { type: number } }
+                            distance_m: { type: number }
+                            height_m: { type: number }
+                            footprint_m2: { type: number }
+                            shape: { type: string, enum: [post, mass] }
+                            preview_px: { type: array, nullable: true, items: { type: integer } }
+        default: { $ref: "#/components/responses/Problem" }
+
   /scans/{scan_id}/next-station/image:
     parameters: [{ $ref: "#/components/parameters/ScanId" }]
     get:
@@ -1599,6 +1662,12 @@ components:
             at: { type: string, format: date-time }
             preview_size: { type: array, items: { type: integer }, minItems: 2, maxItems: 2 }
             image_url: { type: string }
+            marker:
+              type: object
+              properties:
+                distance_m:
+                  type: number
+                  description: How far out the scan saw the ground under the marker; absent when it saw none there. The picture then draws the tripod its real size there, with a shadow.
 
     Coverage:
       type: object

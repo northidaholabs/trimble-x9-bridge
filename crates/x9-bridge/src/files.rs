@@ -26,7 +26,7 @@ impl FileKind {
 
 /// Scan ids are the scanner's UUIDs; refuse anything else so a path can't
 /// escape the cache directory.
-fn safe_id(id: &str) -> Result<&str, ApiError> {
+pub(crate) fn safe_id(id: &str) -> Result<&str, ApiError> {
     if !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
         Ok(id)
     } else {

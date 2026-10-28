@@ -1016,18 +1016,56 @@ laptop whether to use it (`scanner_processing`).
 | `POST /v1/work/{job}/result` | the claimer | `{pairs, poses, audits, walls, skipped}`, poses and audits in the offered stations' order less the skipped |
 | `POST /v1/work/{job}/fail` `{error}` | the claimer | The bridge registers it itself |
 
+### Plan the next station
+
+The bridge computes where to set up next from a full dome's own points, so
+the agent doesn't pick the spot by eye:
+
+```bash
+curl -s -H "$H" $B/scans/$SCAN/next-station/plan
+curl -s -H "$H" "$B/scans/$SCAN/next-station/plan?subject=1820,335"   # toward the subject
+```
+
+It lays the points out in plan view, sorting cells into ground, things
+standing at body height (walls, trunks, posts), and overhead (canopy,
+eaves). Ground the scanner couldn't see because something stood in the way
+counts as hidden. It then tries every open spot a person can walk to from
+the tripod, a step out, and casts rays from each. The first pick sees the
+most hidden ground while sharing at least 5 m of surface, seen from the same
+side, with this station, which is enough to register it. Each later pick
+covers what the ones before it left, a step away from them. The plan's cell
+follows the place: 0.5 m (radius 40 m) outdoors, down to 0.1 m (radius 8 m)
+in a room. The shortest step is a quarter of the median reach, at least 2 m.
+
+![Station 1 of the administration building from above, with three picks on open ground 25 to 38 m out](img/admin-next-plan.jpg)
+
+| Field | What |
+| --- | --- |
+| `candidates` | Up to 3, best first: `xy_m` (this station's frame), `distance_m`, `walk_m` (over ground the scan saw), `sees_hidden_m2`, `shared_surface_m`, `preview_px` (the ground there), `landmark` |
+| `landmark` | The standing thing beside a pick: a post at least 1.5 m tall within 6 m if there is one, else anything that tall, else the nearest. `xy_m`, `distance_m` (from the pick), `height_m`, `footprint_m2`, `shape` (`post` under 1 m², else `mass`), `preview_px`. May be `null` |
+| `subject` | Optional preview columns `x0,x1` (`x1 < x0` crosses the seam): count only hidden ground in that direction, 15° either side. Columns outside the preview are `400 invalid_request` |
+| `reason` | Why there are no candidates: not a full dome, no open ground reachable, nothing hidden another setup would see |
+| `cell_m`, `radius_m`, `min_step_m`, `hidden_m2`, `still_hidden_m2`, `spots_tried` | The plan's scale and what is left after the picks |
+
+The plan without a subject is computed once per scan (a second or two) and
+cached. It knows only this station; what earlier stations saw is in the
+registration. A recorded station can be planned offline:
+`x9-bridge plan station_01.tzf [--subject x0,x1]` (the preview is the `.jpg`
+beside it).
+
 ### Propose the next station
 
 After checking a station's coverage, the agent shows the person where to set
-up next, on that station's preview, so they recognise the spot:
+up next, on that station's preview, so they recognise the spot. One glance:
+the tripod, the one thing they walk past to reach it, and a sentence naming
+that thing:
 
 ```bash
 curl -s -X PUT -H "$H" -d '{
   "marker": {"x": 1335, "y": 540, "label": "on the path, ~3 m past the corner"},
-  "note": "Carry the tripod along the house wall to its right-hand end, past the bush, and set up on the path about 3 m beyond the corner.",
-  "boxes":  [{"x0": 755, "y0": 415, "x1": 865, "y1": 500, "text": "Seen face-on: the wall with the two windows", "kind": "seen"}],
-  "labels": [{"x": 1262, "y": 430, "text": "Hidden: everything past this corner", "kind": "hidden"},
-             {"x": 380, "y": 470, "text": "Shed door", "kind": "landmark"}]
+  "note": "Carry the tripod along the house wall, past the bush, and set up on the path about 3 m beyond the corner.",
+  "labels": [{"x": 1240, "y": 470, "text": "Bush", "kind": "landmark"},
+             {"x": 1262, "y": 430, "text": "Hidden: everything past this corner", "kind": "hidden"}]
 }' $B/scans/$SCAN/next-station
 curl -s -H "$H" -o next.png $B/scans/$SCAN/next-station/image
 curl -s -H "$H" $B/next-stations          # every scan's latest proposal, newest first
@@ -1035,13 +1073,16 @@ curl -s -H "$H" $B/next-stations          # every scan's latest proposal, newest
 
 | Field | What |
 | --- | --- |
-| `marker` | Where the tripod should stand, in preview pixels, on the ground; `label` goes under "SET UP HERE" |
-| `note` | The directions in prose, by landmarks the person can see (1–600 characters). Never compass words: a scan's axes are wherever the scanner's zero angle pointed |
-| `labels`, `boxes` | Up to 12 together, texts up to 80 characters; `kind` `seen` (green), `hidden` (red) or `landmark` (white) |
+| `marker` | Where the tripod should stand, in preview pixels, on the ground; `label` goes under "SET UP HERE" and says where on the ground ("on the pavement, ~5 m past the lamp post"); a label that only names the spot ("setup", "station 2") is refused |
+| `note` | The directions in prose (1–600 characters), naming a landmark label in its own words. No left, right, clockwise or compass words: they depend on which way the person faces, and a scan's axes are wherever the scanner's zero angle pointed |
+| `labels`, `boxes` | Up to 3 together, texts up to 80 characters, each within a quarter of the preview's width of the marker; `kind` `seen` (green), `hidden` (red) or `landmark` (white). At least one `landmark` label, named in up to 30 characters ("lamp post"); where it stands goes in the note. A label's text runs away from the tripod, or above its dot when there's no room that side |
 
-The bridge checks everything lies inside the preview (`400 invalid_request`
-otherwise), draws the picture (the annotated part of the panorama, enlarged,
-text kept inside the frame), keeps the latest proposal per scan, writes the
+The bridge checks everything lies inside the preview, near the marker, with a
+landmark the note names and no side words (`400 invalid_request` otherwise), draws the picture (the annotated part of the panorama, enlarged,
+text kept inside the frame; where the scan saw the ground under the marker,
+the tripod is drawn its real size there, 1.65 m to the scanner's top, in
+perspective, with a soft shadow on the ground beside it, and the response's
+`marker.distance_m` says how far out that ground is), keeps the latest proposal per scan, writes the
 note to the field log and sends a `next_station` event. Any role but `viewer`.
 Proposals are kept in memory; deleting the scan deletes its proposal.
 

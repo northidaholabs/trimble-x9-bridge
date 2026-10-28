@@ -22,6 +22,7 @@ mod measure;
 mod minimap;
 mod mission;
 mod model;
+mod planner;
 mod problem;
 mod recipe;
 mod register;
@@ -72,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         Some("register") => return register::cli(&args[1..]),
         Some("bench") => return bench::cli(&args[1..]),
         Some("analyze") => return analyze::cli(&args[1..]),
+        Some("plan") => return planner::cli(&args[1..]),
         Some("worker") => return workmode::run(&args[1..]).await,
         _ => {}
     }

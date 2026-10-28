@@ -50,6 +50,7 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/v1/scans/:scan_id/coverage/image", get(scan_coverage_image))
         .route("/v1/scans/:scan_id/next-station", get(get_next_station).put(put_next_station))
         .route("/v1/scans/:scan_id/next-station/image", get(get_next_station_image))
+        .route("/v1/scans/:scan_id/next-station/plan", get(plan_next_station))
         .route("/v1/next-stations", get(list_next_stations))
         .route("/v1/missions", get(list_missions))
         .route("/v1/projects/:project_id/registration", get(get_registration).post(post_registration))
@@ -508,6 +509,87 @@ async fn scan_coverage_image(State(st): St, h: HeaderMap, Path(id): Path<String>
     Ok(([(header::CONTENT_TYPE, "image/png")], bytes).into_response())
 }
 
+#[derive(Deserialize)]
+struct PlanQuery {
+    /// Preview columns `x0,x1` framing the job's subject (`x1 < x0` wraps).
+    subject: Option<String>,
+}
+
+/// Where to set up next, from this scan's points (`planner.rs`): up to three
+/// spots on reachable ground, best first, each with its preview pixel and a
+/// landmark beside it. The plan without a subject is computed once per scan
+/// and cached.
+async fn plan_next_station(State(st): St, h: HeaderMap, Path(id): Path<String>, Query(q): Query<PlanQuery>) -> ApiResult<Json<Value>> {
+    st.caller(&h)?;
+    let id = crate::files::safe_id(&id)?.to_string();
+    let subject = match q.subject.as_deref() {
+        None => None,
+        Some(s) => {
+            let cols: Vec<usize> = s.split(',').map(|v| v.trim().parse()).collect::<Result<_, _>>().map_err(|_| ApiError::invalid("subject: two preview columns, x0,x1"))?;
+            let [x0, x1] = cols[..] else { return Err(ApiError::invalid("subject: two preview columns, x0,x1")) };
+            if x0 == x1 {
+                return Err(ApiError::invalid("subject: x0 and x1 must differ"));
+            }
+            Some((x0, x1))
+        }
+    };
+    let tzf = scan_file(&st, &id, FileKind::Tzf).await?;
+    let jpg = match scan_file(&st, &id, FileKind::Preview).await {
+        Ok(p) => tokio::fs::read(p).await.ok(),
+        Err(_) => None,
+    };
+    let preview = jpg.as_deref().and_then(|j| aim::jpeg_size(j).ok()).unwrap_or((0, 0));
+    if let Some((x0, x1)) = subject {
+        if preview.0 == 0 || x0 >= preview.0 || x1 >= preview.0 {
+            return Err(ApiError::invalid(format!("subject: columns must lie within the {}-pixel-wide preview", preview.0)));
+        }
+    }
+    // Only the plan without a subject is kept: a subject is one question.
+    let cached = st.data_dir.join("views").join(format!("{id}.plan.json"));
+    let read_cached = || async {
+        match subject {
+            None => tokio::fs::read(&cached).await.ok(),
+            Some(_) => None,
+        }
+    };
+    let bytes = match read_cached().await {
+        Some(b) => b,
+        None => {
+            let _one = st.view_lock.lock().await;
+            match read_cached().await {
+                Some(b) => b,
+                None => {
+                    let v = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+                        let t = trimble_tzf::Tzf::open(&tzf).map_err(|e| format!("open: {e}"))?;
+                        let meta = t.scan_meta().map_err(|e| format!("metadata: {e}"))?;
+                        let pts = t.grid_points().map_err(|e| format!("decode: {e}"))?;
+                        let mut v = crate::planner::plan(&pts, (meta.grid_cols, meta.grid_rows), preview, subject);
+                        v["preview_size"] = json!([preview.0, preview.1]);
+                        Ok(v)
+                    })
+                    .await
+                    .map_err(|e| ApiError::cache(format!("planning: {e}")))?
+                    .map_err(|e| ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, "decode_failed", "Could not decode the scan").detail(e))?;
+                    let b = serde_json::to_vec_pretty(&v).unwrap_or_default();
+                    if subject.is_none() {
+                        if let Some(dir) = cached.parent() {
+                            let _ = tokio::fs::create_dir_all(dir).await;
+                            let tmp = cached.with_extension(format!("part-{}", crate::util::new_id("p")));
+                            if tokio::fs::write(&tmp, &b).await.is_ok() {
+                                let _ = tokio::fs::rename(&tmp, &cached).await;
+                            }
+                        }
+                    }
+                    b
+                }
+            }
+        }
+    };
+    let mut v: Value = serde_json::from_slice(&bytes).map_err(|e| ApiError::cache(format!("plan: {e}")))?;
+    v["scan_id"] = json!(id);
+    Ok(Json(v))
+}
+
 /// The agent's next-station proposal on a scan's preview: checked, drawn and
 /// kept (the latest per scan), and announced to every client.
 async fn put_next_station(State(st): St, h: HeaderMap, Path(id): Path<String>, body: Bytes) -> ApiResult<Response> {
@@ -519,11 +601,24 @@ async fn put_next_station(State(st): St, h: HeaderMap, Path(id): Path<String>, b
     let (pw, ph, grey) = aim::jpeg_luma(&jpg).map_err(|e| ApiError::invalid(format!("preview: {e}")))?;
     p.check(pw, ph).map_err(ApiError::invalid)?;
     let p2 = p.clone();
-    let png = tokio::task::spawn_blocking(move || crate::station::render(&grey, pw, ph, &p2))
-        .await
-        .map_err(|e| ApiError::cache(format!("drawing: {e}")))?;
+    // The scan, when it decodes, says how far off the marker's ground is.
+    let tzf = scan_file(&st, &id, FileKind::Tzf).await.ok();
+    let (png, ground) = tokio::task::spawn_blocking(move || {
+        let ground = tzf.and_then(|f| {
+            let t = trimble_tzf::Tzf::open(&f).ok()?;
+            let meta = t.scan_meta().ok()?;
+            let pts = t.grid_points().ok()?;
+            crate::station::ground_at(&pts, (meta.grid_cols, meta.grid_rows), (pw, ph), (p2.marker.x, p2.marker.y))
+        });
+        (crate::station::render(&grey, pw, ph, &p2, ground), ground)
+    })
+    .await
+    .map_err(|e| ApiError::cache(format!("drawing: {e}")))?;
     let project_id = scan["project_id"].as_str().unwrap_or("").to_string();
     let mut v = p.to_json();
+    if let Some(g) = ground {
+        v["marker"]["distance_m"] = json!((g.out_m * 10.0).round() / 10.0);
+    }
     v["scan_id"] = json!(id);
     v["project_id"] = json!(project_id);
     v["station"] = scan["station"].clone();

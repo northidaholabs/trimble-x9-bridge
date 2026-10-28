@@ -334,13 +334,18 @@ try:
         check("a box with y0 > y1 fails the measurement with measure_failed", s == 0 and j["state"] == "failed"
               and j["problem"]["code"] == "measure_failed" and "y0 < y1" in j["problem"]["detail"], j)
         # Next-station proposal: drawn on the preview, kept, listed, shown.
-        prop = {"marker": {"x": 900, "y": 600, "label": "by the door"}, "note": "Set up by the door, on the rug.",
-                "labels": [{"x": 500, "y": 450, "text": "Window: seen", "kind": "seen"}],
-                "boxes": [{"x0": 523, "y0": 418, "x1": 674, "y1": 564, "text": "The window", "kind": "seen"}]}
+        prop = {"marker": {"x": 900, "y": 600, "label": "by the door"}, "note": "Carry the tripod past the window, by the door, on the rug.",
+                "labels": [{"x": 600, "y": 450, "text": "Window", "kind": "landmark"}],
+                "boxes": [{"x0": 523, "y0": 418, "x1": 674, "y1": 564, "text": "Seen: the window", "kind": "seen"}]}
         s, b = call("PUT", f"/scans/{station_scan}/next-station", "viewer", prop)
         check("viewer can't propose a station (403)", s == 403, b)
         s, b = call("PUT", f"/scans/{station_scan}/next-station", "agent", {**prop, "marker": {"x": 99999, "y": 1}})
         check("a marker off the preview is refused (400)", s == 400 and "marker" in b["detail"], b)
+        s, b = call("PUT", f"/scans/{station_scan}/next-station", "agent", {**prop, "note": "Turn right at the window, by the door."})
+        check("directions by left or right are refused (400)", s == 400 and "\"right\"" in b["detail"], b)
+        s, b = call("PUT", f"/scans/{station_scan}/next-station", "agent",
+                    {**prop, "labels": [{"x": 1900, "y": 450, "text": "Window", "kind": "landmark"}]})
+        check("a landmark out of the tripod's view is refused (400)", s == 400 and "one view" in b["detail"], b)
         s, ns = call("PUT", f"/scans/{station_scan}/next-station", "agent", prop)
         s2, ctype, png = fetch(f"/scans/{station_scan}/next-station/image", "viewer")
         _, lst = call("GET", "/next-stations", "viewer")
@@ -348,8 +353,35 @@ try:
               s == 200 and ns["proposed_by"] == "agent-1" and ns["preview_size"] == [2082, 815] and ns["marker"]["x"] == 900
               and s2 == 200 and ctype == "image/png" and png[1:4] == b"PNG" and lst and lst[0]["scan_id"] == station_scan
               and saw("next_station"), (s, ns, s2, ctype))
-        s, _ = call("PUT", f"/scans/{sc2['scan_id']}/next-station", "agent", {**prop, "marker": {"x": 100, "y": 100}})
+        s, _ = call("PUT", f"/scans/{sc2['scan_id']}/next-station", "agent",
+                    {**prop, "marker": {"x": 100, "y": 100}, "boxes": [],
+                     "labels": [{"x": 110, "y": 90, "text": "Window", "kind": "landmark"}]})
         check("a proposal on the area scan too", s == 200, s)
+        # Next-station plan: computed from the dome's points, cached, per subject.
+        t0 = time.time()
+        s, pl = call("GET", f"/scans/{station_scan}/next-station/plan", "viewer")
+        t_plan = time.time() - t0
+        cands = pl.get("candidates", []) if s == 200 else []
+        check("the bridge plans the next station from the dome: picks a step out, on the preview, each with a pixel",
+              s == 200 and pl["preview_size"] == [2082, 815] and pl["min_step_m"] >= 2
+              and all(c["distance_m"] >= pl["min_step_m"] and 0 <= c["preview_px"][0] < 2082 and 0 <= c["preview_px"][1] < 815
+                      and c["walk_m"] >= c["distance_m"] - 0.5 for c in cands)
+              and (cands or pl.get("reason")), pl)
+        t0 = time.time()
+        s, again = call("GET", f"/scans/{station_scan}/next-station/plan", "viewer")
+        check("a second plan is served from the cache", s == 200 and again == pl and time.time() - t0 < t_plan / 2 + 0.2, (t_plan, time.time() - t0))
+        s, sub = call("GET", f"/scans/{station_scan}/next-station/plan?subject=523,674", "viewer")
+        check("a plan toward a subject says which, and counts only its hidden ground",
+              s == 200 and sub["subject_px"] == [523, 674] and sub["subject_hidden_m2"] <= sub["hidden_m2"], sub)
+        for bad in ("523", "523,523", "a,b", "523,2082", "-1,5"):
+            s, b = call("GET", f"/scans/{station_scan}/next-station/plan?subject={bad}", "viewer")
+            check(f"a bad subject {bad!r} is refused (400)", s == 400, (s, b))
+        views = os.listdir(os.path.join(tmp, "data", "views"))
+        check("only the plan without a subject is cached", [v for v in views if ".plan" in v] == [f"{station_scan}.plan.json"], views)
+        s, b = call("GET", f"/scans/{sc2['scan_id']}/next-station/plan", "viewer")
+        check("an area scan is not planned from: it says it needs a full dome", s == 200 and not b["candidates"] and "full dome" in b["reason"], b)
+        print(f"      (plan in {t_plan:.1f} s: {len(cands)} picks, min step {pl['min_step_m']} m"
+              + (f", first {cands[0]['distance_m']} m" if cands else f", {pl.get('reason')}") + ")")
     # Registration: each full dome lands in the project frame by itself.
     _, in_project = call("GET", f"/scans?project_id={pid}", "viewer")
     domes = [x for x in in_project if x["kind"] == "full_dome"]
