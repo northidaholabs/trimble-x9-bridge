@@ -1126,6 +1126,8 @@ in a room. The shortest step is a quarter of the median reach, at least 2 m.
 
 ![Station 1 of the administration building from above, with three picks on open ground 25 to 38 m out](img/admin-next-plan.jpg)
 
+That plot is how the spots are chosen. It is not the picture used to direct someone: a bearing with no returns is only the background, and it reads as a line. Placement is shown in the station's view, with the tripod drawn where it will stand and the one distance that places it.
+
 | Field | What |
 | --- | --- |
 | `candidates` | Up to 3, best first: `xy_m` (this station's frame), `distance_m`, `walk_m` (over ground the scan saw), `sees_hidden_m2`, `shared_surface_m`, `preview_px` (the ground there), `landmark` |
@@ -1161,8 +1163,11 @@ curl -s -H "$H" -d '{"points":[{"xy":[10,0],"up":0},{"xy":[10,0],"up":1.3}]}' $B
 
 After checking a station's coverage, the agent shows the person where to set
 up next, on that station's preview, so they recognise the spot. One glance:
-the tripod, the one thing they walk past to reach it, and a sentence naming
-that thing:
+the tripod, the one thing they walk past to reach it, and the measured
+distance in the label. The other spots, when asked, are their distances.
+The plot from above stays off this picture.
+
+![This station's view. The clock tower is seen, the wing's far side is hidden, and the tripod stands on the pavement about 5 m past the lamp post.](img/admin-next-station.jpg)
 
 ```bash
 curl -s -X PUT -H "$H" -d '{
