@@ -130,6 +130,8 @@ pub struct AppState {
     pub prepared: Mutex<HashMap<String, std::sync::Arc<crate::register::Prepared>>>,
     /// Pair checks already made (see `register::audit`).
     pub audit_cache: Mutex<crate::register::AuditCache>,
+    /// Each recently projected-onto scan's depth and ground (`view3d`), a few at most.
+    pub depth: Mutex<Vec<(String, std::sync::Arc<crate::view3d::DepthView>)>>,
 }
 
 impl AppState {
@@ -150,6 +152,7 @@ impl AppState {
             work: Mutex::new(Default::default()),
             prepared: Mutex::new(HashMap::new()),
             audit_cache: Mutex::new(HashMap::new()),
+            depth: Mutex::new(Vec::new()),
         }
     }
 
@@ -277,7 +280,7 @@ impl AppState {
         match serde_json::from_slice::<Vec<crate::mission::Mission>>(&bytes) {
             Ok(ms) => {
                 let n = ms.len();
-                self.inner.lock().unwrap().missions = ms.into_iter().map(|m| (m.project_id.clone(), m)).collect();
+                self.inner.lock().unwrap().missions = ms.into_iter().map(|mut m| { m.refresh_said(); (m.project_id.clone(), m) }).collect();
                 n
             }
             Err(e) => {

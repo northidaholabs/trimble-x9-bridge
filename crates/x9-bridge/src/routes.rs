@@ -51,6 +51,7 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/v1/scans/:scan_id/next-station", get(get_next_station).put(put_next_station))
         .route("/v1/scans/:scan_id/next-station/image", get(get_next_station_image))
         .route("/v1/scans/:scan_id/next-station/plan", get(plan_next_station))
+        .route("/v1/scans/:scan_id/project", post(project_points))
         .route("/v1/next-stations", get(list_next_stations))
         .route("/v1/missions", get(list_missions))
         .route("/v1/projects/:project_id/registration", get(get_registration).post(post_registration))
@@ -590,6 +591,124 @@ async fn plan_next_station(State(st): St, h: HeaderMap, Path(id): Path<String>, 
     let mut v: Value = serde_json::from_slice(&bytes).map_err(|e| ApiError::cache(format!("plan: {e}")))?;
     v["scan_id"] = json!(id);
     Ok(Json(v))
+}
+
+/// How many depth views stay in memory (each a few MB).
+const DEPTH_KEPT: usize = 4;
+/// Points per projection request.
+const PROJECT_MAX: usize = 20_000;
+
+/// The scan's depth view: from memory, or built from its points (one build at a time).
+async fn depth_view(st: &Arc<AppState>, id: &str) -> ApiResult<Arc<crate::view3d::DepthView>> {
+    let cached = |st: &AppState| st.depth.lock().unwrap().iter().find(|(k, _)| k == id).map(|(_, v)| v.clone());
+    if let Some(v) = cached(st) {
+        return Ok(v);
+    }
+    let tzf = scan_file(st, id, FileKind::Tzf).await?;
+    let jpg = scan_file(st, id, FileKind::Preview).await?;
+    let preview = aim::jpeg_size(&tokio::fs::read(jpg).await.map_err(|e| ApiError::cache(format!("preview: {e}")))?).map_err(|e| ApiError::cache(format!("preview: {e}")))?;
+    let _one = st.view_lock.lock().await;
+    if let Some(v) = cached(st) {
+        return Ok(v);
+    }
+    let v = tokio::task::spawn_blocking(move || -> Result<Option<crate::view3d::DepthView>, String> {
+        let t = trimble_tzf::Tzf::open(&tzf).map_err(|e| format!("open: {e}"))?;
+        let meta = t.scan_meta().map_err(|e| format!("metadata: {e}"))?;
+        let pts = t.grid_points().map_err(|e| format!("decode: {e}"))?;
+        Ok(crate::view3d::DepthView::build(&pts, (meta.grid_cols, meta.grid_rows), preview))
+    })
+    .await
+    .map_err(|e| ApiError::cache(format!("depth: {e}")))?
+    .map_err(|e| ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, "decode_failed", "Could not decode the scan").detail(e))?
+    .ok_or_else(|| ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, "no_mapping", "The scan's points don't map onto its preview"))?;
+    let v = Arc::new(v);
+    let mut kept = st.depth.lock().unwrap();
+    kept.retain(|(k, _)| k != id);
+    kept.push((id.to_string(), v.clone()));
+    if kept.len() > DEPTH_KEPT {
+        kept.remove(0);
+    }
+    Ok(v)
+}
+
+/// Where points fall on a scan's preview, how far they are, and whether the
+/// scan saw something nearer (hidden). Points are `[x, y, z]`, or
+/// `{"xy": [x, y], "up": m}` for the ground there plus `up` metres; in the
+/// scan's frame, or the project's (`"frame": "project"`, needs the scan placed).
+async fn project_points(State(st): St, h: HeaderMap, Path(id): Path<String>, body: Bytes) -> ApiResult<Json<Value>> {
+    st.caller(&h)?;
+    let id = crate::files::safe_id(&id)?.to_string();
+    #[derive(Deserialize)]
+    struct Req {
+        #[serde(default)]
+        frame: Option<String>,
+        points: Vec<Value>,
+    }
+    let req: Req = parse(&body)?;
+    if req.points.len() > PROJECT_MAX {
+        return Err(ApiError::invalid(format!("points: at most {PROJECT_MAX}")));
+    }
+    // Project frame to scan frame: the inverse of the station's pose.
+    let pose = match req.frame.as_deref().unwrap_or("scan") {
+        "scan" => None,
+        "project" => {
+            let inner = st.inner.lock().unwrap();
+            let p = inner
+                .registrations
+                .values()
+                .flat_map(|r| r.stations.iter())
+                .find(|s| s.scan_id == id)
+                .and_then(|s| s.pose.clone())
+                .ok_or_else(|| ApiError::conflict("this scan is not placed in its project yet: project in its own frame (\"frame\": \"scan\")"))?;
+            Some(p)
+        }
+        other => return Err(ApiError::invalid(format!("frame: \"scan\" or \"project\", not {other:?}"))),
+    };
+    let v = depth_view(&st, &id).await?;
+    let (c, s) = pose.as_ref().map_or((1.0, 0.0), |p| { let t = p.turn_deg.to_radians(); (t.cos(), t.sin()) });
+    let off = pose.as_ref().map_or([0.0; 3], |p| p.xyz_m);
+    let to_scan = |x: f64, y: f64| {
+        let (dx, dy) = (x - off[0], y - off[1]);
+        (c * dx + s * dy, -s * dx + c * dy)
+    };
+    let num = |v: &Value| v.as_f64().filter(|f| f.is_finite());
+    let mut out = Vec::with_capacity(req.points.len());
+    for (i, p) in req.points.iter().enumerate() {
+        let local = if let Some(a) = p.as_array() {
+            match (a.first().and_then(num), a.get(1).and_then(num), a.get(2).and_then(num), a.len()) {
+                (Some(x), Some(y), Some(z), 3) => {
+                    let (lx, ly) = to_scan(x, y);
+                    [lx, ly, z - off[2]]
+                }
+                _ => return Err(ApiError::invalid(format!("points[{i}]: [x, y, z] in metres"))),
+            }
+        } else {
+            let xy = p.get("xy").and_then(Value::as_array);
+            let up = p.get("up").map_or(Some(0.0), num);
+            match (xy.and_then(|a| a.first()).and_then(num), xy.and_then(|a| a.get(1)).and_then(num), up) {
+                (Some(x), Some(y), Some(up)) => {
+                    let (lx, ly) = to_scan(x, y);
+                    [lx, ly, v.ground_z(lx, ly) + up]
+                }
+                _ => return Err(ApiError::invalid(format!("points[{i}]: [x, y, z], or {{\"xy\": [x, y], \"up\": metres}}"))),
+            }
+        };
+        out.push(match v.project(local) {
+            Some(q) => json!({
+                "px": [(q.px.0 * 10.0).round() / 10.0, (q.px.1 * 10.0).round() / 10.0],
+                "range_m": (q.range_m * 100.0).round() / 100.0,
+                "seen": q.seen,
+                "z_m": ((local[2] + off[2]) * 1000.0).round() / 1000.0,
+            }),
+            None => Value::Null,
+        });
+    }
+    Ok(Json(json!({
+        "scan_id": id,
+        "preview_size": [v.preview.0, v.preview.1],
+        "scanner_height_m": (-v.floor * 1000.0).round() / 1000.0,
+        "points": out,
+    })))
 }
 
 /// The agent's next-station proposal on a scan's preview: checked, drawn and

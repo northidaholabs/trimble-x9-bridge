@@ -361,6 +361,68 @@ paths:
               schema: { $ref: "#/components/schemas/NextStation" }
         default: { $ref: "#/components/responses/Problem" }
 
+  /scans/{scan_id}/project:
+    parameters: [{ $ref: "#/components/parameters/ScanId" }]
+    post:
+      tags: [scans]
+      operationId: projectPoints
+      summary: Where 3D points fall on the scan's preview, how far they are, and whether the scan saw something nearer.
+      description: |
+        For drawing real-size things into a station's panorama (a tripod on a
+        proposed spot, the walk there, earlier stations, a face asked about).
+        The preview's mapping is fitted from the scan's own points; the first
+        call for a scan decodes it (seconds on a Pi), later ones are quick.
+        `seen`: `visible` (nothing nearer that way), `hidden` (the scan saw
+        something nearer: draw it dashed), `open` (the scan saw nothing that way).
+        A point is `null` at the scanner or outside the picture's rows.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [points]
+              properties:
+                frame:
+                  type: string
+                  enum: [scan, project]
+                  default: scan
+                  description: "`project`: the project frame of the registration (the scan must be placed)."
+                points:
+                  type: array
+                  maxItems: 20000
+                  items:
+                    oneOf:
+                      - { type: array, items: { type: number }, minItems: 3, maxItems: 3, description: "[x, y, z] in metres" }
+                      - type: object
+                        required: [xy]
+                        properties:
+                          xy: { type: array, items: { type: number }, minItems: 2, maxItems: 2 }
+                          up: { type: number, default: 0, description: "Metres above the ground the scan saw there (or the tripod's ground where it saw none)." }
+      responses:
+        "200":
+          description: One entry per point, in order.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scan_id: { type: string }
+                  preview_size: { type: array, items: { type: integer } }
+                  scanner_height_m: { type: number, description: "The scanner above the ground round its tripod." }
+                  points:
+                    type: array
+                    items:
+                      type: object
+                      nullable: true
+                      properties:
+                        px: { type: array, items: { type: number } }
+                        range_m: { type: number }
+                        seen: { type: string, enum: [visible, hidden, open] }
+                        z_m: { type: number, description: "The point's height in the frame asked in." }
+        "409": { $ref: "#/components/responses/Problem" }
+        default: { $ref: "#/components/responses/Problem" }
+
   /scans/{scan_id}/next-station/plan:
     parameters: [{ $ref: "#/components/parameters/ScanId" }]
     get:
@@ -1562,6 +1624,9 @@ components:
         stations: { type: array, items: { type: integer } }
         answer: { $ref: "#/components/schemas/PlumbAnswer" }
         checked_at: { type: string, format: date-time }
+        said:
+          description: "With an answer: the answer as `ask` gives it (`out_of_plumb_in`, `leans`, and with a tolerance `allowed_mm`, `allowed_in`, `within` or `tolerance_note`), so every reader shows the same words."
+          allOf: [{ $ref: "#/components/schemas/PlumbAnswer" }]
 
     Tolerance:
       type: object
