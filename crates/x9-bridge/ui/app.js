@@ -297,7 +297,7 @@ function missionCard(m) {
   return `<div class="card mission ${m.state === "ready" ? "attn" : ""}">
     <div class="line top-align"><strong class="grow">${esc(m.goal)}</strong><span class="chip ${state[0]}">${esc(state[1])}</span></div>
     <div class="meta">Done when: ${esc(m.done_when)}</div>
-    <div class="line"><span class="meta">${esc(tally)}</span><span class="ask-chat quiet">${CHAT_ICON}Ask in the chat for more</span></div>
+    <div class="line"><span class="meta">${esc(tally)}</span><span class="ask-chat quiet">${CHAT_ICON}${esc(missionTip(m))}</span></div>
     ${rows ? `<ul class="ledger">${rows}</ul>` : ""}
     ${m.state === "ready" ? `<div class="note">${esc(m.ready_summary ?? "")}</div>
       ${isOp() ? `<button class="btn good wide" data-act="mission-sign-off" data-id="${esc(m.project_id)}" ${S.busy ? "disabled" : ""}>Sign off the job</button>` : `<p class="hint">Waiting for an operator to sign it off.</p>`}` : ""}
@@ -614,6 +614,30 @@ function overlaySvg(o, decided, st, next) {
 // A small reminder that the agent in the chat can say more than the page does.
 const CHAT_ICON = `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2.5 3h11a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 2.5V11H2.5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>`;
 
+// Only when an agent is on this job (it set the mission or proposed a
+// station): otherwise there may be no chat to ask.
+function agentHere(pid) {
+  return S.missions.some((m) => m.project_id === pid) || S.nextStations.some((p) => p.project_id === pid);
+}
+// The tip names the spot by what the picture shows (its distance), not its
+// number: the agent may have planned toward a subject and numbered differently.
+function spotTip(c, d) {
+  const out = `${Math.round(c.distance_m)} m out`;
+  return d?.use ? `Ask in the chat for more, like “how do I get to the spot ${out}?”` : `Ask in the chat for more, like “why the spot ${out}?”`;
+}
+// The mission's tip names a question on the card.
+function missionTip(m) {
+  const qs = m.targets.filter((t) => t.question);
+  const short = (t) => t.name.replace(/ \(.*\)$/, "");
+  const open = qs.find((t) => t.question.verdict && t.question.verdict !== "answer");
+  if (open) return `Ask in the chat, like “why is ${short(open)} not answered yet?”`;
+  const tol = qs.find((t) => t.question.verdict === "answer" && t.tolerance);
+  if (tol) return `Ask in the chat, like “what tolerance was ${short(tol)} checked against?”`;
+  const ans = qs.find((t) => t.question.verdict === "answer");
+  if (ans) return `Ask in the chat, like “how was ${short(ans)} measured?”`;
+  return "Ask in the chat for more";
+}
+
 // The spot to show: the one tapped, else the one chosen, else the best not ruled out.
 function nextSpot(cands, decided, st) {
   if (S.spotFocus != null && cands.some((c) => c.rank === S.spotFocus)) return S.spotFocus;
@@ -650,7 +674,7 @@ function spotsCard(pid) {
     ? `<button class="layer ${S.showMore ? "on" : ""}" data-act="more">${S.showMore ? "Show less" : "Show more"}</button>` : "";
   const pic = typeof img === "string" && img !== "loading"
     ? `<div class="pic-wrap"><div class="spots-pic" data-keep-scroll="spots:${esc(dome.scan_id)}"><div class="spots-inner"><img src="${esc(img)}" alt="Station ${esc(st)}'s view, with the next spot drawn as a tripod to scale and the walk to it">${marks}</div></div>
-       <div class="ask-chat" title="The agent in the chat can explain any of this, or find another spot">${CHAT_ICON}Ask in the chat for more, like “why spot ${next}?”</div></div>
+       ${agentHere(pid) ? `<div class="ask-chat" title="The agent in the chat can explain any of this, or find another spot">${CHAT_ICON}${esc(spotTip(cands.find((c) => c.rank === next), decided[`${st}|${next}`]))}</div>` : ""}</div>
        <div class="line pic-foot"><span class="hint">From station ${esc(st)}, to scale${S.showMore ? ". Dashed: hidden from here" : ""}.</span>${moreBtn}</div>`
     : img?.error ? "" : `<div class="placeholder small">Loading station ${esc(st)}'s view…</div>`;
   const spotRow = (c, main) => {

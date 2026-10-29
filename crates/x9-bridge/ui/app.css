@@ -403,4 +403,5 @@ svg.overlay text.hid { opacity: 0.6; }
 .pic-wrap { position: relative; }
 .ask-chat { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; }
 .pic-wrap .ask-chat { position: absolute; top: 18px; left: 8px; padding: 5px 10px; border-radius: 999px; background: rgba(2, 6, 23, 0.72); color: #e2e8f0; pointer-events: none; }
-.ask-chat.quiet { color: var(--muted); font-weight: 500; white-space: nowrap; }
+.ask-chat.quiet { color: var(--muted); font-weight: 500; }
+.mission .line .ask-chat.quiet { text-align: right; max-width: 60%; }
