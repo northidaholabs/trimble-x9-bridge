@@ -53,7 +53,6 @@ const S = {
   missions: [],     // each project's mission, newest first
   nsImages: new Map(), // scan_id|at -> object URL | "loading" | {error}
   regs: {},            // project_id -> registration (null while loading)
-  regImages: new Map(), // project|updated|ledger -> object URL | "loading" | {error}
   mapImages: new Map(), // project|registration|stations|ledger -> object URL | "loading" | {error}
   mapLast: {},          // project -> the last minimap drawn, shown while the next one loads
   evidence: new Map(), // measurement_id -> object URL | "loading" | {error}
@@ -64,7 +63,11 @@ const S = {
   spotScrolled: {},     // spots picture -> true once scrolled to spot 1
   overlays: {},         // scan|plan|registration|mission -> projected overlay | "loading" | {error}
   spotFocus: null,      // the spot picked out on the picture
-  layers: (() => { try { return JSON.parse(store.get("x9.layers")) ?? null; } catch { return null; } })() ?? { distances: true, spots: true, stations: true, questions: true },
+  // Calm by default: the picture shows the next spot only; "Show more" adds
+  // the other spots, earlier stations, the faces asked about and distances.
+  showMore: store.get("x9.more") === "1",
+  otherSpots: false,    // the other spots' list unfolded
+  qOpen: {},            // project|target -> a question's detail unfolded
   watchMeasure: {}, // scan_id -> job_id
   watchExport: {}, // scan_id -> job_id
   sheet: null,
@@ -294,9 +297,8 @@ function missionCard(m) {
   return `<div class="card mission ${m.state === "ready" ? "attn" : ""}">
     <div class="line top-align"><strong class="grow">${esc(m.goal)}</strong><span class="chip ${state[0]}">${esc(state[1])}</span></div>
     <div class="meta">Done when: ${esc(m.done_when)}</div>
-    <div class="meta">${esc(tally)}</div>
+    <div class="line"><span class="meta">${esc(tally)}</span><span class="ask-chat quiet">${CHAT_ICON}Ask in the chat for more</span></div>
     ${rows ? `<ul class="ledger">${rows}</ul>` : ""}
-    ${regPlan(m)}
     ${m.state === "ready" ? `<div class="note">${esc(m.ready_summary ?? "")}</div>
       ${isOp() ? `<button class="btn good wide" data-act="mission-sign-off" data-id="${esc(m.project_id)}" ${S.busy ? "disabled" : ""}>Sign off the job</button>` : `<p class="hint">Waiting for an operator to sign it off.</p>`}` : ""}
     ${m.state === "signed_off" ? `<div class="meta">Signed off by ${esc(m.signed_off_by)} · ${esc(ago(m.signed_off_at))}${m.confirmed_via ? ` · ${esc(m.confirmed_via)}` : ""}</div>` : ""}
@@ -325,9 +327,24 @@ function askImage(pid, tid, at) {
     .finally(() => render());
   return "loading";
 }
+// One line per question; tap it for the full wording, the heat map and Ask again.
+function questionLine(t) {
+  const q = t.question;
+  if (q.verdict === "answer" && q.said) {
+    const call = t.tolerance ? (q.said.within === true ? " · within ✓" : q.said.within === false ? " · outside ✗" : "") : "";
+    return `${Math.abs(q.said.out_of_plumb_mm).toFixed(1)} mm out of plumb${call}`;
+  }
+  if (q.verdict === "not_yet") return q.reason === "settling" ? "needs one more look" : (q.reason || "not yet");
+  if (q.verdict === "does_not_fit") return q.reason || "doesn't fit";
+  return "not asked yet";
+}
 function questionRow(m, t) {
   const q = t.question;
   const [cls, word] = q.verdict ? QWORD[q.verdict] ?? ["", q.verdict] : ["", "not asked"];
+  const key = `${m.project_id}|${t.target_id}`;
+  const open = !!S.qOpen[key];
+  const head = `<button class="q-line" data-act="q-open" data-key="${esc(key)}" aria-expanded="${open}"><strong>${esc(t.name.replace(/ \(.*\)$/, ""))}</strong> · ${esc(questionLine(t))}<span class="caret">${open ? "▾" : "▸"}</span></button>`;
+  if (!open) return `<li class="question"><span class="chip ${cls}">${esc(word)}</span><div class="grow">${head}</div></li>`;
   let body = "";
   if (q.verdict === "answer" && q.said) {
     const a = q.said;
@@ -359,11 +376,9 @@ function questionRow(m, t) {
       pic = `<a href="${esc(img)}" target="_blank" rel="noopener" title="Open full size"><img class="heat" src="${esc(img)}" alt="${q.verdict === "answer" ? "Heat map of the face: how far each part stands proud of or sits back from the fitted plane" : "Where the face stands proud or sits back; no figures, as it doesn't fit one plane"}"></a>`;
     }
   }
-  const key = `${m.project_id}|${t.target_id}`;
   const ask = canAct() && m.state !== "signed_off"
     ? `<button class="btn small" data-act="ask" data-pid="${esc(m.project_id)}" data-id="${esc(t.target_id)}" ${S.asking[key] ? "disabled" : ""}>${S.asking[key] ? "Asking… (up to a minute and a half)" : q.verdict ? "Ask again" : "Ask now"}</button>` : "";
-  return `<li class="question"><span class="chip ${cls}">${esc(word)}</span><div class="grow">
-    <strong>${esc(t.name)}</strong> <span class="meta">· is it plumb?</span>
+  return `<li class="question open"><span class="chip ${cls}">${esc(word)}</span><div class="grow">${head}
     ${body}${pic}${ask ? `<div class="btns-row">${ask}</div>` : ""}</div></li>`;
 }
 
@@ -490,10 +505,13 @@ const strokes = (pts, w, cls) => runs(pts, w).map((r) => `<path class="${cls}${r
 const tag = (p, text, cls, fs) => p ? `<text class="${cls}${p.seen === "hidden" ? " hid" : ""}" x="${p.px[0]}" y="${p.px[1]}" font-size="${fs}">${esc(text)}</text>` : "";
 const VERDICT_CLS = { answer: "good", not_yet: "warn", does_not_fit: "bad" };
 
-function overlaySvg(o, decided, st) {
+function overlaySvg(o, decided, st, next) {
   const [w, h] = o.size;
   const fs = Math.max(14, w / 70);
-  const L = S.layers;
+  // Calm: the next spot only. More: the other spots, earlier stations, the
+  // faces asked about and distance rings.
+  const more = S.showMore;
+  const L = { distances: more, questions: more, stations: more, spots: true };
   let g = "";
   // Labels that would overlap one already placed move up, with a leader line
   // back to what they name.
@@ -544,24 +562,32 @@ function overlaySvg(o, decided, st) {
       g += strokes([head, top], w, "ghost head");
       g += `<circle class="ghost-dot${top.seen === "hidden" ? " hid" : ""}" cx="${top.px[0]}" cy="${top.px[1]}" r="${fs * 0.55}"/>`;
       g += tag({ ...top, px: [top.px[0], top.px[1] + fs * 0.32] }, String(s.station), "ghost-n", fs * 0.75);
-      if (base) g += label({ ...top, px: [top.px[0], top.px[1] - fs * 0.9] }, `${Math.round(base.range_m)} m`, "ghost-t", fs * 0.7);
     }
   }
   if (L.spots) {
     for (const s of o.spots) {
       const d = decided[`${st}|${s.rank}`];
       const state = d ? (d.use ? " use" : " no") : "";
-      const dim = S.spotFocus != null && S.spotFocus !== s.rank ? " dim" : "";
-      const cls = `spot3d${state}${dim}`;
-      g += `<g class="${cls}">`;
+      const full = s.rank === next || (more && !(d && !d.use));
+      const [, , , head0, top0] = s.tripod;
+      if (!full) {
+        // Another spot: just its number, to tap.
+        if (top0) {
+          const by = top0.px[1] - fs * 1.3;
+          g += `<g class="spot3d other${state}"><g class="badge small" data-act="spot-focus" data-rank="${s.rank}"><circle cx="${top0.px[0]}" cy="${by}" r="${fs * 0.55}"/><text x="${top0.px[0]}" y="${by + fs * 0.27}" font-size="${fs * 0.75}">${s.rank}</text></g></g>`;
+        }
+        continue;
+      }
+      const dim = more && s.rank !== next ? " dim" : "";
+      g += `<g class="spot3d${state}${dim}">`;
       g += strokes(s.path, w, "walk");
-      s.ticks.forEach((p, i) => { if (p) g += `<circle class="tick${p.seen === "hidden" ? " hid" : ""}" cx="${p.px[0]}" cy="${p.px[1]}" r="${fs * 0.16}"/>` + label({ ...p, px: [p.px[0] + fs * 1.1, p.px[1] + fs * 0.25] }, `${(i + 1) * 5} m`, "tick-t", fs * 0.6); });
+      if (more) s.ticks.forEach((p) => { if (p) g += `<circle class="tick${p.seen === "hidden" ? " hid" : ""}" cx="${p.px[0]}" cy="${p.px[1]}" r="${fs * 0.16}"/>`; });
       g += strokes(s.foot, w, "foot");
       const runsFoot = runs(s.foot, w);
       if (runsFoot.length === 1) g += `<path class="foot-fill" d="${runsFoot[0].d} Z"/>`;
       if (s.lm?.base && s.lm.top) {
         g += strokes([s.lm.base, s.lm.top], w, "pole");
-        g += label({ ...s.lm.top, px: [s.lm.top.px[0], s.lm.top.px[1] - fs * 0.3] }, `${s.lm.shape === "post" ? "post" : "landmark"} ${s.lm.height.toFixed(1)} m`, "pole-t", fs * 0.75);
+        if (s.rank === next) g += label({ ...s.lm.top, px: [s.lm.top.px[0], s.lm.top.px[1] - fs * 0.3] }, s.lm.shape === "post" ? "post" : "landmark", "pole-t", fs * 0.75);
       }
       const [f1, f2, f3, head, top] = s.tripod;
       for (const f of [f1, f2, f3]) if (f && head) g += strokes([f, head], w, "leg");
@@ -585,9 +611,19 @@ function overlaySvg(o, decided, st) {
   return `<svg class="overlay" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">${g}</svg>`;
 }
 
-function layerChips() {
-  const chip = (k, label) => `<button class="layer ${S.layers[k] ? "on" : ""}" data-act="layer" data-k="${k}">${label}</button>`;
-  return `<div class="layers">${chip("spots", "Spots")}${chip("stations", "Earlier stations")}${chip("questions", "Questions")}${chip("distances", "Distances")}</div>`;
+// A small reminder that the agent in the chat can say more than the page does.
+const CHAT_ICON = `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2.5 3h11a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 2.5V11H2.5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>`;
+
+// The spot to show: the one tapped, else the one chosen, else the best not ruled out.
+function nextSpot(cands, decided, st) {
+  if (S.spotFocus != null && cands.some((c) => c.rank === S.spotFocus)) return S.spotFocus;
+  const by = (f) => cands.find((c) => f(decided[`${st}|${c.rank}`]));
+  return (by((d) => d?.use) ?? by((d) => !d) ?? cands[0]).rank;
+}
+function spotShort(c) {
+  const lm = c.landmark;
+  const by = lm ? (lm.shape === "post" ? `, by a post ${lm.height_m.toFixed(1)} m tall` : `, by something ${lm.height_m.toFixed(0)} m tall`) : "";
+  return `${Math.round(c.distance_m)} m out, ${Math.round(c.walk_m)} m to walk${by}`;
 }
 
 function spotsCard(pid) {
@@ -603,33 +639,34 @@ function spotsCard(pid) {
   const img = preview(dome.scan_id);
   const [pw, ph] = plan.preview_size ?? [0, 0];
   const ov = overlayFor(pid, dome, plan);
+  const next = nextSpot(cands, decided, st);
   // Until the 3D overlay is in (or if it fails), plain markers at the planner's pixels.
-  const marks = typeof ov === "object" && !ov.error ? overlaySvg(ov, decided, st) : pw && ph ? cands.map((c) => {
+  const marks = typeof ov === "object" && !ov.error ? overlaySvg(ov, decided, st, next) : pw && ph ? cands.filter((c) => S.showMore || c.rank === next).map((c) => {
     const d = decided[`${st}|${c.rank}`];
     const cls = d ? (d.use ? "spot use" : "spot no") : "spot";
     return c.preview_px ? `<span class="${cls}" style="left:${(100 * c.preview_px[0] / pw).toFixed(2)}%;top:${(100 * c.preview_px[1] / ph).toFixed(2)}%">${c.rank}</span>` : "";
   }).join("") : "";
-  const legend = typeof ov === "object" && !ov.error
-    ? `Station ${esc(st)}'s view, drawn to scale: tripods ${esc(ov.height.toFixed(2))} m to the scanner, as this one stands. Dashed: hidden behind something from here. Tap a number to pick that spot out.`
-    : ov === "loading" ? `Station ${esc(st)}'s view. Placing the spots in 3D…` : `Station ${esc(st)}'s view. Numbers: where to stand.`;
+  const moreBtn = typeof ov === "object" && !ov.error
+    ? `<button class="layer ${S.showMore ? "on" : ""}" data-act="more">${S.showMore ? "Show less" : "Show more"}</button>` : "";
   const pic = typeof img === "string" && img !== "loading"
-    ? `${layerChips()}<div class="spots-pic" data-keep-scroll="spots:${esc(dome.scan_id)}"><div class="spots-inner"><img src="${esc(img)}" alt="Station ${esc(st)}'s view, with the bridge's spots drawn as tripods to scale, the walk to each, earlier stations and the faces asked about">${marks}</div></div>
-       <p class="hint">${legend} Scroll sideways for all of it.</p>`
+    ? `<div class="pic-wrap"><div class="spots-pic" data-keep-scroll="spots:${esc(dome.scan_id)}"><div class="spots-inner"><img src="${esc(img)}" alt="Station ${esc(st)}'s view, with the next spot drawn as a tripod to scale and the walk to it">${marks}</div></div>
+       <div class="ask-chat" title="The agent in the chat can explain any of this, or find another spot">${CHAT_ICON}Ask in the chat for more, like “why spot ${next}?”</div></div>
+       <div class="line pic-foot"><span class="hint">From station ${esc(st)}, to scale${S.showMore ? ". Dashed: hidden from here" : ""}.</span>${moreBtn}</div>`
     : img?.error ? "" : `<div class="placeholder small">Loading station ${esc(st)}'s view…</div>`;
-  const rows = cands.map((c) => {
+  const spotRow = (c, main) => {
     const d = decided[`${st}|${c.rank}`];
-    const state = d ? `<div class="meta decided">${d.use ? "Chosen" : "Ruled out"}${d.by ? ` by ${esc(d.by)}` : ""} · ${esc(ago(d.at))}${d.use ? "" : `: ${esc(d.text.replace(SPOT_LOG, "").replace(/^:\s*/, ""))}`}</div>` : "";
-    const btns = canAct() ? `<div class="btns-row">
-        <button class="btn small ${d?.use ? "good" : ""}" data-act="spot-use" data-pid="${esc(pid)}" data-station="${esc(st)}" data-rank="${c.rank}" ${S.busy ? "disabled" : ""}>Set up here</button>
+    const state = d ? `<div class="meta decided">${d.use ? "Chosen" : "Ruled out"} · ${esc(ago(d.at))}${d.use ? "" : `: ${esc(d.text.replace(SPOT_LOG, "").replace(/^:\s*/, ""))}`}</div>` : "";
+    const btns = canAct() && !(d && !d.use) ? `<div class="btns-row">
+        <button class="btn small ${d?.use ? "good" : main ? "primary" : ""}" data-act="spot-use" data-pid="${esc(pid)}" data-station="${esc(st)}" data-rank="${c.rank}" ${S.busy || d?.use ? "disabled" : ""}>${d?.use ? "Chosen" : "Set up here"}</button>
         <button class="btn small" data-act="spot-no" data-pid="${esc(pid)}" data-station="${esc(st)}" data-rank="${c.rank}" ${S.busy ? "disabled" : ""}>Can't stand here</button></div>` : "";
-    return `<li class="${S.spotFocus === c.rank ? "focus" : ""}"><span class="dot ${d ? (d.use ? "done" : "failed") : "now"}">${c.rank}</span><div class="grow">
-      <strong>${esc(spotWords(c))}</strong>
-      <div class="meta">Would see ${esc(Math.round(c.sees_hidden_m2).toLocaleString())} m² of ground not seen yet · overlaps station ${esc(st)} on ${esc(c.shared_surface_m.toFixed(0))} m of surface</div>
-      ${state}${btns}</div></li>`;
-  }).join("");
-  return `<div class="card"><div class="line"><strong>Spots the bridge found</strong><span class="meta">from station ${esc(st)}</span></div>
-    ${pic}<ul class="steps spots">${rows}</ul>
-    <p class="hint">Your choice goes to the field log, where the agent picks it up.</p></div>`;
+    return `<div class="${main ? "next-spot" : "other-spot"}"><span class="dot ${d ? (d.use ? "done" : "failed") : "now"}">${c.rank}</span><div class="grow">
+      <strong>${main ? "Next: " : ""}${esc(spotShort(c))}</strong>${state}${btns}</div></div>`;
+  };
+  const main = cands.find((c) => c.rank === next);
+  const others = cands.filter((c) => c.rank !== next);
+  const otherList = others.length ? `<button class="fold" data-act="other-spots">${S.otherSpots ? "▾" : "▸"} Other spots (${others.length})</button>
+    ${S.otherSpots ? others.map((c) => spotRow(c, false)).join("") : ""}` : "";
+  return `<div class="card">${pic}${spotRow(main, true)}${otherList}</div>`;
 }
 
 // --------------------------------------------------------------- trust ---
@@ -645,7 +682,9 @@ const TRUST = {
 const BUMP_LOG = /^Station (\d+): the person says the tripod (was bumped|didn't move)/;
 function trustNotes(pid) {
   const r = S.regs[pid];
-  const odd = (r?.stations ?? []).filter((s) => TRUST[s.verdict]);
+  // Only what the person can answer: a doubtful station (did the tripod move?).
+  // The rest is the agent's to sort out with the next station.
+  const odd = (r?.stations ?? []).filter((s) => s.verdict === "doubtful");
   if (!odd.length) return "";
   const said = {};
   for (const e of S.log) {
@@ -669,34 +708,6 @@ function workerText() {
   if (!S.workers.length) return "on the Pi";
   const w = S.workers[0];
   return `${esc(w.worker)}${w.job_id ? " · working" : " · ready"}${S.workers.length > 1 ? ` +${S.workers.length - 1}` : ""}`;
-}
-
-// The registered plan under the ledger: every station in one frame, walls,
-// and the mission's wall faces coloured by status.
-function regPlan(m) {
-  const id = m.project_id;
-  if (!(id in S.regs)) {
-    S.regs[id] = null;
-    api(`/projects/${encodeURIComponent(id)}/registration`).then((v) => { S.regs[id] = v; }).catch(() => {}).finally(() => render());
-    return "";
-  }
-  const r = S.regs[id];
-  if (!r?.stations?.some((s) => s.placed)) return "";
-  const key = `${id}|${r.updated_at}|${m.targets.map((t) => t.status).join()}`;
-  let img = S.regImages.get(key);
-  if (!img) {
-    S.regImages.set(key, "loading");
-    api(`/projects/${encodeURIComponent(id)}/registration/plan`, { raw: true })
-      .then((x) => x.blob())
-      .then((b) => S.regImages.set(key, URL.createObjectURL(b)))
-      .catch((e) => S.regImages.set(key, { error: e.message }))
-      .finally(() => render());
-    img = "loading";
-  }
-  const pic = img === "loading" ? `<div class="placeholder small">Loading the plan…</div>`
-    : img?.error ? `<div class="problem">${esc(img.error)}</div>`
-    : `<a href="${esc(img)}" target="_blank" rel="noopener" title="Open full size"><img class="nextstation" src="${esc(img)}" alt="Plan of the registered stations, walls and the mission's wall faces"></a>`;
-  return `<div class="meta">${esc(r.summary)}</div>${pic}`;
 }
 
 // The project as a line map (walls, stations), redrawn as stations land and register.
@@ -1562,7 +1573,9 @@ const actions = {
     const text = `Next station from station ${el.dataset.station}: setting up at spot ${el.dataset.rank}${c ? ` (${spotWords(c)})` : ""}.`;
     return act(() => logNote(text, el.dataset.pid), `Spot ${el.dataset.rank} chosen`);
   },
-  layer: (el) => { S.layers = { ...S.layers, [el.dataset.k]: !S.layers[el.dataset.k] }; store.set("x9.layers", JSON.stringify(S.layers)); render(true); },
+  more: () => { S.showMore = !S.showMore; store.set("x9.more", S.showMore ? "1" : null); render(true); },
+  "other-spots": () => { S.otherSpots = !S.otherSpots; render(true); },
+  "q-open": (el) => { const k = el.dataset.key; S.qOpen[k] = !S.qOpen[k]; render(true); },
   "spot-focus": (el) => { const r = Number(el.dataset.rank); S.spotFocus = S.spotFocus === r ? null : r; render(true); },
   "spot-no": (el) => { S.sheet = { type: "spot", pid: el.dataset.pid, station: el.dataset.station, rank: el.dataset.rank }; render(true); },
   bumped: (el) => act(() => logNote(`Station ${el.dataset.station}: the person says the tripod ${el.dataset.said} during the scan.`, el.dataset.pid), "Noted for the agent"),
