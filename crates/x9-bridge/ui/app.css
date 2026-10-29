@@ -245,6 +245,12 @@ details summary { cursor: pointer; margin: 8px 0; }
   main { max-width: 1160px; padding: 16px 24px 40px; }
   .cols { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 0 24px; align-items: start; }
   .cols.even { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  /* Now: the station's view runs the full width under both columns. */
+  .cols.now .col-a { grid-column: 1; grid-row: 1; }
+  .cols.now .col-b { grid-column: 2; grid-row: 1; }
+  .cols.now .span { grid-column: 1 / -1; grid-row: 2; }
+  .cols.now .span .next-station { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0 24px; }
+  .cols.now .span .spots-inner { min-width: 1500px; }
   h2.first { margin-top: 4px; }
   .pano img, .placeholder { height: min(52vh, 440px); }
   .placeholder.small { height: 160px; }
@@ -312,3 +318,70 @@ body.viewing { overflow: hidden; }
   .vw-size { margin-left: 0; }
   .vw-bar button { padding: 0 10px; }
 }
+
+/* Questions: the verdict, its answer in the bridge's words, the heat map. */
+.ledger li.question .answer { font-size: 17px; font-weight: 700; margin-top: 4px; }
+.ledger li.question .tol { margin-top: 2px; }
+.ledger li.question .tol .chip { min-width: 0; margin-right: 4px; }
+img.heat { display: block; width: 100%; max-width: 420px; margin-top: 8px; border-radius: 10px; border: 1px solid var(--line); }
+.btns-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.meta.small { font-size: 13px; }
+.meta.decided { color: var(--ink); margin-top: 4px; }
+
+/* Spots the bridge found, drawn on the station's panorama. */
+.spots-pic { overflow-x: auto; margin: 10px 0 4px; border-radius: 12px; background: #0b1220; }
+.spots-inner { position: relative; min-width: 720px; }
+.spots-inner img { display: block; width: 100%; }
+.spot { position: absolute; transform: translate(-50%, -50%); width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center;
+  font-weight: 800; font-size: 15px; background: #f59e0b; color: #111827; border: 2px solid #fff; box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.45); }
+.spot.use { background: var(--good); color: #fff; }
+.spot.no { background: #6b7280; color: #fff; text-decoration: line-through; }
+.lm { position: absolute; transform: translate(-50%, -50%); width: 26px; height: 26px; border-radius: 50%; border: 3px solid #f8fafc; box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.5); }
+.steps.spots li { align-items: flex-start; }
+.ledger.trust { margin-top: 8px; }
+.ledger.trust .chip { min-width: 84px; }
+
+/* The station's view: real-size things projected into the panorama. Solid
+   where the scan sees them from here; dashed and faded where hidden. */
+.layers { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 0; }
+.layer { font: inherit; font-size: 13px; font-weight: 600; padding: 5px 11px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); color: var(--muted); cursor: pointer; }
+.layer.on { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+.spots-inner { min-width: 1400px; }
+svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+svg.overlay path { fill: none; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+svg.overlay .hid { stroke-dasharray: 5 5; opacity: 0.55; }
+svg.overlay text { font-family: inherit; font-weight: 700; text-anchor: middle; paint-order: stroke; stroke: rgba(2, 6, 23, 0.85); stroke-width: 4px; stroke-linejoin: round; }
+svg.overlay text.hid { opacity: 0.6; }
+.overlay .ring { stroke: #e2e8f0; stroke-width: 1; opacity: 0.5; }
+.overlay .ring-t { fill: #e2e8f0; opacity: 0.85; font-weight: 600; }
+.overlay .face { stroke-width: 2.5; }
+.overlay .face.good { stroke: #4ade80; } .overlay .face.warn { stroke: #fbbf24; } .overlay .face.bad { stroke: #f87171; } .overlay .face.none { stroke: #cbd5e1; }
+.overlay .face-fill { stroke: none !important; opacity: 0.16; }
+.overlay .face-fill.good { fill: #4ade80; } .overlay .face-fill.warn { fill: #fbbf24; } .overlay .face-fill.bad { fill: #f87171; } .overlay .face-fill.none { fill: #cbd5e1; }
+.overlay .face-t.good { fill: #4ade80; } .overlay .face-t.warn { fill: #fbbf24; } .overlay .face-t.bad { fill: #f87171; } .overlay .face-t.none { fill: #e2e8f0; }
+.overlay .ghost { stroke: #22d3ee; stroke-width: 1.5; opacity: 0.8; }
+.overlay .ghost.head { stroke-width: 3; }
+.overlay .ghost-dot { fill: rgba(8, 47, 73, 0.85); stroke: #22d3ee; stroke-width: 2; }
+.overlay .ghost-dot.hid { opacity: 0.5; stroke-dasharray: 3 3; }
+.overlay .ghost-n { fill: #a5f3fc; stroke: none; }
+.overlay .ghost-t { fill: #a5f3fc; font-weight: 600; }
+.overlay .walk { stroke: #f59e0b; stroke-width: 2.5; stroke-dasharray: 1 7; }
+.overlay .walk.hid { stroke-dasharray: 1 10; }
+.overlay .tick { fill: #fde68a; }
+.overlay .tick-t { fill: #fde68a; font-weight: 600; }
+.overlay .foot { stroke: #f59e0b; stroke-width: 2; }
+.overlay .foot-fill { fill: #f59e0b; opacity: 0.25; stroke: none; }
+.overlay .leg { stroke: #fbbf24; stroke-width: 2.5; }
+.overlay .scanner { stroke: #fef3c7; stroke-width: 7; }
+.overlay .pole { stroke: #f8fafc; stroke-width: 2; }
+.overlay .pole-t { fill: #f8fafc; font-weight: 600; }
+.overlay .lead { stroke: #e2e8f0; stroke-width: 1; opacity: 0.6; }
+.overlay .badge { pointer-events: auto; cursor: pointer; }
+.overlay .badge circle { fill: #f59e0b; stroke: #fff; stroke-width: 2; }
+.overlay .badge text { fill: #111827; stroke: none; }
+.overlay .badge-t { fill: #fde68a; }
+.overlay .spot3d.use .badge circle, .overlay .spot3d.use .foot-fill { fill: #22c55e; }
+.overlay .spot3d.use .leg, .overlay .spot3d.use .foot, .overlay .spot3d.use .walk { stroke: #4ade80; }
+.overlay .spot3d.no { opacity: 0.35; }
+.overlay .spot3d.dim { opacity: 0.25; }
+.steps.spots li.focus { background: var(--accent-soft); border-radius: 10px; }

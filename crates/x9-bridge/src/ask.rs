@@ -92,11 +92,16 @@ pub struct Question {
     pub answer: Option<Reading>,
     #[serde(default)]
     pub checked_at: String,
+    /// With an answer: what `scanner_ask` says of it (inches, which way it
+    /// leans, the tolerance's call), so the web UI and the model read the
+    /// same words. Kept current by the mission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub said: Option<Value>,
 }
 
 impl Question {
     pub fn new(kind: &str) -> Question {
-        Question { kind: kind.into(), verdict: None, reason: String::new(), asked: false, seen_share: None, stations: vec![], answer: None, checked_at: String::new() }
+        Question { kind: kind.into(), verdict: None, reason: String::new(), asked: false, seen_share: None, stations: vec![], answer: None, checked_at: String::new(), said: None }
     }
 }
 
@@ -242,6 +247,7 @@ pub fn decide(prev: Option<&Question>, settling: Option<&Reading>, c: &Check) ->
         verdict: None,
         reason: String::new(),
         answer: None,
+        said: None,
     };
     let fit = match (gate(c.seen_share, c.length_m, c.fit.as_ref().map(|f| f.flat_rms_mm)), &c.fit) {
         (Gate::Pass, Some(f)) => f,

@@ -168,7 +168,27 @@ impl MissionRequest {
     }
 }
 
+impl Target {
+    /// The answer's wording, from the answer and the tolerance as they are now.
+    fn refresh_said(&mut self) {
+        let tolerance = self.tolerance.clone();
+        if let Some(q) = &mut self.question {
+            q.said = match (q.verdict, &q.answer) {
+                (Some(Verdict::Answer), Some(a)) => Some(crate::ask::reading_said(a, tolerance.as_ref())),
+                _ => None,
+            };
+        }
+    }
+}
+
 impl Mission {
+    /// Every answer's wording, e.g. for missions saved before `said` existed.
+    pub fn refresh_said(&mut self) {
+        for t in &mut self.targets {
+            t.refresh_said();
+        }
+    }
+
     pub fn new(req: &MissionRequest, project_id: &str, by: &str) -> Mission {
         Mission {
             mission_id: crate::util::new_id("msn"),
@@ -279,6 +299,7 @@ impl Mission {
                 return Err(format!("target {id}: a question target is covered by its answer (scanner_ask), not by hand"));
             }
             judge(t, geo)?;
+            t.refresh_said();
             t.updated_at = now_rfc3339();
             short(&format!("target {id}: name"), &t.name, 80, true)?;
             short(&format!("target {id}: kind"), &t.kind, 30, false)?;
@@ -355,6 +376,7 @@ impl Mission {
         };
         let changed = t.status != status || q.verdict != verdict;
         t.question = Some(Question { checked_at: now_rfc3339(), ..q });
+        t.refresh_said();
         if !changed {
             return None;
         }
@@ -568,9 +590,16 @@ mod tests {
         // The answer arrives with the next station, without being asked again.
         let r_of = |p: f64| Reading { out_of_plumb_mm: p, lean_mm_per_m: 0.5, flat_rms_mm: 6.0, flat_p95_mm: None, straightedge_ok_pct: None,
                                        worst_strip_mm_per_m: None, over_m: None, stations: vec![1] };
-        let r = r_of(4.0);
+        let r = Reading { over_m: Some(5.0), ..r_of(4.0) };
         let said = m.record_question("never", verdict(Verdict::Answer, Some(r)), &numbers).unwrap();
         assert!(said.contains("never facade"), "{said}");
+        // The answer carries the words scanner_ask gives; a tolerance adds its call.
+        assert_eq!(m.targets[0].question.as_ref().unwrap().said.as_ref().unwrap()["out_of_plumb_in"], "3/16 in");
+        assert!(m.targets[0].question.as_ref().unwrap().said.as_ref().unwrap().get("within").is_none());
+        let tol: crate::ask::Tolerance = serde_json::from_value(serde_json::json!({"words": "3/8 in at any height", "steps": [{"mm": 9.5}]})).unwrap();
+        m.update(&[TargetUpdate { tolerance: Some(Some(tol)), ..q("never", 8.0) }], &scans, &g).unwrap();
+        assert_eq!(m.targets[0].question.as_ref().unwrap().said.as_ref().unwrap()["within"], true);
+        assert_eq!(m.targets[0].status, Status::Covered);
         assert_eq!(m.targets[0].status, Status::Covered);
         assert_eq!(m.targets[0].stations, scans);
         assert!(m.ready("done").unwrap_err().contains("rough facade"));

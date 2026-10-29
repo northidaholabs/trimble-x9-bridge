@@ -35,6 +35,7 @@ mod station;
 mod ui;
 mod util;
 mod view;
+mod view3d;
 mod work;
 mod worker;
 mod workmode;

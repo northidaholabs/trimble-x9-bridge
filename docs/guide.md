@@ -1140,6 +1140,23 @@ registration. A recorded station can be planned offline:
 `x9-bridge plan station_01.tzf [--subject x0,x1]` (the preview is the `.jpg`
 beside it).
 
+### Draw into a station's view
+
+`POST /scans/{id}/project` puts 3D points onto the scan's preview: for each,
+the pixel, how far it is, and `seen`: `visible`, `hidden` (the scan saw
+something nearer that way) or `open` (it saw nothing that way). Points are
+`[x, y, z]`, or `{"xy": [x, y], "up": m}` for the ground the scan saw there
+plus `up`; in the scan's frame, or `"frame": "project"` once the scan is
+placed. The answer also gives `scanner_height_m`, the scanner above its own
+ground. The preview's mapping is fitted from the scan's points, so nothing
+about the scanner is assumed. The web UI draws its spots, walks, earlier
+stations and faces with it.
+
+```bash
+curl -s -H "$H" -d '{"points":[{"xy":[10,0],"up":0},{"xy":[10,0],"up":1.3}]}' $B/scans/$SCAN/project
+# {"preview_size":[2082,815],"scanner_height_m":1.26,"points":[{"px":[1040.2,561.0],"range_m":10.1,"seen":"visible","z_m":-1.25},…]}
+```
+
 ### Propose the next station
 
 After checking a station's coverage, the agent shows the person where to set
@@ -1302,11 +1319,12 @@ stops and deletes.
 
 | Tab | What you see and do |
 | --- | --- |
-| **Now** | Battery, level, moved-since-last-scan, storage. **Needs you**: scan requests waiting for approval (with mode, project, window and note) and runs waiting for a person. What is running, with phase, progress and Stop. Recent jobs; a cancelled scan links to its partial scan. New full-dome scan. |
+| **Now** | Battery, level, moved-since-last-scan, storage, and **Heavy work**: the laptop worker doing registration, or "on the Pi". **Needs you**: scan requests waiting for approval (with mode, project, window and note) and runs waiting for a person. What is running, with phase, progress and Stop. Recent jobs; a cancelled scan links to its partial scan. New full-dome scan. |
 | **Runs** | Start a recipe (project and inputs). A step the agent decides itself (`review = "final"`) is not listed under "Needs you"; its answer is shown again at the sign-off next to the result, and a person may answer it instead (folded away). A run's page shows its person interventions and the grants its scans ran under. Each run's steps, what it waits for, and its problem if it failed. A `person` step shows its instructions and a form for its `needs`; a `box` need shows the `preview_of` step's preview to draw on. When the agent has proposed an answer, the step shows it (the box on the preview, the values in the form, the agent's note) with **Looks right**; drawing a new box or editing a value changes it first. Cancel a run. |
 | **Scans** | Pick or create a project; scans grouped by station, area scans under their full dome. A scan: its preview, **measure the opening** (values, checks, evidence image), **aim** (draw a box, see the window in degrees, pick a mode, scan the area), **export** PLY or LAS with its checks and a download, download the raw `.tzf`, delete (operator). |
 | **Log** | The field log, newest first, and a note form. |
-| **Next station** | The agent's latest proposal is at the top of Now (and on that scan's page): its directions and the station's view with "SET UP HERE"; click the picture for full size. It updates as soon as the agent proposes. |
+| **Next station** | The agent's latest proposal (and on that scan's page): its directions and the station's view with "SET UP HERE"; click the picture for full size. It updates as soon as the agent proposes. Under it, **Spots the bridge found** from the latest placed full dome ([the plan](#plan-the-next-station)), drawn into that station's panorama to scale: each spot as a tripod as tall as this one stands, the walk to it with 5 m ticks, its landmark as a pole of its measured height, earlier stations as numbered markers, the faces asked about outlined and tinted by verdict, and distance rings at 5, 10, 20 and 40 m. What the scan saw something in front of is dashed. **Spots**, **Earlier stations**, **Questions** and **Distances** switch the layers; tap a number to pick that spot out. **Set up here** and **Can't stand here** (with why) write a line to the field log for the agent. On a desktop it runs the full width under Now. |
+| **Mission** | The goal, done-when and each target. A question target shows its verdict in the bridge's words: an answer's figure (mm and inches, over what height, which way the top leans), the tolerance's call when the job set one (within or outside, and its words), flatness and the stations, and the face's heat map; not yet or doesn't fit with the reason and no figures. **Ask again** asks now (up to a minute and a half on a Pi). Under the map, stations not yet trusted are explained; a doubtful one asks whether the tripod moved, and the answer goes to the field log. Sign off when the agent says it is ready (operator). |
 | **Viewer** (`#/view/<scan_id>`, from a scan's **View the points** or the Scans tab's **View the latest scan**) | The scan's points in 3D, coloured by intensity, height or coverage (spacing class, with shadows drawn on the floor in red and a legend). **Plan** shows the coverage plan; **No ceiling** (on for full domes) hides the ceiling to see into the room; **From scanner** puts you where the scanner stood to look around; **Overview** goes back. Drag to turn, right-drag or shift-drag to pan, scroll or pinch to zoom. **Follow new scans** (on by default) opens each new scan in the same project as soon as it is done, and a line at the top says what is scanning meanwhile. |
 
 Things to know:
@@ -1320,6 +1338,10 @@ Things to know:
   proposed box opens in Pan, scrolled into view.
 - It asks before stopping a scan, cancelling a run or deleting a scan.
 - `GET /v1/whoami` tells it the caller's name and role.
+- The station's view asks `POST /scans/{id}/project` for every point it
+  draws, so the picture and the bridge agree; the first call for a scan
+  decodes it (seconds on a Pi). Question wording comes from the mission's
+  `said`, the same words `scanner_ask` gives.
 - The viewer draws with WebGL (no libraries). It loads the default view of
   about 2 M points (28 MB) and the coverage; on the Pi the first view of a
   scan waits for the bridge to decode it.

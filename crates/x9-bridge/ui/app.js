@@ -57,6 +57,14 @@ const S = {
   mapImages: new Map(), // project|registration|stations|ledger -> object URL | "loading" | {error}
   mapLast: {},          // project -> the last minimap drawn, shown while the next one loads
   evidence: new Map(), // measurement_id -> object URL | "loading" | {error}
+  askImages: new Map(), // project|target|checked_at -> object URL | "loading" | {error}
+  asking: {},           // project|target -> true while an ask runs
+  plans: {},            // scan_id -> the bridge's next-station plan | "loading" | {error}
+  workers: [],          // laptops doing the heavy work, seen in the last 15 s
+  spotScrolled: {},     // spots picture -> true once scrolled to spot 1
+  overlays: {},         // scan|plan|registration|mission -> projected overlay | "loading" | {error}
+  spotFocus: null,      // the spot picked out on the picture
+  layers: (() => { try { return JSON.parse(store.get("x9.layers")) ?? null; } catch { return null; } })() ?? { distances: true, spots: true, stations: true, questions: true },
   watchMeasure: {}, // scan_id -> job_id
   watchExport: {}, // scan_id -> job_id
   sheet: null,
@@ -169,6 +177,13 @@ async function act(fn, done) {
   }
 }
 
+// A line in the field log for the agent (and the record), shown at once.
+async function logNote(text, projectId) {
+  const e = await api("/log", { method: "POST", body: { text, project_id: projectId } });
+  if (e && !S.log.some((x) => x.entry_id === e.entry_id)) S.log.unshift(e);
+  return e;
+}
+
 function toast(text, bad = false) {
   S.toast = { text, bad };
   render(true);
@@ -212,6 +227,7 @@ async function load(what) {
       case "grants": S.grants = await api("/grants"); break;
       case "next-stations": S.nextStations = await api("/next-stations"); break;
       case "missions": S.missions = await api("/missions"); break;
+      case "workers": S.workers = await api("/workers"); break;
       case "scans":
         S.scans = S.project ? await api(`/scans?project_id=${encodeURIComponent(S.project)}`) : [];
         for (const sc of S.scans) S.scanById[sc.scan_id] = sc;
@@ -268,6 +284,7 @@ const TARGET_CHIP = { open: ["warn", "open"], covered: ["good", "covered"], meas
 function missionCard(m) {
   const state = { active: ["info", "in progress"], ready: ["warn", "ready to leave"], signed_off: ["good", "signed off"] }[m.state] ?? ["", m.state];
   const rows = m.targets.map((t) => {
+    if (t.question) return questionRow(m, t);
     const [cls, word] = TARGET_CHIP[t.status] ?? ["", t.status];
     return `<li><span class="chip ${cls}">${esc(word)}</span><div class="grow"><strong>${esc(t.name)}</strong>
       <div class="meta">${esc(t.kind)}${t.stations.length ? ` · ${t.stations.length} station${t.stations.length === 1 ? "" : "s"}` : ""}${t.geometry?.seen_share !== undefined ? ` · ${Math.round(t.geometry.seen_share * 100)}% of its length seen` : ""}${t.note ? ` · ${esc(t.note)}` : ""}</div></div></li>`;
@@ -284,6 +301,374 @@ function missionCard(m) {
       ${isOp() ? `<button class="btn good wide" data-act="mission-sign-off" data-id="${esc(m.project_id)}" ${S.busy ? "disabled" : ""}>Sign off the job</button>` : `<p class="hint">Waiting for an operator to sign it off.</p>`}` : ""}
     ${m.state === "signed_off" ? `<div class="meta">Signed off by ${esc(m.signed_off_by)} · ${esc(ago(m.signed_off_at))}${m.confirmed_via ? ` · ${esc(m.confirmed_via)}` : ""}</div>` : ""}
   </div>`;
+}
+
+// ------------------------------------------------------------- questions ---
+// A question target's row: the bridge's verdict, in its words. Figures only
+// with an answer, and only as the bridge said them (`said`): the page does
+// no arithmetic of its own, so it and the agent never disagree.
+const QWORD = { answer: ["good", "answered"], not_yet: ["warn", "not yet"], does_not_fit: ["bad", "doesn't fit"] };
+function reasonText(q) {
+  if (q.reason === "settling") return "Passed once. One more station that sees this face confirms it.";
+  const r = (q.reason || "").trim();
+  return r ? r[0].toUpperCase() + r.slice(1).replace(/\.?$/, ".") : "";
+}
+function askImage(pid, tid, at) {
+  const key = `${pid}|${tid}|${at}`;
+  const got = S.askImages.get(key);
+  if (got) return got;
+  S.askImages.set(key, "loading");
+  api(`/projects/${encodeURIComponent(pid)}/mission/targets/${encodeURIComponent(tid)}/ask/image`, { raw: true })
+    .then((r) => r.blob())
+    .then((b) => S.askImages.set(key, URL.createObjectURL(b)))
+    .catch((e) => S.askImages.set(key, { error: e.message }))
+    .finally(() => render());
+  return "loading";
+}
+function questionRow(m, t) {
+  const q = t.question;
+  const [cls, word] = q.verdict ? QWORD[q.verdict] ?? ["", q.verdict] : ["", "not asked"];
+  let body = "";
+  if (q.verdict === "answer" && q.said) {
+    const a = q.said;
+    const over = a.over_m != null ? ` over ${a.over_m.toFixed(1)} m` : "";
+    const inches = a.out_of_plumb_in === "0 in" ? "under 1/16 in" : a.out_of_plumb_in;
+    body += `<div class="answer">${esc(Math.abs(a.out_of_plumb_mm).toFixed(1))} mm out of plumb (${esc(inches)})${esc(over)}</div>`;
+    if (a.leans) body += `<div class="meta">The top leans ${esc(a.leans)}.</div>`;
+    if (t.tolerance) {
+      const call = a.within === true ? `<span class="chip good">within</span> ${esc(a.allowed_in)} allowed`
+        : a.within === false ? `<span class="chip bad">outside</span> ${esc(a.allowed_in)} allowed`
+        : esc(a.tolerance_note ?? "");
+      body += `<div class="meta tol">${call}<br>${esc(t.tolerance.words)}</div>`;
+    } else {
+      body += `<div class="meta">No tolerance set, so no call on within or outside.</div>`;
+    }
+    body += `<div class="meta">Flat to ${esc(a.flat_rms_mm.toFixed(0))} mm RMS · stations ${esc(a.stations.join(", "))}</div>`;
+  } else if (q.verdict) {
+    const seen = q.verdict === "not_yet" && q.seen_share != null && q.seen_share < 1 ? ` ${Math.round(q.seen_share * 100)}% of the face seen so far.` : "";
+    body += `<div class="meta">${esc(reasonText(q))}${esc(seen)}</div>`;
+    if (t.tolerance) body += `<div class="meta">Tolerance: ${esc(t.tolerance.words)}</div>`;
+  } else {
+    body += `<div class="meta">Not asked yet.</div>`;
+  }
+  // The evidence: the face's heat map, kept from the last ask.
+  let pic = "";
+  if (q.asked && (q.verdict === "answer" || q.verdict === "does_not_fit")) {
+    const img = askImage(m.project_id, t.target_id, q.checked_at);
+    if (typeof img === "string" && img !== "loading") {
+      pic = `<a href="${esc(img)}" target="_blank" rel="noopener" title="Open full size"><img class="heat" src="${esc(img)}" alt="${q.verdict === "answer" ? "Heat map of the face: how far each part stands proud of or sits back from the fitted plane" : "Where the face stands proud or sits back; no figures, as it doesn't fit one plane"}"></a>`;
+    }
+  }
+  const key = `${m.project_id}|${t.target_id}`;
+  const ask = canAct() && m.state !== "signed_off"
+    ? `<button class="btn small" data-act="ask" data-pid="${esc(m.project_id)}" data-id="${esc(t.target_id)}" ${S.asking[key] ? "disabled" : ""}>${S.asking[key] ? "Asking… (up to a minute and a half)" : q.verdict ? "Ask again" : "Ask now"}</button>` : "";
+  return `<li class="question"><span class="chip ${cls}">${esc(word)}</span><div class="grow">
+    <strong>${esc(t.name)}</strong> <span class="meta">· is it plumb?</span>
+    ${body}${pic}${ask ? `<div class="btns-row">${ask}</div>` : ""}</div></li>`;
+}
+
+// ------------------------------------------------------------ next spots ---
+// The bridge's own plan from the latest full dome: up to three spots a
+// person can walk to, each with a landmark. The person picks one or says why
+// not; the answer goes into the field log, where the agent reads it.
+const SPOT_LOG = /^Next station from station (\d+): (setting up at|can't stand at) spot (\d)/;
+function spotDecisions(pid) {
+  const out = {};
+  for (const e of [...S.log].reverse()) {
+    if (e.project_id !== pid) continue;
+    const m = SPOT_LOG.exec(e.text || "");
+    if (m) out[`${m[1]}|${m[3]}`] = { use: m[2] === "setting up at", text: e.text, by: e.author, at: e.at };
+  }
+  return out;
+}
+function latestDome(pid) {
+  const r = S.regs[pid];
+  const placed = new Set((r?.stations ?? []).filter((s) => s.placed).map((s) => s.scan_id));
+  return S.scans.filter((s) => s.project_id === pid && s.kind === "full_dome" && placed.has(s.scan_id))
+    .sort((a, b) => (b.station ?? 0) - (a.station ?? 0))[0];
+}
+function loadPlan(scanId) {
+  if (S.plans[scanId]) return S.plans[scanId];
+  S.plans[scanId] = "loading";
+  api(`/scans/${encodeURIComponent(scanId)}/next-station/plan`)
+    .then((p) => { S.plans[scanId] = p; })
+    .catch((e) => { S.plans[scanId] = { error: e.message }; })
+    .finally(() => render());
+  return "loading";
+}
+function spotWords(c) {
+  const lm = c.landmark;
+  const by = lm ? `, ${lm.distance_m.toFixed(0)} m from ${lm.shape === "post" ? `a post ${lm.height_m.toFixed(1)} m tall` : `something large (${lm.height_m.toFixed(0)} m tall: a tree, vehicle or building)`}` : "";
+  return `${c.distance_m.toFixed(0)} m out, about ${c.walk_m.toFixed(0)} m to walk${by}`;
+}
+// ------------------------------------------------------ the station's view ---
+// Real-size things drawn into the station's panorama: the bridge projects
+// each 3D point (on the ground, or so many metres up) onto the picture and
+// says whether the scan saw something nearer, so hidden parts draw dashed.
+const RINGS_M = [5, 10, 20, 40];
+const LEG_SPREAD_M = 0.45;
+const FOOTPRINT_M = 0.6;
+const circle = (cx, cy, r, n, up = 0) => Array.from({ length: n + 1 }, (_, i) => ({ xy: [cx + r * Math.cos(2 * Math.PI * i / n), cy + r * Math.sin(2 * Math.PI * i / n)], up }));
+const line3 = (a, b, n) => Array.from({ length: n + 1 }, (_, i) => [a[0] + (b[0] - a[0]) * i / n, a[1] + (b[1] - a[1]) * i / n, a[2] + (b[2] - a[2]) * i / n]);
+// A tripod at (x, y): three feet, the head, and the scanner on top, `h` m up.
+const tripodPts = (x, y, h) => [
+  ...[0, 1, 2].map((k) => ({ xy: [x + LEG_SPREAD_M * Math.cos(Math.PI / 2 + 2 * Math.PI * k / 3), y + LEG_SPREAD_M * Math.sin(Math.PI / 2 + 2 * Math.PI * k / 3)], up: 0 })),
+  { xy: [x, y], up: h - 0.32 }, { xy: [x, y], up: h }, { xy: [x, y], up: 0 },
+];
+
+function overlayFor(pid, dome, plan) {
+  const reg = S.regs[pid];
+  const m = S.missions.find((x) => x.project_id === pid);
+  const key = `${dome.scan_id}|${reg?.updated_at ?? ""}|${m ? m.targets.map((t) => `${t.target_id}:${t.question?.verdict ?? t.status}`).join() : ""}`;
+  const got = S.overlays[key];
+  if (got) return got;
+  S.overlays[key] = "loading";
+  (async () => {
+    const scanPts = [];
+    const take = (pts) => { const i = scanPts.length; scanPts.push(...pts); return [i, pts.length]; };
+    const rings = RINGS_M.map((r) => ({ r, at: take(circle(0, 0, r, 144)) }));
+    // The scanner's own height above its ground first: tripods are drawn that tall.
+    const probe = await api(`/scans/${encodeURIComponent(dome.scan_id)}/project`, { method: "POST", body: { points: [{ xy: [1, 0], up: 0 }] } });
+    const H = probe.scanner_height_m || 1.5;
+    const spots = (plan.candidates ?? []).map((c) => {
+      const [x, y] = c.xy_m;
+      const d = Math.hypot(x, y);
+      const n = Math.max(2, Math.round(d / 0.5));
+      const path = Array.from({ length: n + 1 }, (_, i) => ({ xy: [x * (1.2 / d + (1 - 1.2 / d) * i / n), y * (1.2 / d + (1 - 1.2 / d) * i / n)], up: 0 }));
+      const ticks = [];
+      for (let t = 5; t < d - 1; t += 5) ticks.push({ xy: [x * t / d, y * t / d], up: 0 });
+      const lm = c.landmark ? { at: take([{ xy: c.landmark.xy_m, up: 0 }, { xy: c.landmark.xy_m, up: c.landmark.height_m }]), height: c.landmark.height_m, shape: c.landmark.shape } : null;
+      return { rank: c.rank, dist: d, foot: take(circle(x, y, FOOTPRINT_M, 28)), tripod: take(tripodPts(x, y, H)), path: take(path), ticks: take(ticks), lm };
+    });
+    const projPts = [];
+    const takeP = (pts) => { const i = projPts.length; projPts.push(...pts); return [i, pts.length]; };
+    const here = reg?.stations?.find((s) => s.scan_id === dome.scan_id);
+    const stations = here?.placed ? (reg.stations ?? []).filter((s) => s.placed && s.scan_id !== dome.scan_id && s.xyz_m)
+      .map((s) => ({ station: s.station, verdict: s.verdict, tripod: takeP(tripodPts(s.xyz_m[0], s.xyz_m[1], H)) })) : [];
+    const faces = here?.placed && m ? m.targets.filter((t) => t.question && t.face && t.geometry?.height_m).map((t) => {
+      const [z0, z1] = t.geometry.height_m;
+      const a = [t.face.from[0], t.face.from[1]], b = [t.face.to[0], t.face.to[1]];
+      const n = Math.max(8, Math.round(Math.hypot(b[0] - a[0], b[1] - a[1]) / 0.5));
+      const outline = [...line3([...a, z0], [...b, z0], n), ...line3([...b, z0], [...b, z1], 12).slice(1), ...line3([...b, z1], [...a, z1], n).slice(1), ...line3([...a, z1], [...a, z0], 12).slice(1)];
+      return { t, outline: takeP(outline), label: takeP([[(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, z1]]) };
+    }) : [];
+    const [s1, p1] = await Promise.all([
+      api(`/scans/${encodeURIComponent(dome.scan_id)}/project`, { method: "POST", body: { points: scanPts } }),
+      projPts.length ? api(`/scans/${encodeURIComponent(dome.scan_id)}/project`, { method: "POST", body: { frame: "project", points: projPts } }) : null,
+    ]);
+    const cut = (res, [i, n]) => res.points.slice(i, i + n);
+    S.overlays[key] = {
+      size: s1.preview_size, height: H,
+      rings: rings.map((r) => ({ r: r.r, pts: cut(s1, r.at) })),
+      spots: spots.map((s) => ({ rank: s.rank, dist: s.dist, foot: cut(s1, s.foot), tripod: cut(s1, s.tripod), path: cut(s1, s.path), ticks: cut(s1, s.ticks),
+        lm: s.lm && { base: cut(s1, s.lm.at)[0], top: cut(s1, s.lm.at)[1], height: s.lm.height, shape: s.lm.shape } })),
+      stations: p1 ? stations.map((s) => ({ ...s, tripod: cut(p1, s.tripod) })) : [],
+      faces: p1 ? faces.map((f) => ({ t: f.t, outline: cut(p1, f.outline), label: cut(p1, f.label)[0] })) : [],
+    };
+  })().catch((e) => { S.overlays[key] = { error: e.message }; }).finally(() => render());
+  return "loading";
+}
+
+// Projected points to SVG paths: split where a point is off the picture,
+// across the panorama's seam, and where it goes from seen to hidden.
+function runs(pts, w) {
+  const out = [];
+  let cur = null;
+  for (const p of pts) {
+    if (!p) { cur = null; continue; }
+    const hid = p.seen === "hidden";
+    if (cur && (cur.hidden !== hid || Math.abs(p.px[0] - cur.last[0]) > w / 2)) {
+      if (cur.hidden !== hid && Math.abs(p.px[0] - cur.last[0]) <= w / 2) cur.d += ` L${p.px[0]},${p.px[1]}`;
+      cur = null;
+    }
+    if (!cur) { cur = { hidden: hid, d: `M${p.px[0]},${p.px[1]}`, last: p.px }; out.push(cur); }
+    else { cur.d += ` L${p.px[0]},${p.px[1]}`; cur.last = p.px; }
+  }
+  return out;
+}
+const strokes = (pts, w, cls) => runs(pts, w).map((r) => `<path class="${cls}${r.hidden ? " hid" : ""}" d="${r.d}"/>`).join("");
+const tag = (p, text, cls, fs) => p ? `<text class="${cls}${p.seen === "hidden" ? " hid" : ""}" x="${p.px[0]}" y="${p.px[1]}" font-size="${fs}">${esc(text)}</text>` : "";
+const VERDICT_CLS = { answer: "good", not_yet: "warn", does_not_fit: "bad" };
+
+function overlaySvg(o, decided, st) {
+  const [w, h] = o.size;
+  const fs = Math.max(14, w / 70);
+  const L = S.layers;
+  let g = "";
+  // Labels that would overlap one already placed move up, with a leader line
+  // back to what they name.
+  const placed = [];
+  const label = (p, text, cls, size) => {
+    if (!p) return "";
+    const bw = text.length * size * 0.56, bh = size * 1.15;
+    const anchor = p.px;
+    let y = anchor[1];
+    const hits = (yy) => placed.some((b) => Math.abs(b.x - anchor[0]) < (b.w + bw) / 2 && Math.abs(b.y - yy) < (b.h + bh) / 2);
+    let moved = 0;
+    while (hits(y) && moved < 8) { y -= bh * 1.05; moved++; }
+    placed.push({ x: anchor[0], y, w: bw, h: bh });
+    const lead = moved ? `<path class="lead" d="M${anchor[0]},${anchor[1] - size * 0.2} L${anchor[0]},${y + size * 0.25}"/>` : "";
+    return lead + tag({ ...p, px: [anchor[0], y] }, text, cls, size);
+  };
+  const ringLabels = [];
+  if (L.distances) {
+    for (const r of o.rings) {
+      g += strokes(r.pts, w, "ring");
+      // Labelled where the ring is lowest on the picture (nearest the viewer).
+      const vis = r.pts.filter((p) => p && p.seen !== "hidden");
+      for (const q of [0.125, 0.375, 0.625, 0.875]) {
+        const p = r.pts[Math.round(q * (r.pts.length - 1))];
+        if (p && p.seen !== "hidden" && vis.length) ringLabels.push([{ ...p, px: [p.px[0], p.px[1] - fs * 0.3] }, `${r.r} m`]);
+      }
+    }
+  }
+  if (L.questions) {
+    for (const f of o.faces) {
+      const q = f.t.question;
+      const cls = VERDICT_CLS[q.verdict] ?? "none";
+      const runsF = runs(f.outline, w);
+      const closed = runsF.length === 1 && !runsF[0].hidden ? `${runsF[0].d} Z` : null;
+      if (closed) g += `<path class="face-fill ${cls}" d="${closed}"/>`;
+      g += strokes(f.outline, w, `face ${cls}`);
+      const said = q.verdict === "answer" && q.said
+        ? `${Math.abs(q.said.out_of_plumb_mm).toFixed(1)} mm${f.t.tolerance ? (q.said.within === true ? " · within" : q.said.within === false ? " · outside" : "") : ""}`
+        : q.verdict === "not_yet" ? "not yet" : q.verdict === "does_not_fit" ? "doesn't fit" : "not asked";
+      if (f.label) g += label({ ...f.label, px: [f.label.px[0], f.label.px[1] - fs * 0.5] }, `${f.t.name.replace(/ \(.*\)$/, "")} · ${said}`, `face-t ${cls}`, fs);
+    }
+  }
+  if (L.stations) {
+    for (const s of o.stations) {
+      const [f1, f2, f3, head, top, base] = s.tripod;
+      if (!top) continue;
+      for (const f of [f1, f2, f3]) if (f && head) g += strokes([f, head], w, "ghost");
+      g += strokes([head, top], w, "ghost head");
+      g += `<circle class="ghost-dot${top.seen === "hidden" ? " hid" : ""}" cx="${top.px[0]}" cy="${top.px[1]}" r="${fs * 0.55}"/>`;
+      g += tag({ ...top, px: [top.px[0], top.px[1] + fs * 0.32] }, String(s.station), "ghost-n", fs * 0.75);
+      if (base) g += label({ ...top, px: [top.px[0], top.px[1] - fs * 0.9] }, `${Math.round(base.range_m)} m`, "ghost-t", fs * 0.7);
+    }
+  }
+  if (L.spots) {
+    for (const s of o.spots) {
+      const d = decided[`${st}|${s.rank}`];
+      const state = d ? (d.use ? " use" : " no") : "";
+      const dim = S.spotFocus != null && S.spotFocus !== s.rank ? " dim" : "";
+      const cls = `spot3d${state}${dim}`;
+      g += `<g class="${cls}">`;
+      g += strokes(s.path, w, "walk");
+      s.ticks.forEach((p, i) => { if (p) g += `<circle class="tick${p.seen === "hidden" ? " hid" : ""}" cx="${p.px[0]}" cy="${p.px[1]}" r="${fs * 0.16}"/>` + label({ ...p, px: [p.px[0] + fs * 1.1, p.px[1] + fs * 0.25] }, `${(i + 1) * 5} m`, "tick-t", fs * 0.6); });
+      g += strokes(s.foot, w, "foot");
+      const runsFoot = runs(s.foot, w);
+      if (runsFoot.length === 1) g += `<path class="foot-fill" d="${runsFoot[0].d} Z"/>`;
+      if (s.lm?.base && s.lm.top) {
+        g += strokes([s.lm.base, s.lm.top], w, "pole");
+        g += label({ ...s.lm.top, px: [s.lm.top.px[0], s.lm.top.px[1] - fs * 0.3] }, `${s.lm.shape === "post" ? "post" : "landmark"} ${s.lm.height.toFixed(1)} m`, "pole-t", fs * 0.75);
+      }
+      const [f1, f2, f3, head, top] = s.tripod;
+      for (const f of [f1, f2, f3]) if (f && head) g += strokes([f, head], w, "leg");
+      if (head && top) g += strokes([head, top], w, "scanner");
+      if (top) {
+        const by = top.px[1] - fs * 1.3;
+        g += `<g class="badge" data-act="spot-focus" data-rank="${s.rank}"><circle cx="${top.px[0]}" cy="${by}" r="${fs * 0.75}"/><text x="${top.px[0]}" y="${by + fs * 0.35}" font-size="${fs}">${s.rank}</text></g>`;
+        g += label({ ...top, px: [top.px[0], by - fs * 1.05] }, `${Math.round(s.dist)} m`, "badge-t", fs * 0.75);
+      }
+      g += `</g>`;
+    }
+  }
+  // Distance labels last, and only where they don't crowd something else.
+  for (const [p, text] of ringLabels) {
+    const bw = text.length * fs * 0.45, bh = fs * 0.9;
+    if (!placed.some((b) => Math.abs(b.x - p.px[0]) < (b.w + bw) / 2 && Math.abs(b.y - p.px[1]) < (b.h + bh) / 2)) {
+      placed.push({ x: p.px[0], y: p.px[1], w: bw, h: bh });
+      g += tag(p, text, "ring-t", fs * 0.8);
+    }
+  }
+  return `<svg class="overlay" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">${g}</svg>`;
+}
+
+function layerChips() {
+  const chip = (k, label) => `<button class="layer ${S.layers[k] ? "on" : ""}" data-act="layer" data-k="${k}">${label}</button>`;
+  return `<div class="layers">${chip("spots", "Spots")}${chip("stations", "Earlier stations")}${chip("questions", "Questions")}${chip("distances", "Distances")}</div>`;
+}
+
+function spotsCard(pid) {
+  const dome = latestDome(pid);
+  if (!dome) return "";
+  const plan = loadPlan(dome.scan_id);
+  if (plan === "loading") return `<div class="card"><div class="placeholder small">Working out where to set up next…</div></div>`;
+  if (plan?.error) return `<div class="card"><div class="problem">${esc(plan.error)}</div></div>`;
+  const cands = plan.candidates ?? [];
+  if (!cands.length) return `<div class="card"><p class="meta">${esc(plan.reason || "No more spots to suggest from this station.")}</p></div>`;
+  const decided = spotDecisions(pid);
+  const st = dome.station;
+  const img = preview(dome.scan_id);
+  const [pw, ph] = plan.preview_size ?? [0, 0];
+  const ov = overlayFor(pid, dome, plan);
+  // Until the 3D overlay is in (or if it fails), plain markers at the planner's pixels.
+  const marks = typeof ov === "object" && !ov.error ? overlaySvg(ov, decided, st) : pw && ph ? cands.map((c) => {
+    const d = decided[`${st}|${c.rank}`];
+    const cls = d ? (d.use ? "spot use" : "spot no") : "spot";
+    return c.preview_px ? `<span class="${cls}" style="left:${(100 * c.preview_px[0] / pw).toFixed(2)}%;top:${(100 * c.preview_px[1] / ph).toFixed(2)}%">${c.rank}</span>` : "";
+  }).join("") : "";
+  const legend = typeof ov === "object" && !ov.error
+    ? `Station ${esc(st)}'s view, drawn to scale: tripods ${esc(ov.height.toFixed(2))} m to the scanner, as this one stands. Dashed: hidden behind something from here. Tap a number to pick that spot out.`
+    : ov === "loading" ? `Station ${esc(st)}'s view. Placing the spots in 3D…` : `Station ${esc(st)}'s view. Numbers: where to stand.`;
+  const pic = typeof img === "string" && img !== "loading"
+    ? `${layerChips()}<div class="spots-pic" data-keep-scroll="spots:${esc(dome.scan_id)}"><div class="spots-inner"><img src="${esc(img)}" alt="Station ${esc(st)}'s view, with the bridge's spots drawn as tripods to scale, the walk to each, earlier stations and the faces asked about">${marks}</div></div>
+       <p class="hint">${legend} Scroll sideways for all of it.</p>`
+    : img?.error ? "" : `<div class="placeholder small">Loading station ${esc(st)}'s view…</div>`;
+  const rows = cands.map((c) => {
+    const d = decided[`${st}|${c.rank}`];
+    const state = d ? `<div class="meta decided">${d.use ? "Chosen" : "Ruled out"}${d.by ? ` by ${esc(d.by)}` : ""} · ${esc(ago(d.at))}${d.use ? "" : `: ${esc(d.text.replace(SPOT_LOG, "").replace(/^:\s*/, ""))}`}</div>` : "";
+    const btns = canAct() ? `<div class="btns-row">
+        <button class="btn small ${d?.use ? "good" : ""}" data-act="spot-use" data-pid="${esc(pid)}" data-station="${esc(st)}" data-rank="${c.rank}" ${S.busy ? "disabled" : ""}>Set up here</button>
+        <button class="btn small" data-act="spot-no" data-pid="${esc(pid)}" data-station="${esc(st)}" data-rank="${c.rank}" ${S.busy ? "disabled" : ""}>Can't stand here</button></div>` : "";
+    return `<li class="${S.spotFocus === c.rank ? "focus" : ""}"><span class="dot ${d ? (d.use ? "done" : "failed") : "now"}">${c.rank}</span><div class="grow">
+      <strong>${esc(spotWords(c))}</strong>
+      <div class="meta">Would see ${esc(Math.round(c.sees_hidden_m2).toLocaleString())} m² of ground not seen yet · overlaps station ${esc(st)} on ${esc(c.shared_surface_m.toFixed(0))} m of surface</div>
+      ${state}${btns}</div></li>`;
+  }).join("");
+  return `<div class="card"><div class="line"><strong>Spots the bridge found</strong><span class="meta">from station ${esc(st)}</span></div>
+    ${pic}<ul class="steps spots">${rows}</ul>
+    <p class="hint">Your choice goes to the field log, where the agent picks it up.</p></div>`;
+}
+
+// --------------------------------------------------------------- trust ---
+// Stations not yet trusted, in words, with the one question a person can
+// answer: did the tripod move?
+const TRUST = {
+  single: "Tied to the rest by one overlap only. Fine for now; the next station should also see what this one saw.",
+  doubtful: "Doesn't agree with its neighbours.",
+  grouped: "Placed with its own group, not yet joined to the rest. The next station should see walls from both groups.",
+  ambiguous: "Could fit in more than one place. The next station should overlap it more.",
+  unplaced: "Not placed yet: too little overlap with the others.",
+};
+const BUMP_LOG = /^Station (\d+): the person says the tripod (was bumped|didn't move)/;
+function trustNotes(pid) {
+  const r = S.regs[pid];
+  const odd = (r?.stations ?? []).filter((s) => TRUST[s.verdict]);
+  if (!odd.length) return "";
+  const said = {};
+  for (const e of S.log) {
+    if (e.project_id !== pid) continue;
+    const m = BUMP_LOG.exec(e.text || "");
+    if (m && !(m[1] in said)) said[m[1]] = m[2];
+  }
+  return `<ul class="ledger trust">${odd.map((s) => {
+    const ask = s.verdict === "doubtful" && canAct()
+      ? said[s.station] ? `<div class="meta decided">You said the tripod ${esc(said[s.station])}.</div>`
+        : `<div class="meta">Did the tripod move or get bumped during this scan?</div><div class="btns-row">
+          <button class="btn small" data-act="bumped" data-pid="${esc(pid)}" data-station="${esc(s.station)}" data-said="was bumped">It was bumped</button>
+          <button class="btn small" data-act="bumped" data-pid="${esc(pid)}" data-station="${esc(s.station)}" data-said="didn't move">It didn't move</button></div>`
+      : "";
+    return `<li><span class="chip ${s.verdict === "single" ? "info" : "warn"}">${esc(s.verdict)}</span><div class="grow"><strong>Station ${esc(s.station)}</strong>
+      <div class="meta">${esc(TRUST[s.verdict])}</div>${s.reasons?.length ? `<div class="meta small">${esc(s.reasons[0])}</div>` : ""}${ask}</div></li>`;
+  }).join("")}</ul>`;
+}
+
+function workerText() {
+  if (!S.workers.length) return "on the Pi";
+  const w = S.workers[0];
+  return `${esc(w.worker)}${w.job_id ? " · working" : " · ready"}${S.workers.length > 1 ? ` +${S.workers.length - 1}` : ""}`;
 }
 
 // The registered plan under the ledger: every station in one frame, walls,
@@ -339,7 +724,7 @@ function minimapCard(pid) {
   const pic = shown ? `<a href="${esc(shown)}" target="_blank" rel="noopener" title="Open full size"><img class="minimap" src="${esc(shown)}" alt="Line map of the walls found and the stations so far"></a>`
     : img?.error ? `<div class="problem">${esc(img.error)}</div>` : `<div class="placeholder small">Drawing the map…</div>`;
   const phase = registering[0]?.phase;
-  return `<div class="card">${pic}<div class="meta">${registering.length ? `Registering${phase ? `: ${esc(phase)}` : "…"}` : esc(r?.summary ?? "The map fills in as stations are scanned.")}</div></div>`;
+  return `<div class="card">${pic}<div class="meta">${registering.length ? `Registering${phase ? `: ${esc(phase)}` : "…"}` : esc(r?.summary ?? "The map fills in as stations are scanned.")}</div>${trustNotes(pid)}</div>`;
 }
 
 // The agent's proposal for where to set up next: the picture and its directions.
@@ -468,7 +853,7 @@ async function stream() {
 }
 
 function refreshAll() {
-  ["status", "jobs", "runs", "recipes", "projects", "modes", "log", "scans", "grants", "next-stations", "missions"].forEach(load);
+  ["status", "jobs", "runs", "recipes", "projects", "modes", "log", "scans", "grants", "next-stations", "missions", "workers"].forEach(load);
 }
 
 // ----------------------------------------------------------------- routes ---
@@ -607,6 +992,7 @@ function viewNow() {
           <div class="fact"><b>Moved since last scan</b><span class="${s.moved_since_last_scan ? "warn" : "ok"}">${s.moved_since_last_scan ? "yes" : "no"}</span></div>
           <div class="fact"><b>Storage free</b><span>${gb(s.storage_free_bytes)}</span></div>
           <div class="fact"><b>Bridge</b><span>${esc(st.bridge?.version ?? "")}</span></div>
+          <div class="fact"><b>Heavy work</b><span>${workerText()}</span></div>
         </div></div>`;
     }
   }
@@ -628,14 +1014,18 @@ function viewNow() {
     }),
   ];
 
-  return `<div class="cols"><div>
+  const nextStation = (() => {
+    const p = S.nextStations.find((x) => !S.project || x.project_id === S.project) ?? S.nextStations[0];
+    const spots = S.project ? spotsCard(S.project) : "";
+    return p || spots ? `<h2>Next station</h2><section class="next-station">${p ? nextStationCard(p) : ""}${spots}</section>` : "";
+  })();
+  return `<div class="cols now"><div class="col-a">
     <section>${scanner}</section>
     <h2>Now</h2><section>${active.length ? active.map((j) => jobCard(j)).join("") : `<p class="empty">Nothing running.</p>`}
       ${canAct() ? `<button class="btn primary wide" data-act="sheet-scan">New full-dome scan</button>` : ""}</section>
-    </div><div>
+    </div>${nextStation ? `<div class="span">${nextStation}</div>` : ""}<div class="col-b">
     ${S.project ? `<h2 class="first">Map</h2><section>${minimapCard(S.project)}</section>` : ""}
     ${(() => { const m = S.missions.find((x) => x.project_id === S.project) ?? S.missions[0]; return m ? `<h2 class="${S.project ? "" : "first"}">Mission</h2><section>${missionCard(m)}</section>` : ""; })()}
-    ${(() => { const p = S.nextStations.find((x) => !S.project || x.project_id === S.project) ?? S.nextStations[0]; return p ? `<h2 class="${S.missions.length || S.project ? "" : "first"}">Next station</h2><section>${nextStationCard(p)}</section>` : ""; })()}
     <h2 class="${S.nextStations.length || S.missions.length || S.project ? "" : "first"}">Needs you</h2><section>${needs.length ? needs.join("") : `<p class="empty">Nothing needs you.</p>`}</section>
     ${recent.length ? `<h2>Recent</h2><section>${recent.map((j) => jobCard(j, { actions: false })).join("")}</section>` : ""}
     </div></div>`;
@@ -952,6 +1342,15 @@ function viewSheet() {
         <label class="field"><span>Name</span><input type="text" name="name" maxlength="64" required placeholder="e.g. 2026-10-21 kitchen window"></label>
         <div class="btns"><button type="button" class="btn" data-act="close">Cancel</button><button class="btn primary" ${S.busy ? "disabled" : ""}>Create</button></div>
       </form>`;
+  } else if (sh.type === "spot") {
+    const why = ["Blocked: a vehicle, gate, fence or building", "Not safe: traffic, a drop-off, machinery", "Ground too soft, steep or uneven", "Not allowed there", "Other"];
+    body = `<h3>Can't stand at spot ${esc(sh.rank)}</h3>
+      <p class="meta">The agent reads this and finds another spot.</p>
+      <form data-form="spot" data-id="${esc(sh.station)}|${esc(sh.rank)}">
+        <label class="field"><span>Why</span><select name="why" required><option value="">Choose…</option>${why.map((w) => `<option>${esc(w)}</option>`).join("")}</select></label>
+        <label class="field"><span>Anything else (optional)</span><input type="text" name="detail" maxlength="200" placeholder="e.g. delivery truck parked there until noon"></label>
+        <div class="btns"><button type="button" class="btn" data-act="close">Cancel</button><button class="btn primary" ${S.busy ? "disabled" : ""}>Rule it out</button></div>
+      </form>`;
   } else if (sh.type === "me") {
     body = `<h3>${esc(S.me?.name ?? "")}</h3>
       <p class="meta">Signed in as ${esc(S.me?.role ?? "")}. ${isOp() ? "You can approve scans and delete them." : S.me?.role === "agent" ? "Your scans wait for an operator's approval." : "You can look but not change anything."}</p>
@@ -1022,6 +1421,22 @@ function render(force = false) {
       }
     }
     if (scroll[k] != null) el.scrollLeft = scroll[k];
+  });
+  // A spots picture opens on spot 1; after that it keeps the person's scrolling.
+  root.querySelectorAll(".spots-pic").forEach((el) => {
+    const k = el.dataset.keepScroll;
+    if (S.spotScrolled[k]) return;
+    const img = el.querySelector("img");
+    const go = () => {
+      const sp = el.querySelector(".spot");
+      const badge = el.querySelector(".badge circle");
+      const svg = el.querySelector("svg.overlay");
+      const x = sp ? sp.offsetLeft : badge && svg ? Number(badge.getAttribute("cx")) / svg.viewBox.baseVal.width * svg.clientWidth : null;
+      if (x == null) return;
+      S.spotScrolled[k] = true;
+      el.scrollLeft = Math.max(0, x - el.clientWidth / 2);
+    };
+    if (img.complete && img.naturalWidth) go(); else img.addEventListener("load", go, { once: true });
   });
   root.querySelectorAll("form[data-form] [name]").forEach((el) => {
     const k = fieldKey(el);
@@ -1132,6 +1547,25 @@ const actions = {
     return act(() => api(`/projects/${encodeURIComponent(el.dataset.id)}/mission/sign-off`, { method: "POST", body: { confirmed_via: "web UI" } })
       .then((m) => { S.missions = [m, ...S.missions.filter((x) => x.project_id !== m.project_id)]; }), "Job signed off");
   },
+  ask: (el) => {
+    const pid = el.dataset.pid, tid = el.dataset.id, key = `${pid}|${tid}`;
+    S.asking[key] = true;
+    render(true);
+    api(`/projects/${encodeURIComponent(pid)}/mission/targets/${encodeURIComponent(tid)}/ask`, { method: "POST" })
+      .then((r) => toast(r.verdict === "answer" ? "Answered" : r.verdict === "does_not_fit" ? "Doesn't fit: see why" : "Not yet: see why"))
+      .catch((e) => { if (e.status !== 401) toast(e.message, true); })
+      .finally(() => { delete S.asking[key]; load("missions"); });
+  },
+  "spot-use": (el) => {
+    const plan = S.plans[latestDome(el.dataset.pid)?.scan_id];
+    const c = plan?.candidates?.find((x) => String(x.rank) === el.dataset.rank);
+    const text = `Next station from station ${el.dataset.station}: setting up at spot ${el.dataset.rank}${c ? ` (${spotWords(c)})` : ""}.`;
+    return act(() => logNote(text, el.dataset.pid), `Spot ${el.dataset.rank} chosen`);
+  },
+  layer: (el) => { S.layers = { ...S.layers, [el.dataset.k]: !S.layers[el.dataset.k] }; store.set("x9.layers", JSON.stringify(S.layers)); render(true); },
+  "spot-focus": (el) => { const r = Number(el.dataset.rank); S.spotFocus = S.spotFocus === r ? null : r; render(true); },
+  "spot-no": (el) => { S.sheet = { type: "spot", pid: el.dataset.pid, station: el.dataset.station, rank: el.dataset.rank }; render(true); },
+  bumped: (el) => act(() => logNote(`Station ${el.dataset.station}: the person says the tripod ${el.dataset.said} during the scan.`, el.dataset.pid), "Noted for the agent"),
   "approve-run": (el) => act(() => api(`/jobs/${encodeURIComponent(el.dataset.id)}/approve`, { method: "POST", body: { run: true } }).then((j) => { upsert(S.jobs, j, "job_id"); load("grants"); }), "Run approved"),
   "grant-project": () => act(async () => {
     const expires = new Date(Date.now() + GRANT_HOURS * 3600e3).toISOString().replace(/\.\d+Z$/, "Z");
@@ -1258,6 +1692,14 @@ const forms = {
     S.sheet = null;
     load("scans");
   }, "Project created"),
+  spot: (f) => {
+    const sh = S.sheet;
+    const why = [f.why.value, f.detail.value.trim()].filter(Boolean).join(": ");
+    return act(async () => {
+      await logNote(`Next station from station ${sh.station}: can't stand at spot ${sh.rank}: ${why}.`, sh.pid);
+      S.sheet = null;
+    }, `Spot ${sh.rank} ruled out`);
+  },
   note: (f) => act(async () => {
     const body = { text: f.text.value.trim() };
     if (S.project) body.project_id = S.project;
@@ -1300,7 +1742,7 @@ async function boot() {
   } else {
     render(true);
   }
-  setInterval(() => { if (S.me && !document.hidden) load("status"); }, 5000);
+  setInterval(() => { if (S.me && !document.hidden) { load("status"); load("workers"); } }, 5000);
   setInterval(() => { if (S.me && S.jobs.some((j) => j.state === "running")) render(); }, 1000);
 }
 boot();
