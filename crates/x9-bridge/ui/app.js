@@ -340,9 +340,13 @@ function questionLine(t) {
 }
 function questionRow(m, t) {
   const q = t.question;
-  const [cls, word] = q.verdict ? QWORD[q.verdict] ?? ["", q.verdict] : ["", "not asked"];
   const key = `${m.project_id}|${t.target_id}`;
   const open = !!S.qOpen[key];
+  // Declined by the person: the reason, not the bridge's last look.
+  if (t.status === "declined") {
+    return `<li class="question"><span class="chip">declined</span><div class="grow"><strong>${esc(t.name.replace(/ \(.*\)$/, ""))}</strong> · ${esc(t.note || "declined")}</div></li>`;
+  }
+  const [cls, word] = q.verdict ? QWORD[q.verdict] ?? ["", q.verdict] : ["", "not asked"];
   const head = `<button class="q-line" data-act="q-open" data-key="${esc(key)}" aria-expanded="${open}"><strong>${esc(t.name.replace(/ \(.*\)$/, ""))}</strong> · ${esc(questionLine(t))}<span class="caret">${open ? "▾" : "▸"}</span></button>`;
   if (!open) return `<li class="question"><span class="chip ${cls}">${esc(word)}</span><div class="grow">${head}</div></li>`;
   let body = "";
@@ -627,7 +631,7 @@ function spotTip(c, d) {
 }
 // The mission's tip names a question on the card.
 function missionTip(m) {
-  const qs = m.targets.filter((t) => t.question);
+  const qs = m.targets.filter((t) => t.question && t.status !== "declined");
   const short = (t) => t.name.replace(/ \(.*\)$/, "");
   const open = qs.find((t) => t.question.verdict && t.question.verdict !== "answer");
   if (open) return `Ask in the chat, like “why is ${short(open)} not answered yet?”`;
