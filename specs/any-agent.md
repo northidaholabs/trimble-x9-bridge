@@ -2,6 +2,11 @@
 
 Owner: Jim · Date: 2026-10-29 · Status: draft, not approved
 
+The control-plane side, once the agent's model is called through a gateway
+that is not ours (what leaves the site, who decided under what, the bill, and
+the page for the plane's administrator), is [`control-plane.md`](control-plane.md).
+It leans on parts A and B here and restates none of them.
+
 ## Problem
 
 A person should get the same answers, in the same words, under the same
