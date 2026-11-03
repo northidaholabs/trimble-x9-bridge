@@ -67,6 +67,48 @@ shadow on the pavement (<code>scanner_propose_station</code>).</td>
 Tested with Claude Opus 5.5 and Grok 4.6 driving the MCP tools: given the
 same plan, both put the tripod on the same spot of pavement.
 
+### One mission, as the person sees it
+
+The field web UI on a phone, replaying the administration building through
+the bridge on the simulator. The 19 stations were set by a crew; the spots
+were planned afterwards from each station's own points, and the agent's
+replies were scripted. The frames are the same ones on
+[ai-scan.northidaholabs.com/visit.html](https://ai-scan.northidaholabs.com/visit.html).
+
+<table>
+<tr>
+<td width="33%"><img src="docs/img/visit/1-mission.jpg" alt="The field app's mission card for the administration building: the sentence as the goal, what done means, and four questions, each on one line with its state."></td>
+<td width="33%"><img src="docs/img/visit/2-where.jpg" alt="Station 11's view of the administration building with the next station drawn as a tripod at its real size, the walk to it, and the landmark beside it."></td>
+<td width="33%"><img src="docs/img/visit/3-chosen.jpg" alt="The same administration building view after the person chose the spot: the tripod turns green and the card says chosen."></td>
+</tr>
+<tr>
+<td valign="top"><b>The sentence.</b> The person says what the job has to
+answer; the mission card holds it, and each question gets one line.</td>
+<td valign="top"><b>The next station.</b> Drawn into the view the person
+already has: the tripod the size it will be there, the walk to it, and what
+it stands beside.</td>
+<td valign="top"><b>The move.</b> The person chose the spot, or would have
+ruled it out and said why. Either way it is one line in the record, and the
+agent reads it there.</td>
+</tr>
+<tr>
+<td width="33%"><img src="docs/img/visit/4a-not-yet.jpg" alt="The administration building mission card at nine stations with the first question open: not yet, because the face passed once and needs one more station that sees it, and the tolerance the job set."></td>
+<td width="33%"><img src="docs/img/visit/4b-answered.jpg" alt="The same administration building question at eleven stations: answered, within the tolerance, with the bridge's words and the heat map of the face."></td>
+<td width="33%"><img src="docs/img/visit/5-signed-off.jpg" alt="The administration building mission card after sign-off: three questions answered, the fourth declined with its reason, and who signed."></td>
+</tr>
+<tr>
+<td valign="top"><b>The answer that waited.</b> At nine stations the first
+face had passed once, which is not an answer yet; the card says what it is
+waiting for, and the tolerance the job set.</td>
+<td valign="top"><b>The answer.</b> Two stations later the face had been
+seen again and agreed, and the line changed by itself, with the picture
+behind it and the call against the tolerance.</td>
+<td valign="top"><b>The sign-off.</b> Three faces answered. The fourth never
+came back into view, so it is declined with that reason rather than
+guessed. Nothing is open, and the person signs once.</td>
+</tr>
+</table>
+
 ## Build a field kit
 
 <p align="center">
