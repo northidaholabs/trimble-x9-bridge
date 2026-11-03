@@ -1142,13 +1142,13 @@ fn report_html(summary: &Value, walls: &[WallResult], ponds: &[Pond], sections: 
     let mut h = String::new();
     let _ = write!(
         h,
-        r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Survey report</title>
+        r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Scan report</title>
 <style>body{{font:15px/1.5 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:24px auto;max-width:1200px;padding:0 16px;color:#1f2328;background:#fff}}
 h1{{font-size:24px}}h2{{font-size:19px;margin-top:32px;border-bottom:1px solid #d0d7de}}table{{border-collapse:collapse;width:100%;font-size:13px}}
 th,td{{border:1px solid #d0d7de;padding:4px 6px;text-align:right}}th:first-child,td:first-child{{text-align:left}}img{{max-width:100%;border-radius:6px}}
 .note{{color:#57606a}}.bad{{color:#cf222e;font-weight:600}}.question{{border:1px solid #d0d7de;border-radius:6px;padding:4px 12px;margin:12px 0}}.question h3{{margin:6px 0}}.verdict{{font-weight:600;text-transform:uppercase;font-size:12px;letter-spacing:.04em;margin-right:6px}}.flag{{color:#cf222e}}.declined{{color:#57606a}}
 @media (prefers-color-scheme:dark){{body{{background:#0d1117;color:#e6edf3}}th,td{{border-color:#30363d}}.note{{color:#8b949e}}h2{{border-color:#30363d}}}}</style>
-<h1>Survey report</h1>
+<h1>Scan report</h1>
 <p class="note">{} stations used: those the registration audit trusts. Project frame of station {}: x and y in metres, not north. Flatness tolerance {} mm over a {} m straight line. Made by x9-bridge {}.</p>"#,
         summary["stations_used"], summary["frame_station"], opts.tolerance_mm, opts.straightedge_m, env!("CARGO_PKG_VERSION")
     );
