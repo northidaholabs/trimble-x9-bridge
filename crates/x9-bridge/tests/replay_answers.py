@@ -2,7 +2,7 @@
 """Criteria 6 and 7 of specs/on-site-answers.md: replay recorded surveys as
 they arrive, ask each target's face at every count, and score the answers.
 
-    replay_answers.py [--bin target/release/x9-bridge] [--work /tmp/answers] [held-out] [admin]
+    replay_answers.py [--bin target/release/x9-bridge] [--work /tmp/answers] [held-out] [demo-scan]
 
 Targets are set as on site: at each set count, every building wall of 4 m or
 more in that registration gets one, unless an existing target already covers
@@ -14,7 +14,7 @@ count is not an answer, either as carried on (`--state`) or judged afresh on
 the final registration alone (`--reference`), or if its plumb is more than
 5 mm from the fresh one.
 
-Criterion 7 rebuilds the admin report from all 19 stations and checks w23 and
+Criterion 7 rebuilds the demo-scan report from all 19 stations and checks w23 and
 w29 carry their verdicts and no numbers.
 
 Recordings are real properties: they stay outside git, under ~/x9-sim.
@@ -33,7 +33,7 @@ from pathlib import Path
 SURVEYS = {
     # name: (recordings, set counts, final count, scored faces needed)
     "held-out": (Path(os.environ.get("X9_HELDOUT", Path.home() / "x9-sim/held-out")), [4, 6, 8, 10], 12, 5),
-    "admin": (Path.home() / "x9-sim/admin-color", [4, 8, 10, 12], 19, 3),
+    "demo-scan": (Path.home() / "x9-sim/admin-color", [4, 8, 10, 12], 19, 3),
 }
 MIN_LENGTH_M = 4.0
 MISS_MM = 5.0
@@ -153,9 +153,9 @@ def replay(binary, name, work):
 
 
 def criterion7(binary, work, regs):
-    src = SURVEYS["admin"][0]
-    out = work / "admin" / "report19"
-    run([binary, "analyze", regs[19], out, *station_files(src, 19)], log=work / "admin" / "report19.log")
+    src = SURVEYS["demo-scan"][0]
+    out = work / "demo-scan" / "report19"
+    run([binary, "analyze", regs[19], out, *station_files(src, 19)], log=work / "demo-scan" / "report19.log")
     rows = {r["wall_id"]: r for r in csv.DictReader(open(out / "walls.csv"))}
     html = (out / "report.html").read_text()
     numbers = ["out_of_plumb_mm", "lean_mm_per_m", "worst_strip_mm_per_m", "flat_rms_mm", "flat_p95_mm", "straightedge_ok_pct", "straightedge_worst_mm"]
@@ -187,13 +187,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", default=str(Path(__file__).resolve().parents[3] / "target/release/x9-bridge"))
     ap.add_argument("--work", default="/tmp/answers")
-    ap.add_argument("surveys", nargs="*", default=["held-out", "admin"])
+    ap.add_argument("surveys", nargs="*", default=["held-out", "demo-scan"])
     a = ap.parse_args()
     work = Path(a.work)
     results = {}
     for s in a.surveys:
         results[s] = replay(a.bin, s, work)
-    c7 = criterion7(a.bin, work, results["admin"][2]) if "admin" in results else None
+    c7 = criterion7(a.bin, work, results["demo-scan"][2]) if "demo-scan" in results else None
     shown = all(r[1] for r in results.values())
     passed = all(r[0] for r in results.values())
     print("criterion 6:", "PASS" if passed else "not shown (a floor not met)" if not shown else "FAIL")

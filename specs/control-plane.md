@@ -100,7 +100,7 @@ mission are two lines.
 The bench (`any-agent.md` part B) records, beside pass and fail, the tokens
 in and out and the dollars for each scenario run, from the client's usage
 report where the client gives one, and the README table carries them. The
-survey prompt run end to end on the administration building replay is
+survey prompt run end to end on the demonstration scan replay is
 measured the same way, three runs, and its figure is written here.
 
 The mission never needs the agent to finish. When the plane refuses (a
@@ -148,7 +148,7 @@ tool servers on a customer's plane:
    names the signer and the station of the agent's last entry.
 5. metric: The bench table carries tokens and dollars per scenario for every
    platform whose client reports usage, and the survey prompt on the
-   administration building replay has its three-run total written here.
+   demonstration scan replay has its three-run total written here.
 6. test: The administrator's page lists every tool the server exposes with
    what it returns at each level; a tool added without a row fails the
    test.

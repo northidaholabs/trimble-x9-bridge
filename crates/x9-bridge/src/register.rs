@@ -77,7 +77,7 @@ const REFIT_BAD_DEG: f64 = 0.08;
 /// When judging whether other pairs back a join (not a station's own
 /// votes), the millimetre limits grow with the distance between the two
 /// stations: a turn the angle limit allows moves a station that far away by
-/// its lever arm (0.08° is 1.4 mm per metre). On the admin building, good
+/// its lever arm (0.08° is 1.4 mm per metre). On the demonstration scan, good
 /// pairs 22-38 m apart read 25-36 mm with turns under 0.05°. Surfaces get
 /// half the slope. A station's own votes keep the fixed limits: with the
 /// wider ones, 3 cm planted errors went uncaught (bench, 2026-10-24).
@@ -2732,7 +2732,7 @@ mod tests {
     fn limits_grow_with_the_lever_arm() {
         assert_eq!(refit_limit_mm(0.0), REFIT_BAD_MM);
         assert!((REFIT_BAD_PER_M - 1.396).abs() < 0.001, "0.08° is 1.4 mm per metre");
-        // The admin building's corner pairs, all right: 14-15 (22 m, 36 mm) and 14-16 (38 m, 25 mm).
+        // The demonstration site's corner pairs, all right: 14-15 (22 m, 36 mm) and 14-16 (38 m, 25 mm).
         assert!(refit_limit_mm(22.3) > 35.8 && refit_limit_mm(38.5) > 24.7);
         // Near pairs stay strict: a 3 cm move 5 m away still disagrees.
         assert!(refit_limit_mm(5.0) < 30.0 && surface_limit_mm(5.0) < 30.0);
@@ -2754,7 +2754,7 @@ mod tests {
         assert_eq!(pair_evidence(&surface, 10.0), Some(true));
         let far_surface = PairChecks { gaps: vec![0.0315; 400], ..Default::default() };
         assert_eq!(pair_evidence(&far_surface, 5.0), Some(false));
-        assert_eq!(pair_evidence(&far_surface, 38.4), Some(true), "the admin corner pair 13-15 reads 31.5 mm at 38 m");
+        assert_eq!(pair_evidence(&far_surface, 38.4), Some(true), "the demo-scan corner pair 13-15 reads 31.5 mm at 38 m");
     }
 
     #[test]

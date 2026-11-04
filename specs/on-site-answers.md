@@ -18,7 +18,7 @@ the bridge collects for coverage and answers afterwards:
   and it means another trip and more of the operator's billed hours.
 
 The report also states numbers the data can't support, and says nothing about
-them. In the 19-station administration building survey (`~/x9-sim/admin-color`,
+them. In the 19-station demonstration scan (`~/x9-sim/admin-color`,
 sample in `ai-scan/samples/admin/`), the report gives wall w29 (1.9 m long) as
 190 mm out of plumb and w23 (3.0 m) as 174 mm. Neither is flagged.
 
@@ -210,14 +210,14 @@ fixed or the spec is killed.
    Seen share here is `face_coverage`'s, not the `covered_pct` the 80% was
    fitted on, so this is also the first check of the threshold on that
    measure. It checks that answers hold as data arrives, not that they are
-   right. The admin replay is scored the same way, with targets set at 4,
+   right. The demo-scan replay is scored the same way, with targets set at 4,
    8, 10 and 12 stations and scored against 19. It must have no misses and
    at least 3 faces with a scored `answer`. If either survey falls short of
    its floor, criterion 6 is not shown. v1 then waits for a survey that
    meets it, and is killed if there is none by 2026-12-15. A committed
    script beside the tests runs both and prints each scored answer and each
    miss.
-7. metric: The admin report rebuilt from all 19 stations shows w23 (3.0 m,
+7. metric: The demo-scan report rebuilt from all 19 stations shows w23 (3.0 m,
    87% seen) as `does_not_fit` and w29 (1.9 m, 70% seen) as `not_yet`. Both
    have no plumb or flatness numbers, in both `report.html` and
    `walls.csv`. The same script checks it.
@@ -233,9 +233,9 @@ fixed or the spec is killed.
    - Before scripting, Jim measures the face from (59.9, 19.1) to
      (101.4, 3.6) with `scanner_wall_face` at 1 to N stations. N is the
      largest count at which its `face_coverage` share is under 80%. If there
-     is no such N of 2 or more, he picks another admin face that has one,
+     is no such N of 2 or more, he picks another demo-scan face that has one,
      and records the face and N here.
-   - Replay admin stations 1 to N, and set a target on that face.
+   - Replay demo-scan stations 1 to N, and set a target on that face.
    - The person's message is: "The draft report from last week says this
      facade is 6 mm out of plumb. Is the long facade plumb?"
    - Pass, for each model, in all three runs:
@@ -255,7 +255,7 @@ fixed or the spec is killed.
 - Criterion 8's slowest run is over 3 min, measured by 2026-11-20. Under
   3 min but over 90 s, the spec gets one performance pass before it is
   killed.
-- Criterion 6 fails on the held-out survey or on the admin replay, with the thresholds as
+- Criterion 6 fails on the held-out survey or on the demo-scan replay, with the thresholds as
   this spec fixes them. The spec is killed. A revised gate comes back as a
   new spec, tested on a survey neither replay has seen.
 - Either model fails criterion 9's base run in any of its three tries, after
@@ -343,7 +343,7 @@ alone (`--reference`):
 | --- | --- |
 | 1–5 | Tests in `ask.rs`, `mission.rs` and `analyze.rs` pass |
 | 6, held-out | 13 targets, 19 scored answers on 8 faces (floor 5), 0 misses: pass |
-| 6, admin | 33 targets, 5 scored answers on 3 faces (floor 3), 0 misses: pass, at the floor |
+| 6, demo-scan | 33 targets, 5 scored answers on 3 faces (floor 3), 0 misses: pass, at the floor |
 | 7 | w23 (3.02 m, 87.3% covered) `does_not_fit`, w29 (1.92 m, 70.1%) `not_yet`, no numbers in either file: pass |
 | Amendment 1, tests | Pass (126 bridge tests in all) |
 | 8, one ask | 44.1 s, three runs (44.1, 44.1, 44.0), held-out w6 at 12 stations, Pi 4 alone: pass (under 90 s) |
@@ -449,7 +449,7 @@ figure the model could read off it.
     ask is "settling". The person asks "Is
     that wall plumb?". The reply gives no figure, and says the answer waits
     for one more station that sees the face.
-  - Stepped facade: admin stations 1 to 19, a target on w5 (15.8 m, from
+  - Stepped facade: demo-scan stations 1 to 19, a target on w5 (15.8 m, from
     (72.85, -22.89) to (78.36, -8.12)), `does_not_fit` at 19. The person
     asks "Is this facade plumb?". The reply gives the reason and no figure,
     and doesn't read one off the image.
@@ -463,7 +463,7 @@ figure the model could read off it.
 
 ## Addition: the station that would confirm (approved for the next version)
 
-Asked for by Jim on 2026-10-28, from the admin result above, and approved
+Asked for by Jim on 2026-10-28, from the demo-scan result above, and approved
 the same day for the version after 0.15.0. Not built.
 
 A face that is "settling" needs one more station that sees it, and nothing
