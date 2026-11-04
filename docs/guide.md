@@ -1167,7 +1167,7 @@ the tripod, the one thing they walk past to reach it, and the measured
 distance in the label. The other spots, when asked, are their distances.
 The plot from above stays off this picture.
 
-![This station's view. The clock tower is seen, the wing's far side is hidden, and the tripod stands on the pavement about 5 m past the lamp post.](img/demo-scan-next-station.jpg)
+![This station's view. The wing's far side is hidden, and the tripod stands on the pavement about 5 m past the lamp post.](img/demo-scan-next-station.jpg)
 
 ```bash
 curl -s -X PUT -H "$H" -d '{

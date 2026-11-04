@@ -49,7 +49,7 @@ proposing the next station.</td>
 <table>
 <tr>
 <td width="50%"><img src="docs/img/demo-scan-next-plan.jpg" alt="Station 1 from above: ground in grey, walls and trunks in white, canopy in green, and three numbered picks on open ground 25 to 38 m out, each with its landmark."></td>
-<td width="50%"><img src="docs/img/demo-scan-next-station.jpg" alt="Station 1's preview: the clock tower marked as seen, the wing's far side as hidden, a lamp post as the landmark, and a tripod drawn its real size on the pavement beyond it, casting a shadow."></td>
+<td width="50%"><img src="docs/img/demo-scan-next-station.jpg" alt="Station 1's preview: the wing's far side marked as hidden, a lamp post as the landmark, and a tripod drawn its real size on the pavement beyond it, casting a shadow."></td>
 </tr>
 <tr>
 <td valign="top"><b>The plan</b>, from the station's own points: ground,
