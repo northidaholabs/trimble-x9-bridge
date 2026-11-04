@@ -1055,7 +1055,7 @@ mod tests {
 
     #[test]
     fn stray_returns_do_not_wall_the_tripod_in() {
-        // Station 7 of the admin survey: single returns at body height (a
+        // Station 7 of the demonstration scan: single returns at body height (a
         // passer-by, edge noise) scattered over the walkway round the tripod.
         let (mut walls, solid) = block(10.0);
         walls.extend(fence());

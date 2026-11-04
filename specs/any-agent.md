@@ -84,7 +84,7 @@ rest widen who can take part.
 
 ### B. The bench: every platform, the same rules
 
-A replay harness on the sim (`x9-sim`, the administration building and the
+A replay harness on the sim (`x9-sim`, the demonstration scan and the
 held-out survey), like `x9-bridge bench` for registration but for the agent.
 Each scenario is a scripted person and a set of rules scored from the
 bridge's own log and the transcript:

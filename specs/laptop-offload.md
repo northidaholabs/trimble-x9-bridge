@@ -41,7 +41,7 @@ Two things make it slow, and they are separate:
    it deletes each scan file once it has decoded the 5 cm cloud.
 
 There is also a storage limit. The Pi caches every scan file it fetches
-under `$BRIDGE_DATA/scans` (about 95 MB per station on the admin survey:
+under `$BRIDGE_DATA/scans` (about 95 MB per station on the demonstration scan:
 1.8 GB for 19), and evicts one only when the scanner deletes the scan. The
 SD card has 1.5 GB free, so a long visit runs the Pi's disk out around
 station 15. Nothing in the log warns before it does.
@@ -158,7 +158,7 @@ Every criterion is a ship gate.
    an Apple Silicon Mac and once on an Intel Mac; the Intel run must also
    be under `on-site-answers.md` criterion 8's limits (90 s and 120 s).
    This is how criterion 8 is shown for the kit.
-7. test: With `BRIDGE_CACHE_MB` set to 300 and the admin survey replayed
+7. test: With `BRIDGE_CACHE_MB` set to 300 and the demonstration scan replayed
    station by station, the cache never passes 300 MB, every station still
    registers, and the log carries the budget note once.
 

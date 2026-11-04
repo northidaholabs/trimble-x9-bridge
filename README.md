@@ -21,15 +21,15 @@ keeps its own internet, and nothing routes through the Pi.
 
 ## What you get
 
-A 19-station colour scan of an administration building, replayed through the
+A 19-station colour demonstration scan, replayed through the
 bridge: each station registered by itself as it landed, all of them
 confirmed by the audit, every pair of stations within about 22 mm.
 
 <table>
 <tr>
-<td width="33%"><img src="docs/img/admin-plan.jpg" alt="Registered plan of all 19 stations of the administration building, seen from above."></td>
-<td width="33%"><img src="docs/img/admin-minimap.png" alt="Minimap of the administration building: walls as lines, building walls separate from low walls and vegetation, numbered station dots."></td>
-<td width="33%"><img src="docs/img/admin-coverage.png" alt="Coverage plan of one station: what the scanner saw and where it was blocked."></td>
+<td width="33%"><img src="docs/img/demo-scan-plan.jpg" alt="Registered plan of all 19 stations of the demonstration scan, seen from above."></td>
+<td width="33%"><img src="docs/img/demo-scan-minimap.png" alt="Minimap of the demonstration scan: walls as lines, building walls separate from low walls and vegetation, numbered station dots."></td>
+<td width="33%"><img src="docs/img/demo-scan-coverage.png" alt="Coverage plan of one station: what the scanner saw and where it was blocked."></td>
 </tr>
 <tr>
 <td valign="top"><b>Registered plan</b>: every station in one frame, from
@@ -48,8 +48,8 @@ proposing the next station.</td>
 
 <table>
 <tr>
-<td width="50%"><img src="docs/img/admin-next-plan.jpg" alt="Station 1 from above: ground in grey, walls and trunks in white, canopy in green, and three numbered picks on open ground 25 to 38 m out, each with its landmark."></td>
-<td width="50%"><img src="docs/img/admin-next-station.jpg" alt="Station 1's preview: the clock tower marked as seen, the wing's far side as hidden, a lamp post as the landmark, and a tripod drawn its real size on the pavement beyond it, casting a shadow."></td>
+<td width="50%"><img src="docs/img/demo-scan-next-plan.jpg" alt="Station 1 from above: ground in grey, walls and trunks in white, canopy in green, and three numbered picks on open ground 25 to 38 m out, each with its landmark."></td>
+<td width="50%"><img src="docs/img/demo-scan-next-station.jpg" alt="Station 1's preview: the clock tower marked as seen, the wing's far side as hidden, a lamp post as the landmark, and a tripod drawn its real size on the pavement beyond it, casting a shadow."></td>
 </tr>
 <tr>
 <td valign="top"><b>The plan</b>, from the station's own points: ground,
@@ -69,7 +69,7 @@ same plan, both put the tripod on the same spot of pavement.
 
 ### One mission, as the person sees it
 
-The field web UI on a phone, replaying the administration building through
+The field web UI on a phone, replaying a demonstration scan through
 the bridge on the simulator. The 19 stations were set by a crew; the spots
 were planned afterwards from each station's own points, and the agent's
 replies were scripted. The frames are the same ones on
@@ -77,9 +77,9 @@ replies were scripted. The frames are the same ones on
 
 <table>
 <tr>
-<td width="33%"><img src="docs/img/visit/1-mission.jpg" alt="The field app's mission card for the administration building: the sentence as the goal, what done means, and four questions, each on one line with its state."></td>
-<td width="33%"><img src="docs/img/visit/2-where.jpg" alt="Station 11's view of the administration building with the next station drawn as a tripod at its real size, the walk to it, and the landmark beside it."></td>
-<td width="33%"><img src="docs/img/visit/3-chosen.jpg" alt="The same administration building view after the person chose the spot: the tripod turns green and the card says chosen."></td>
+<td width="33%"><img src="docs/img/visit/1-mission.jpg" alt="The field app's mission card for a demonstration scan, listing four wall faces with the state of each."></td>
+<td width="33%"><img src="docs/img/visit/2-where.jpg" alt="Station 11's view in a demonstration scan, with the next station drawn as a tripod at real size 10 m away, the walking path to it and a nearby landmark."></td>
+<td width="33%"><img src="docs/img/visit/3-chosen.jpg" alt="The same view after the person chose the spot: the tripod turns green and the card says chosen."></td>
 </tr>
 <tr>
 <td valign="top"><b>The sentence.</b> The person says what the job has to
@@ -92,9 +92,9 @@ ruled it out and said why. Either way it is one line in the record, and the
 agent reads it there.</td>
 </tr>
 <tr>
-<td width="33%"><img src="docs/img/visit/4a-not-yet.jpg" alt="The administration building mission card at nine stations with the first question open: not yet, because the face passed once and needs one more station that sees it, and the tolerance the job set."></td>
-<td width="33%"><img src="docs/img/visit/4b-answered.jpg" alt="The same administration building question at eleven stations: answered, within the tolerance, with the bridge's words and the heat map of the face."></td>
-<td width="33%"><img src="docs/img/visit/5-signed-off.jpg" alt="The administration building mission card after sign-off: three questions answered, the fourth declined with its reason, and who signed."></td>
+<td width="33%"><img src="docs/img/visit/4a-not-yet.jpg" alt="The mission card at nine stations, with the first face open. It reads not yet: the face has passed from one station and needs one more, and the card shows the tolerance the job set."></td>
+<td width="33%"><img src="docs/img/visit/4b-answered.jpg" alt="The same face at eleven stations, now answered within tolerance, with the bridge's note and a heat map of the face."></td>
+<td width="33%"><img src="docs/img/visit/5-signed-off.jpg" alt="The mission card after sign-off: three faces answered and the fourth declined with its reason."></td>
 </tr>
 <tr>
 <td valign="top"><b>The answer that waited.</b> At nine stations the first

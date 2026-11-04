@@ -237,7 +237,7 @@ x9-bridge analyze --compare [--min-change-m 0.02] BEFORE_OUT AFTER_OUT CHANGE_DI
 `--compare` measures cut and fill between two visits' height grids in the
 same frame, counting cells that changed by `--min-change-m` or more (a scan's
 millimetres of noise, summed over a whole site, would otherwise add up to
-cubic metres), and draws the change. On the admin building's ground with a
+cubic metres), and draws the change. On the demonstration scan's ground with a
 planted 18.85 m³ stockpile and a 2.40 m³ pit (synthetic), it reports 18.84
 and 2.40 m³.
 
