@@ -2732,7 +2732,7 @@ mod tests {
     fn limits_grow_with_the_lever_arm() {
         assert_eq!(refit_limit_mm(0.0), REFIT_BAD_MM);
         assert!((REFIT_BAD_PER_M - 1.396).abs() < 0.001, "0.08° is 1.4 mm per metre");
-        // The demonstration scan's corner pairs, all right: 14-15 (22 m, 36 mm) and 14-16 (38 m, 25 mm).
+        // The demonstration site's corner pairs, all right: 14-15 (22 m, 36 mm) and 14-16 (38 m, 25 mm).
         assert!(refit_limit_mm(22.3) > 35.8 && refit_limit_mm(38.5) > 24.7);
         // Near pairs stay strict: a 3 cm move 5 m away still disagrees.
         assert!(refit_limit_mm(5.0) < 30.0 && surface_limit_mm(5.0) < 30.0);
