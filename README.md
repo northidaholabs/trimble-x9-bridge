@@ -10,6 +10,10 @@ behavior ([PROVENANCE.md](PROVENANCE.md)). It contains no vendor code and is
 **not affiliated with or endorsed by Trimble Inc.**; "Trimble" and "X9" are
 trademarks of their respective owners.
 
+I built this clean-room from how the scanner behaves and the data it
+returns. It uses no Trimble source code, internal documents, or confidential
+information, including anything from my past employment at Trimble.
+
 <p align="center">
   <img src="docs/img/connections.svg" width="900"
        alt="A laptop's agent reaches the MCP server on a Raspberry Pi over ssh on a USB-C cable; the MCP server calls x9-bridge; the bridge drives the Trimble X9 over the scanner's Wi-Fi or USB. An optional worker on the laptop registers stations.">
