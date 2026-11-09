@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:northidaholabs:list:0",
+  "title": "List: the lines a job must document, before any are answered",
+  "description": "Modelled on the inspection and test plan (ITP). One line is one row of the plan. The list holds no results; a record does (record.schema.json), keyed by line_id.",
+  "type": "object",
+  "required": ["format", "version", "list_id", "title", "revision", "parties", "lines"],
+  "additionalProperties": false,
+  "properties": {
+    "format": { "const": "nil-list" },
+    "version": { "const": 0 },
+    "list_id": { "$ref": "#/$defs/id" },
+    "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "revision": { "type": "string", "minLength": 1, "maxLength": 20, "description": "The plan's revision letter or number. A record names the revision it answers." },
+    "issued": { "type": "string", "format": "date" },
+    "issued_by": { "$ref": "#/$defs/person" },
+    "source": {
+      "type": "object",
+      "description": "What the list was read from.",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["itp", "punch_list", "inspection_form", "closeout_list", "other"] },
+        "name": { "type": "string" },
+        "reference": { "type": "string" }
+      }
+    },
+    "parties": {
+      "type": "array",
+      "minItems": 1,
+      "description": "The ITP's party columns: who may hold, witness or review a line.",
+      "items": { "$ref": "#/$defs/party" }
+    },
+    "lines": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/line" } }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+    "person": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "org": { "type": "string" },
+        "role": { "type": "string" }
+      }
+    },
+    "party": {
+      "type": "object",
+      "required": ["id", "role"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "role": { "enum": ["contractor", "subcontractor", "client", "inspector", "third_party"] },
+        "name": { "type": "string" }
+      }
+    },
+    "point": {
+      "description": "ITP inspection point. H hold: the line cannot close without this party's release. W witness: the party is told and may attend; the line closes without them. R review: the party reviews the record afterwards. S surveillance: no signature.",
+      "enum": ["H", "W", "R", "S"]
+    },
+    "tolerance": {
+      "description": "The bridge's own tolerance shape (trimble-x9-bridge docs/guide.md): the person's words, and either allowances by height or a rate.",
+      "type": "object",
+      "required": ["words"],
+      "additionalProperties": false,
+      "properties": {
+        "words": { "type": "string", "minLength": 1 },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["mm"],
+            "additionalProperties": false,
+            "properties": { "up_to_m": { "type": "number", "exclusiveMinimum": 0 }, "mm": { "type": "number", "exclusiveMinimum": 0 } }
+          }
+        },
+        "mm_per_m": { "type": "number", "exclusiveMinimum": 0 },
+        "max_mm": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "line": {
+      "type": "object",
+      "required": ["line_id", "activity", "requirement", "method", "evidence", "question"],
+      "additionalProperties": false,
+      "properties": {
+        "line_id": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)*$", "description": "The ITP item number. Stable across revisions; a record answers by it." },
+        "group": { "type": "string", "description": "The ITP section: a trade or a stage." },
+        "activity": { "type": "string", "minLength": 1, "description": "What was built or what is inspected." },
+        "requirement": { "type": "string", "minLength": 1, "description": "The acceptance criterion, in the list's own words." },
+        "reference": { "type": "string", "description": "The controlling document: a spec section, a drawing, a standard." },
+        "method": { "enum": ["dimensional", "visual", "test", "review"], "description": "The ITP inspection type." },
+        "evidence": {
+          "enum": ["measured", "seen", "attested"],
+          "description": "The grade of evidence the line can carry. measured: the scanner answers from points. seen: a picture shows it. attested: a person states it and names the document behind it. By default dimensional is measured, visual is seen, test and review are attested."
+        },
+        "question": {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "enum": ["plumb", "flatness", "height", "opening", "clearance", "low_spots", "map", "photo", "statement"] },
+            "thresholds": { "type": "object", "additionalProperties": { "type": "number" }, "description": "Limits that define what is counted, when the requirement is a count or a listing." }
+          }
+        },
+        "tolerance": { "$ref": "#/$defs/tolerance" },
+        "points": {
+          "type": "object",
+          "description": "The inspection point for each party, by party id. A party with no entry has no part in the line.",
+          "propertyNames": { "$ref": "#/$defs/id" },
+          "additionalProperties": { "$ref": "#/$defs/point" }
+        },
+        "record": { "type": "string", "description": "The ITP's verifying document: what will be kept as proof." },
+        "required": { "type": "boolean", "default": true },
+        "place_hint": { "type": "string", "description": "Where on site, in words. The person binds the line to a place once, on the station's view; the record keeps that binding." },
+        "note": { "type": "string" }
+      },
+      "allOf": [
+        { "if": { "properties": { "evidence": { "const": "measured" } } }, "then": { "properties": { "question": { "properties": { "kind": { "enum": ["plumb", "flatness", "height", "opening", "clearance", "low_spots", "map"] } } } } } },
+        { "if": { "properties": { "evidence": { "const": "seen" } } }, "then": { "properties": { "question": { "properties": { "kind": { "const": "photo" } } } } } },
+        { "if": { "properties": { "evidence": { "const": "attested" } } }, "then": { "required": ["record"], "properties": { "question": { "properties": { "kind": { "const": "statement" } } } } } },
+        { "if": { "required": ["tolerance"] }, "then": { "properties": { "evidence": { "const": "measured" } } } }
+      ]
+    }
+  }
+}

@@ -1,0 +1,85 @@
+{
+  "format": "nil-list",
+  "version": 0,
+  "list_id": "demo-closeout",
+  "title": "Closeout list, demonstration building",
+  "revision": "A",
+  "source": { "kind": "itp", "name": "Sample written for the model. Lines 1.1 to 4.1 are the missions on the visit page; 5.1 to 6.1 are illustrative." },
+  "parties": [
+    { "id": "trade", "role": "contractor" },
+    { "id": "checker", "role": "client" }
+  ],
+  "lines": [
+    {
+      "line_id": "1.1", "group": "Masonry", "activity": "Long facade",
+      "requirement": "Plumb within a quarter inch in ten feet",
+      "method": "dimensional", "evidence": "measured",
+      "question": { "kind": "plumb" },
+      "tolerance": { "words": "a quarter inch in ten feet", "steps": [ { "up_to_m": 3.05, "mm": 6.4 } ] },
+      "points": { "trade": "H", "checker": "W" },
+      "record": "Report row with the face's heat map",
+      "place_hint": "The wall a new opening has to meet"
+    },
+    {
+      "line_id": "1.2", "group": "Masonry", "activity": "Fourth wall face",
+      "requirement": "Plumb within a quarter inch in ten feet",
+      "method": "dimensional", "evidence": "measured",
+      "question": { "kind": "plumb" },
+      "tolerance": { "words": "a quarter inch in ten feet", "steps": [ { "up_to_m": 3.05, "mm": 6.4 } ] },
+      "points": { "trade": "H", "checker": "R" },
+      "record": "Report row with the face's heat map"
+    },
+    {
+      "line_id": "2.1", "group": "Access", "activity": "Arched wall",
+      "requirement": "Height from the ground at its foot to the parapet, recorded",
+      "method": "dimensional", "evidence": "measured",
+      "question": { "kind": "height" },
+      "points": { "checker": "R" },
+      "record": "Report row with the wall's picture",
+      "place_hint": "The parapet a lift has to reach"
+    },
+    {
+      "line_id": "3.1", "group": "Paving", "activity": "Walks and road",
+      "requirement": "Every place water would stand, 0.5 m² or more and 10 mm or deeper, listed with its position",
+      "method": "dimensional", "evidence": "measured",
+      "question": { "kind": "low_spots", "thresholds": { "min_area_m2": 0.5, "min_depth_mm": 10 } },
+      "points": { "checker": "R" },
+      "record": "Plan of the site with the low spots numbered"
+    },
+    {
+      "line_id": "4.1", "group": "Record", "activity": "Whole site",
+      "requirement": "Every station in one frame",
+      "method": "dimensional", "evidence": "measured",
+      "question": { "kind": "map" },
+      "points": { "checker": "R" },
+      "record": "Registered plan from above"
+    },
+    {
+      "line_id": "5.1", "group": "Openings", "activity": "Entry doors",
+      "requirement": "Hung, closing and latching",
+      "method": "visual", "evidence": "seen",
+      "question": { "kind": "photo" },
+      "points": { "trade": "H", "checker": "W" },
+      "record": "Picture of each leaf, closed",
+      "note": "Illustrative line. Not part of the demonstration scan."
+    },
+    {
+      "line_id": "5.2", "group": "Openings", "activity": "Window heads",
+      "requirement": "Sealant applied and continuous",
+      "method": "visual", "evidence": "seen",
+      "question": { "kind": "photo" },
+      "points": { "trade": "H", "checker": "R" },
+      "record": "Picture of each head",
+      "note": "Illustrative line. Not part of the demonstration scan."
+    },
+    {
+      "line_id": "6.1", "group": "Anchors", "activity": "Lift anchors at the parapet",
+      "requirement": "Torqued to the manufacturer's figure",
+      "method": "test", "evidence": "attested",
+      "question": { "kind": "statement" },
+      "points": { "trade": "H", "checker": "R" },
+      "record": "Torque log, signed by the installer",
+      "note": "Illustrative line. Not part of the demonstration scan."
+    }
+  ]
+}

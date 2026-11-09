@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:northidaholabs:list-record:0",
+  "title": "Record: what each line of a list came to, and who signed it",
+  "description": "The answers to one revision of one list on one job. Lines are keyed by the list's line_id. A record never restates the requirement; it points at it.",
+  "type": "object",
+  "required": ["format", "version", "list_id", "list_revision", "lines"],
+  "additionalProperties": false,
+  "properties": {
+    "format": { "const": "nil-list-record" },
+    "version": { "const": 0 },
+    "list_id": { "type": "string" },
+    "list_revision": { "type": "string" },
+    "project_id": { "type": "string" },
+    "mission_id": { "type": "string" },
+    "source": { "type": "string", "description": "Where the record's content came from, when it was not a live job." },
+    "lines": { "type": "array", "items": { "$ref": "#/$defs/line" } },
+    "capture_sign_off": {
+      "description": "The mission's existing sign-off: nothing is open and the operator signed once. Null until then.",
+      "oneOf": [ { "type": "null" }, { "$ref": "#/$defs/signature_core" } ]
+    }
+  },
+  "$defs": {
+    "person": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": { "name": { "type": "string", "minLength": 1 }, "org": { "type": "string" }, "role": { "type": "string" } }
+    },
+    "signature_core": {
+      "type": "object",
+      "required": ["by", "at", "via"],
+      "additionalProperties": false,
+      "properties": {
+        "by": { "$ref": "#/$defs/person" },
+        "at": { "type": "string", "format": "date-time" },
+        "via": { "type": "string", "description": "How it reached the bridge, as the mission records it: web UI, asked in the chat, relayed by the agent." }
+      }
+    },
+    "agent": {
+      "description": "Who proposed or computed it, as specs/control-plane.md part B asks. client, model and plane are declared, not verified.",
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" }, "client": { "type": "string" }, "model": { "type": "string" },
+        "plane": { "type": "string" }, "playbook": { "type": "string" }
+      }
+    },
+    "line": {
+      "type": "object",
+      "required": ["line_id", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "line_id": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)*$" },
+        "status": {
+          "enum": ["open", "not_yet", "does_not_fit", "answered", "declined"],
+          "description": "open: nothing captured. not_yet and does_not_fit: the bridge's own verdicts, with its reason. answered: the evidence carries the line. declined: a person or the agent closed it without an answer, with a reason."
+        },
+        "conformance": {
+          "enum": ["conforming", "non_conforming", "neutral", "not_applicable"],
+          "description": "Only with answered. conforming and non_conforming: the evidence against the line's tolerance or requirement. neutral: answered, but the tolerance makes no call for this case. not_applicable: the line asks for a figure or a record, not a pass. The four states are the ones field inspection software already uses."
+        },
+        "reason": { "type": "string", "description": "Why not yet, does not fit, declined or neutral, in the bridge's words where it has them." },
+        "evidence": {
+          "type": "object",
+          "required": ["grade"],
+          "additionalProperties": false,
+          "properties": {
+            "grade": { "enum": ["measured", "seen", "attested"] },
+            "say": { "type": "string", "description": "The bridge's sentence, relayed as written (specs/any-agent.md part A)." },
+            "reading": { "type": "object", "description": "The figures, by the bridge's field names (out_of_plumb_mm, over_m, flat_rms_mm, …).", "additionalProperties": { "type": "number" } },
+            "stations": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "uniqueItems": true },
+            "seen_share": { "type": "number", "minimum": 0, "maximum": 1 },
+            "pictures": { "type": "array", "items": { "type": "string" }, "description": "Links to the views in the field web UI or the report." },
+            "document": { "type": "string", "description": "With attested: the document the statement rests on." },
+            "live": { "type": "boolean", "description": "False when the answer was worked out from finished scans, not asked during the visit." }
+          }
+        },
+        "place": {
+          "type": "object",
+          "description": "Where the line was bound on site.",
+          "additionalProperties": false,
+          "properties": {
+            "face": {
+              "type": "object", "required": ["from", "to"], "additionalProperties": false,
+              "properties": {
+                "from": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+                "to": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }
+              }
+            },
+            "station": { "type": "integer", "minimum": 1 },
+            "bound_by": { "$ref": "#/$defs/person" }
+          }
+        },
+        "signatures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["party", "action", "by", "at", "via"],
+            "additionalProperties": false,
+            "properties": {
+              "party": { "type": "string" },
+              "action": {
+                "enum": ["done", "witnessed", "released", "accepted", "accepted_with_note", "rejected"],
+                "description": "done: the party says the work is finished. witnessed: the party attended. released: a hold point is lifted. accepted, accepted_with_note, rejected: the party's call on the answered line."
+              },
+              "note": { "type": "string" },
+              "by": { "$ref": "#/$defs/person" },
+              "at": { "type": "string", "format": "date-time" },
+              "via": { "type": "string" }
+            },
+            "allOf": [ { "if": { "properties": { "action": { "enum": ["accepted_with_note", "rejected"] } } }, "then": { "required": ["note"] } } ]
+          }
+        },
+        "agent": { "$ref": "#/$defs/agent" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      },
+      "allOf": [
+        { "if": { "properties": { "status": { "const": "answered" } } }, "then": { "required": ["conformance", "evidence"] }, "else": { "not": { "required": ["conformance"] } } },
+        { "if": { "properties": { "status": { "enum": ["not_yet", "does_not_fit", "declined"] } } }, "then": { "required": ["reason"] } },
+        { "if": { "properties": { "conformance": { "const": "neutral" } }, "required": ["conformance"] }, "then": { "required": ["reason"] } }
+      ]
+    }
+  }
+}

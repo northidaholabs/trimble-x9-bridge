@@ -1,0 +1,9 @@
+line,group,activity,requirement,reference,method,tolerance,trade,checker,record
+1.1,Masonry,Long facade,Plumb within a quarter inch in ten feet,,dimensional,a quarter inch in ten feet,H,W,Report row with the face's heat map
+1.2,Masonry,Fourth wall face,Plumb within a quarter inch in ten feet,,dimensional,a quarter inch in ten feet,H,R,Report row with the face's heat map
+2.1,Access,Arched wall,"Height from the ground at its foot to the parapet, recorded",,dimensional,,,R,Report row with the wall's picture
+3.1,Paving,Walks and road,"Every place water would stand, 0.5 m² or more and 10 mm or deeper, listed with its position",,dimensional,,,R,Plan of the site with the low spots numbered
+4.1,Record,Whole site,Every station in one frame,,dimensional,,,R,Registered plan from above
+5.1,Openings,Entry doors,"Hung, closing and latching",,visual,,H,W,"Picture of each leaf, closed"
+5.2,Openings,Window heads,Sealant applied and continuous,,visual,,H,R,Picture of each head
+6.1,Anchors,Lift anchors at the parapet,Torqued to the manufacturer's figure,,test,,H,R,"Torque log, signed by the installer"

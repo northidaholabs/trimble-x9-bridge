@@ -1,0 +1,56 @@
+{
+  "format": "nil-list-record",
+  "version": 0,
+  "list_id": "demo-closeout",
+  "list_revision": "A",
+  "source": "A replay of a demonstration scan. Figures and sentences are quoted from https://ai-scan.northidaholabs.com/visit.html as read on 2026-11-09. No party signed any line, and three lines were never part of the scan.",
+  "lines": [
+    {
+      "line_id": "1.1", "status": "answered", "conformance": "neutral",
+      "reason": "The tolerance gives no allowance for 14.6 m of height.",
+      "evidence": {
+        "grade": "measured",
+        "say": "4.1 mm out of plumb (3/16 in) over 14.6 m. The top leans toward the side it was scanned from. The tolerance gives no allowance for 14.6 m of height. Flat to 7.6 mm RMS.",
+        "reading": { "out_of_plumb_mm": 4.1, "over_m": 14.6, "flat_rms_mm": 7.6 },
+        "stations": [3, 4, 5, 6],
+        "live": false
+      }
+    },
+    {
+      "line_id": "1.2", "status": "declined",
+      "reason": "The face never came back into view."
+    },
+    {
+      "line_id": "2.1", "status": "answered", "conformance": "not_applicable",
+      "evidence": {
+        "grade": "measured",
+        "say": "16.2 m, from the ground at its foot to the parapet the scan saw.",
+        "reading": { "height_m": 16.2, "runs_m": 15.4 },
+        "stations": [15, 16, 17, 18],
+        "live": false
+      }
+    },
+    {
+      "line_id": "3.1", "status": "answered", "conformance": "not_applicable",
+      "evidence": {
+        "grade": "measured",
+        "say": "23 places of 0.5 m² or more, 10 mm or deeper.",
+        "reading": { "places": 23 },
+        "live": false
+      }
+    },
+    {
+      "line_id": "4.1", "status": "answered", "conformance": "not_applicable",
+      "evidence": {
+        "grade": "measured",
+        "say": "All 19 stations in one frame. The most any two overlapping stations disagree is 22 mm.",
+        "reading": { "stations": 19, "worst_overlap_mm": 22 },
+        "live": false
+      }
+    },
+    { "line_id": "5.1", "status": "open" },
+    { "line_id": "5.2", "status": "open" },
+    { "line_id": "6.1", "status": "open" }
+  ],
+  "capture_sign_off": null
+}
