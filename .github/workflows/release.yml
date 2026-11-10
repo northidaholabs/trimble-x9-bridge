@@ -2,23 +2,66 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Rebuild some platforms for a tag that is already released, for example
+  # when a runner image is retired mid-release. Other platforms' archives on
+  # the release are left as they are.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build, e.g. v0.16.0"
+        required: true
+      platforms:
+        description: "Which archives to build and attach"
+        type: choice
+        options: [macos, linux, all]
+        default: macos
 permissions:
   contents: write
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          all='[
+            {"target":"x86_64-unknown-linux-gnu","os":"ubuntu-latest","family":"linux"},
+            {"target":"aarch64-unknown-linux-gnu","os":"ubuntu-latest","family":"linux"},
+            {"target":"aarch64-apple-darwin","os":"macos-15","family":"macos"},
+            {"target":"x86_64-apple-darwin","os":"macos-15","family":"macos"}
+          ]'
+          if [ "$EVENT" = workflow_dispatch ]; then
+            tag=$INPUT_TAG
+            case "$tag" in v[0-9]*) ;; *) echo "not a version tag: $tag"; exit 1 ;; esac
+            want=${PLATFORMS:-macos}
+          else
+            tag=$REF_NAME; want=all
+          fi
+          matrix=$(jq -c --arg w "$want" '[.[] | select($w == "all" or .family == $w)]' <<<"$all")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "$tag: $matrix"
   build:
+    needs: plan
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # The Pi and Linux machines.
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest }
-          # Field laptops, for `x9-bridge worker`.
-          - { target: aarch64-apple-darwin, os: macos-14 }
-          - { target: x86_64-apple-darwin, os: macos-14 }
+        # The Pi and Linux machines, and field laptops for `x9-bridge worker`.
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -47,7 +90,7 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }} -p x9-bridge -p x9-mock -p x9-cli
       - name: Package
         run: |
-          d=trimble-x9-bridge-${{ github.ref_name }}-${{ matrix.target }}
+          d=trimble-x9-bridge-$TAG-${{ matrix.target }}
           mkdir -p $d/ops
           cp target/${{ matrix.target }}/release/{x9-bridge,x9-mock,x9} $d/
           cp ops/x9-netctl ops/90-x9-bridge ops/x9-bridge-run ops/x9-bridge.service ops/x9-wifi-prefer ops/x9-wifi-prefer.service ops/x9-wifi-prefer.timer \
@@ -57,6 +100,7 @@ jobs:
           shasum -a 256 $d.tar.gz > $d.tar.gz.sha256
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.plan.outputs.tag }}
           files: |
             trimble-x9-bridge-*.tar.gz
             trimble-x9-bridge-*.tar.gz.sha256
