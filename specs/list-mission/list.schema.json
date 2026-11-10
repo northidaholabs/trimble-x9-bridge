@@ -56,7 +56,7 @@
       }
     },
     "point": {
-      "description": "ITP inspection point. H hold: the line cannot close without this party's release. W witness: the party is told and may attend; the line closes without them. R review: the party reviews the record afterwards. S surveillance: no signature.",
+      "description": "ITP inspection point. H hold: this party's release is owed on the line, and acceptance waits for it. Nothing is locked: the crew can go on and leave, and the record shows the release as owed. W witness: the party is told and may attend; nothing waits for them. R review: the party reviews the record afterwards. S surveillance: no signature.",
       "enum": ["H", "W", "R", "S"]
     },
     "tolerance": {
@@ -112,8 +112,8 @@
           "additionalProperties": { "$ref": "#/$defs/point" }
         },
         "record": { "type": "string", "description": "The ITP's verifying document: what will be kept as proof." },
-        "required": { "type": "boolean", "default": true },
-        "place_hint": { "type": "string", "description": "Where on site, in words. The person binds the line to a place once, on the station's view; the record keeps that binding." },
+        "required": { "type": "boolean", "default": true, "description": "A required line is named when the crew asks whether it is ready to leave, and named in the sign-off if it is left open. It stops nobody." },
+        "place_hint": { "type": "string", "description": "Where on site, in words. A person binds the line to a place on a station's view, and can bind it again; the record keeps who did." },
         "note": { "type": "string" }
       },
       "allOf": [
