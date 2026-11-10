@@ -21,6 +21,8 @@ going past what the bridge said takes one sentence of why.
 python3 specs/list-mission/check.py          # needs the jsonschema package
 ```
 
+CI runs it on every push, as its own job.
+
 ## What is out there
 
 A search on 2026-11-09 found no open, machine-readable standard for a
