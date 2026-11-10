@@ -1823,4 +1823,275 @@ mod tests {
         let h = l.height().unwrap();
         assert!((h - 0.011).abs() < 0.002, "{h}");
     }
+
+    // ------------------------------------------- a synthetic surveyed yard ---
+
+    use crate::export::tests::{scratch, tzf_bytes};
+
+    /// A yard seen from a scanner 1.5 m above its floor: walls at x = -6 and
+    /// 5, y = -4 and 6, up to 3 m above the scanner, no roof; a 2 cm dip
+    /// 1.5 m square at (2, 2) and a 0.5 m high box (a parked thing) at (-3, 3).
+    fn yard(va: f64, ha: f64) -> Option<f64> {
+        let d = [va.sin() * ha.cos(), va.sin() * ha.sin(), va.cos()];
+        let (lo, hi) = ([-6.0, -4.0], [5.0, 6.0]);
+        let wall = (0..2).map(|k| if d[k] > 0.0 { hi[k] / d[k] } else if d[k] < 0.0 { lo[k] / d[k] } else { f64::MAX }).fold(f64::MAX, f64::min);
+        if d[2] >= 0.0 {
+            return (wall * d[2] <= 3.0).then_some(wall);
+        }
+        let over = |t: f64, x: [f64; 2], y: [f64; 2]| (x[0]..=x[1]).contains(&(d[0] * t)) && (y[0]..=y[1]).contains(&(d[1] * t));
+        let top = -1.0 / d[2];
+        if top < wall && over(top, [-3.5, -2.5], [2.5, 3.5]) {
+            return Some(top);
+        }
+        let dip = -1.52 / d[2];
+        if dip < wall && over(dip, [1.25, 2.75], [1.25, 2.75]) {
+            return Some(dip);
+        }
+        Some(wall.min(-1.5 / d[2]))
+    }
+
+    fn yard_scan(cols: usize) -> Vec<u8> {
+        let step = std::f64::consts::TAU / cols as f64;
+        tzf_bytes(((std::f64::consts::PI - 0.45) / step) as usize, cols, 0.4, 0.0, step, yard)
+    }
+
+    fn wall_def(id: &str, from: [f64; 2], to: [f64; 2], kind: &str) -> Wall {
+        Wall { wall_id: id.into(), from, to, length_m: (to[0] - from[0]).hypot(to[1] - from[1]), z_m: [-1.5, 3.0], seen_by: vec![1], kind: kind.into(), flatness: 0.9, height_m: None }
+    }
+
+    /// The east wall's 10 cm points, as a registration merges them.
+    fn east_wall_merged() -> crate::register::Merged {
+        let mut m = crate::register::Merged::default();
+        for iy in 0..=100 {
+            for iz in 0..=43 {
+                m.pts.push([5.0, -4.0 + iy as f32 * 0.1, -1.4 + iz as f32 * 0.1]);
+                m.spacing_mm.push(10.0);
+                m.station.push(1);
+            }
+        }
+        m
+    }
+
+    /// A `register` output for the yard: station 1 (the frame) trusted,
+    /// station 2 not placed; four walls of every kind; a merged cloud; and a
+    /// mission asking whether the east wall is plumb.
+    fn yard_survey(dir: &std::path::Path) -> (String, Vec<String>, String) {
+        let reg = dir.join("reg");
+        std::fs::create_dir_all(&reg).unwrap();
+        let w = |p: &str, v: Value| std::fs::write(reg.join(p), serde_json::to_vec(&v).unwrap()).unwrap();
+        w("poses.json", json!([{"turn_deg": 0.0, "xyz_m": [0.0, 0.0, 0.0]}, null]));
+        w("audit.json", json!([{"verdict": "frame"}, {"verdict": "unplaced"}]));
+        let walls = vec![
+            wall_def("w1", [5.0, -4.0], [5.0, 6.0], "building"),
+            wall_def("w2", [-6.0, 6.0], [5.0, 6.0], "building"),
+            wall_def("w3", [-6.0, -4.0], [-6.0, 6.0], "low wall"),
+            wall_def("w4", [-6.0, -4.0], [5.0, -4.0], "vegetation"),
+        ];
+        w("walls.json", json!(walls));
+        std::fs::write(reg.join("merged.bin"), east_wall_merged().to_bytes()).unwrap();
+        let f1 = dir.join("station_01.tzf");
+        std::fs::write(&f1, yard_scan(1440)).unwrap();
+        let reading = json!({"out_of_plumb_mm": 0.5, "lean_mm_per_m": 0.1, "flat_rms_mm": 0.4, "over_m": 4.2, "stations": [1]});
+        let mission = json!({"mission_id": "m1", "project_id": "p", "goal": "Is the yard's east wall plumb?", "kind": "custom", "done_when": "answered",
+            "state": "active", "created_by": "crew", "created_at": "2026-11-10T10:00:00Z", "targets": [
+                {"target_id": "east", "name": "East wall", "face": {"from": [5.0, -4.0], "to": [5.0, 6.0]},
+                 "question": {"kind": "plumb", "verdict": "answer", "answer": reading, "stations": [1]},
+                 "tolerance": {"words": "1/4 inch in 10 feet", "mm_per_m": 2.0}},
+                {"target_id": "north", "name": "North wall", "status": "declined", "note": "behind a hedge", "face": {"from": [-6.0, 6.0], "to": [5.0, 6.0]},
+                 "question": {"kind": "plumb", "verdict": "does_not_fit", "reason": "rough"}},
+                {"target_id": "gate", "name": "The gate"}]});
+        let m = dir.join("mission.json");
+        std::fs::write(&m, serde_json::to_vec(&mission).unwrap()).unwrap();
+        let files = vec![f1.to_string_lossy().into_owned(), dir.join("station_02.tzf").to_string_lossy().into_owned()];
+        (reg.to_string_lossy().into_owned(), files, m.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn a_surveyed_yard_gets_its_walls_ground_low_spot_sections_and_questions() {
+        let dir = scratch("x9-analyze-yard");
+        let (reg, files, mission) = yard_survey(&dir);
+        let out = dir.join("out").to_string_lossy().into_owned();
+        let mut args: Vec<String> = ["--straightedge", "2", "--tolerance-mm", "5", "--section", "0,0,6,0.5", "--section", "0,-5,0.5,7",
+                                     "--section", "5.5,-3,5.5,5", "--questions", mission.as_str(), reg.as_str(), out.as_str()].iter().map(|s| s.to_string()).collect();
+        args.extend(files);
+        cli(&args).unwrap();
+        for f in ["report.html", "analysis.json", "walls.csv", "low_spots.csv", "plan.dxf", "ground.f32", "ground.json", "ground.png", "flatness.png",
+                  "low_spots.png", "wall-w1.png", "wall-w2.png", "section-1.png", "section-1.csv", "section-3.csv", "question-east.png"] {
+            assert!(std::path::Path::new(&format!("{out}/{f}")).is_file(), "{f} missing");
+        }
+        let a: Value = serde_json::from_slice(&std::fs::read(format!("{out}/analysis.json")).unwrap()).unwrap();
+        let s = &a["summary"];
+        assert_eq!((s["stations_used"].as_u64(), s["frame_station"].as_u64(), s["walls"].as_u64()), (Some(1), Some(1), Some(2)), "{s}");
+        assert!(s["ground_cells"].as_u64().unwrap() > 1000 && s["ground_flatness"]["rms_mm"].is_number(), "{s}");
+        // The wall stands 4.5 m above the floor at its foot.
+        let w1 = &a["walls"][0];
+        assert_eq!(w1["wall_id"], "w1");
+        assert!((w1["top_above_ground_m"].as_f64().unwrap() - 4.5).abs() < 0.1, "{w1}");
+        // The dip holds water: about 2 m², 2 cm deep.
+        let spots = a["low_spots"].as_array().unwrap();
+        assert!(!spots.is_empty(), "{a}");
+        let dip = &spots[0];
+        assert!((dip["at"][0].as_f64().unwrap() - 2.0).abs() < 0.3 && (dip["at"][1].as_f64().unwrap() - 2.0).abs() < 0.3, "{dip}");
+        assert!((dip["max_depth_mm"].as_f64().unwrap() - 20.0).abs() < 4.0, "{dip}");
+        // Sections: the first crosses the east wall, the second the north one, the third runs along a wall.
+        let crossed: Vec<Value> = a["sections"].as_array().unwrap().iter().map(|x| x["walls_crossed"].clone()).collect();
+        assert_eq!(crossed, [json!(["w1"]), json!(["w2"]), json!([])]);
+        // The east wall is plumb, judged again from the final registration; the north one wasn't seen.
+        let q = a["questions"].as_array().unwrap();
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0]["final"]["verdict"], "answer", "{}", q[0]);
+        assert!(q[0]["final"]["answer"]["out_of_plumb_mm"].as_f64().unwrap().abs() < 2.0, "{}", q[0]);
+        assert_eq!(q[1]["final"]["verdict"], "not_yet");
+        assert_eq!(q[1]["declined"], "behind a hedge");
+        // The parked box is not ground.
+        let g = Ground::load(&out).unwrap();
+        assert!(g.at([-3.0, 3.0]).is_none_or(|z| z < -1.3), "{:?}", g.at([-3.0, 3.0]));
+        assert!((g.at([1.0, -1.0]).unwrap() + 1.5).abs() < 0.01);
+        let html = std::fs::read_to_string(format!("{out}/report.html")).unwrap();
+        assert!(html.contains("The questions") && html.contains("Sections") && html.contains("Highest wall top"), "report");
+        let dxf = std::fs::read_to_string(format!("{out}/plan.dxf")).unwrap();
+        for layer in ["WALLS", "LOW_WALLS", "VEGETATION", "STATIONS", "LOW_SPOTS"] {
+            assert!(dxf.contains(&format!("\n8\n{layer}\n")), "{layer}");
+        }
+        assert!(dxf.ends_with("0\nENDSEC\n0\nEOF\n"));
+        let csv = std::fs::read_to_string(format!("{out}/low_spots.csv")).unwrap();
+        assert!(csv.lines().nth(1).is_some_and(|l| l.starts_with("L1,")), "{csv}");
+
+        // A second visit with a heap tipped near the dip: cut and fill between the two.
+        let after = dir.join("after");
+        std::fs::create_dir_all(&after).unwrap();
+        let mut b = g.clone();
+        for y in 0..b.h {
+            for x in 0..b.w {
+                let p = [b.x0 + (x as f64 + 0.5) * b.cell, b.y0 + (y as f64 + 0.5) * b.cell];
+                if (p[0] - 0.0).hypot(p[1] - 2.0) < 0.5 && b.z[y * b.w + x].is_finite() {
+                    b.z[y * b.w + x] += 0.3;
+                }
+            }
+        }
+        std::fs::write(after.join("ground.f32"), b.to_bytes()).unwrap();
+        std::fs::write(after.join("ground.json"), serde_json::to_vec(&b.header()).unwrap()).unwrap();
+        let change = dir.join("change").to_string_lossy().into_owned();
+        cli(&["--compare".into(), "--min-change-m".into(), "0.05".into(), out.clone(), after.to_string_lossy().into_owned(), change.clone()]).unwrap();
+        let c: Value = serde_json::from_slice(&std::fs::read(format!("{change}/change.json")).unwrap()).unwrap();
+        assert!((c["fill_m3"].as_f64().unwrap() - 0.3 * std::f64::consts::PI * 0.25).abs() < 0.03, "{c}");
+        assert_eq!(c["cut_m3"], 0.0);
+        assert!(std::path::Path::new(&format!("{change}/change.png")).is_file());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_command_line_says_how_to_use_it() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        cli(&a(&["--help"])).unwrap();
+        let bads: [&[&str]; 5] = [&[], &["reg"], &["reg", "out"], &["--compare", "a", "b"], &["--straightedge"]];
+        for bad in bads {
+            assert!(cli(&a(bad)).unwrap_err().to_string().contains("usage: x9-bridge analyze"), "{bad:?}");
+        }
+        assert!(cli(&a(&["--section", "1,2,3", "r", "o", "f"])).unwrap_err().to_string().contains("--section x1,y1,x2,y2"));
+        assert!(cli(&a(&["--tolerance-mm", "fine", "r", "o", "f"])).is_err());
+        assert!(cli(&a(&["--section", "1,2,x,4", "r", "o", "f"])).is_err());
+        // A registration folder that isn't one, or files that don't match it.
+        let dir = scratch("x9-analyze-cli");
+        let reg = dir.to_string_lossy().into_owned();
+        let (reg, out, cmp) = (reg.as_str(), format!("{reg}/out"), format!("{reg}/c"));
+        let (out, cmp) = (out.as_str(), cmp.as_str());
+        assert!(format!("{:#}", cli(&a(&[reg, out, "a.tzf"])).unwrap_err()).contains("poses.json"));
+        std::fs::write(dir.join("poses.json"), "[null, null]").unwrap();
+        std::fs::write(dir.join("audit.json"), "[]").unwrap();
+        std::fs::write(dir.join("walls.json"), "[]").unwrap();
+        assert!(cli(&a(&[reg, out, "a.tzf"])).unwrap_err().to_string().contains("2 poses but 1 station files"));
+        // Nothing trusted: an empty report, no ground.
+        cli(&a(&[reg, out, "a.tzf", "b.tzf"])).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(dir.join("out/analysis.json")).unwrap()).unwrap();
+        assert_eq!((v["summary"]["stations_used"].as_u64(), v["summary"]["ground_cells"].clone()), (Some(0), Value::Null));
+        // Comparing needs both height grids, whole.
+        assert!(format!("{:#}", cli(&a(&["--compare", reg, reg, cmp])).unwrap_err()).contains("ground.json"));
+        std::fs::write(dir.join("ground.json"), r#"{"x0": 0, "y0": 0, "cell": 0.1, "w": 3, "h": 2}"#).unwrap();
+        std::fs::write(dir.join("ground.f32"), [0u8; 20]).unwrap();
+        assert!(cli(&a(&["--compare", reg, reg, cmp])).unwrap_err().to_string().contains("is not 3×2"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_station_that_saw_none_of_the_walls_is_not_read() {
+        let w = wall_def("w1", [5.0, -4.0], [5.0, 6.0], "building");
+        let pose = Pose { turn_deg: 0.0, xyz_m: [0.0, 0.0, 0.0] };
+        let fits = measure_faces(&[w], &[(2, pose, "/nonexistent/station_02.tzf".into())], &Opts::default()).unwrap();
+        assert_eq!(fits.len(), 1);
+        assert!(fits[0].result.lean_mm_per_m.is_none() && fits[0].result.covered_pct == 0.0);
+        assert!(!fits[0].png(&Opts::default()).is_empty());
+        // One that did see it, but whose file isn't a scan, is an error.
+        let w = wall_def("w1", [5.0, -4.0], [5.0, 6.0], "building");
+        assert!(measure_faces(&[w], &[(1, pose, "/nonexistent/station_01.tzf".into())], &Opts::default()).is_err());
+    }
+
+    #[test]
+    fn small_helpers_say_what_they_mean() {
+        assert_eq!(said("does_not_fit"), "does not fit");
+        assert_eq!(esc("<a & b>"), "&lt;a &amp; b&gt;");
+        assert_eq!((opt(Some(1.5), " m"), opt(None, " m")), ("1.5 m".to_string(), "–".to_string()));
+        assert_eq!(percentile(&mut Vec::<f64>::new(), 0.5), None);
+        assert_eq!(percentile(&mut [3.0, 1.0, 2.0], 0.5), Some(2.0));
+        assert_eq!(diverging(-5.0), [37, 99, 235]);
+        assert_eq!(diverging(5.0), [220, 38, 38]);
+        assert_eq!(terrain(-1.0), [40, 80, 140]);
+        assert_eq!(terrain(2.0), [240, 235, 225]);
+        assert_eq!((nice_step(0.05), nice_step(3.0), nice_step(500.0)), (0.005, 0.2, 5.0));
+        assert_eq!((r1(1.26), r2(1.256)), (1.3, 1.26));
+        assert!(fit_line(&[(0.0, 0.0), (0.0, 1.0), (0.0, 2.0)]).is_none(), "a vertical line has no slope");
+        assert!(fit_plane(&[(1.0, 1.0, 0.0); 12]).is_none(), "points on one spot fit no plane");
+        assert!(straightedge(&[], 3.0, 0.05).is_empty());
+        // Too few returns, or one stray far below the rest.
+        let mut l = Lowest::new();
+        l.add(0.0);
+        assert_eq!(l.height(), None);
+        for z in [0.0, 0.01, 0.02, 0.0, 0.01, 0.0, 0.01, 0.02, 0.01, -0.5] {
+            l.add(z);
+        }
+        assert!(l.height().unwrap().abs() < 0.02);
+        assert!(Ground::from_cells(&HashMap::new(), 0.1).is_none());
+        // Walls from the ground's foot: a ground with nothing ahead of a wall gives no height.
+        let g = flat_ground(10, 10, 0.0);
+        assert_eq!(g.known(), 100);
+        assert!(g.at([-1.0, 0.0]).is_none() && g.at([0.5, 0.5]) == Some(0.0));
+        assert!(ground_plane(&g).is_some());
+        let sloped = Ground { z: (0..100).map(|i| (i % 10) as f32 * 0.01).collect(), ..g.clone() };
+        let p = ground_plane(&sloped).unwrap();
+        assert!((p[1] - 0.1).abs() < 1e-6, "{p:?}");
+        assert!(ground_flatness(&Ground { z: vec![f32::NAN; 100], ..g.clone() }, &[f32::NAN; 100], None, &Opts::default()).is_null());
+    }
+
+    #[test]
+    fn a_wall_seen_from_its_far_side_is_drawn_mirrored_and_titled_by_its_verdict() {
+        // Station on the wall's other side: its normal flips, and the face is drawn from there.
+        let w = wall_def("w9", [0.0, 0.0], [6.0, 0.0], "building");
+        let mut g = WallGrid::new(&w, &[[3.0, -4.0]]);
+        assert!(g.nrm[1] < 0.0);
+        for iu in 0..300 {
+            for iz in 0..300 {
+                let (u, z) = (iu as f64 * 0.02, -1.5 + iz as f64 * 0.015);
+                g.add([u, -(0.002 * (z + 1.5)), z]);
+            }
+        }
+        g.add([100.0, 0.0, 0.0]);
+        g.add([3.0, 2.0, 0.0]);
+        g.add([3.0, 0.0, -9.0]);
+        let ground = flat_ground(80, 80, -1.5);
+        let ground = Ground { x0: -1.0, y0: -6.0, ..ground };
+        let (r, plane) = measure_wall(&g, Some(&ground), &Opts::default(), "wall-w9.png");
+        assert!(plane.is_some() && r.covered_pct > 90.0, "{r:?}");
+        assert!((r.lean_mm_per_m.unwrap() - 2.0).abs() < 0.2, "{r:?}");
+        assert!((r.top_above_ground_m.unwrap() - 4.5).abs() < 0.1, "{r:?}");
+        assert!(r.straightedge_windows > 0 && r.worst_strip_at_m.is_some());
+        let mut rs = vec![r.clone()];
+        gate_walls(&mut rs);
+        assert_eq!(rs[0].verdict.as_deref(), Some("answer"));
+        assert!(wall_title(&rs[0]).contains("flatness RMS"));
+        let png = wall_png(&g, plane, &rs[0], &Opts::default());
+        assert_eq!(&png[1..4], b"PNG");
+        withhold(&mut rs[0], "not_yet", Some("settling".into()));
+        assert!(wall_title(&rs[0]).ends_with("plumb and flatness: not yet"));
+        assert!(!wall_png(&g, None, &rs[0], &Opts::default()).is_empty());
+    }
 }

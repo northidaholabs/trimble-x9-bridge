@@ -5,7 +5,7 @@ usage: e2e.py <target/release dir>
 Starts the mock and the bridge on spare ports, walks the main flows, and
 prints PASS/FAIL per check. Exit code 1 if anything failed.
 """
-import json, os, re, shutil, subprocess, sys, tempfile, threading, time, uuid, urllib.request, urllib.error
+import json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, uuid, urllib.request, urllib.error
 
 BIN = sys.argv[1]
 MOCK, BRIDGE = "127.0.0.1:34599", "127.0.0.1:8799"
@@ -744,10 +744,20 @@ try:
         out = json.loads(p.stdout) if p.returncode == 0 else {}
         check(f"x9 {args[0]} works against the mock", p.returncode == 0 and out.get(key) is not None, (p.returncode, p.stderr))
 finally:
+    # Ctrl-C, not a kill: both shut down cleanly, so an instrumented build
+    # writes its coverage profile on the way out.
+    # The bridge must stop even with an event stream still open.
     for p in procs:
-        p.terminate()
+        p.send_signal(signal.SIGINT)
     for p in procs:
-        p.wait()
+        try:
+            p.wait(timeout=10)
+            stopped = True
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+            stopped = False
+        check(f"{os.path.basename(p.args[0])} (pid {p.pid}) stops on Ctrl-C", stopped)
     # Each run's data directory holds scans and exports (half a gigabyte with fixtures).
     shutil.rmtree(tmp, ignore_errors=True)
 

@@ -1391,3 +1391,7 @@ async fn cancel_run(State(st): St, h: HeaderMap, Path(id): Path<String>) -> ApiR
     crate::runs::may_steer(&st, &id, &c, "cancel other people's runs")?;
     Ok(Json(crate::runs::cancel(&st, &id)?))
 }
+
+#[cfg(test)]
+#[path = "routes_tests.rs"]
+mod tests;

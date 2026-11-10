@@ -195,6 +195,8 @@ need a person at the kit.
 | `crates/x9-client` | Client for the scanner's HTTP API |
 | `crates/x9-mock` | Scanner simulator: scans with realistic phases, area scans, cancel, failure modes |
 | `crates/x9-cli` | Small CLI over the client |
+| `crates/x9-bridge/ui-tests` | Browser tests for the web UI (Playwright) |
+| `scripts/coverage.sh` | Line coverage of the unit and end-to-end tests |
 | `ops/` | The field-kit build: the bridge service and launcher, the USB-C gadget, NetworkManager profiles, the scanner Wi-Fi preference, and `x9-netctl` for desk machines |
 
 ## Install
@@ -219,14 +221,23 @@ over USB, or `http://192.168.43.1:34567/api/v1` on its Wi-Fi.
 ## Tests
 
 ```bash
-cargo test                                   # rules, grants, aiming, recipes, echo check
+cargo test                                   # unit tests: every route, the job worker, the mock, client and CLI
 python3 crates/x9-bridge/tests/e2e.py target/release
+scripts/coverage.sh                          # both, with line coverage (needs cargo-llvm-cov)
+cd crates/x9-bridge/ui-tests && npm ci && npx playwright test   # the web UI in a browser
 ```
 
-The end-to-end test starts the simulator and the bridge and checks the main
-flows. With `E2E_FIXTURES` pointing at a directory of real scans
-(`dome.tzf`/`.jpg`, `area.tzf`/`.jpg`) it also checks previews, aiming,
-exports and a full recipe run.
+The unit tests run the bridge's router against an in-process simulator
+(`crates/x9-bridge/src/testkit.rs`), with synthetic scan files where a test
+needs points. The end-to-end test starts the simulator and the bridge as
+processes and checks the main flows. With `E2E_FIXTURES` pointing at a
+directory of real scans (`dome.tzf`/`.jpg`, `area.tzf`/`.jpg`) it also checks
+previews, aiming, exports and a full recipe run on them. The browser tests
+drive the web UI against both and report how much of its JavaScript ran
+([`crates/x9-bridge/ui-tests`](crates/x9-bridge/ui-tests/README.md)).
+
+CI runs all of them. The coverage job fails below 90% of lines, and its
+summary lists every file.
 
 ## Agents
 

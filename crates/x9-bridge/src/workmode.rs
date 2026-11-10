@@ -125,14 +125,16 @@ impl Worker {
         let tzf = self.cache.join(format!("{scan_id}.tzf.part"));
         tokio::fs::write(&tzf, r.bytes().await?).await?;
         let t = tzf.clone();
-        let c = tokio::task::spawn_blocking(move || -> anyhow::Result<Cloud> {
+        let decoded = tokio::task::spawn_blocking(move || -> anyhow::Result<Cloud> {
             let f = trimble_tzf::Tzf::open(&t)?;
             let meta = f.scan_meta()?;
             let pts = f.grid_points()?;
             Ok(Cloud::from_grid(&pts, crate::view::step_rad(&meta)))
         })
-        .await??;
+        .await;
+        // The download is only needed to decode: drop it whether or not that worked.
         let _ = tokio::fs::remove_file(&tzf).await;
+        let c = decoded??;
         tokio::fs::write(&path, c.to_bytes()).await?;
         Ok(c)
     }
@@ -195,5 +197,238 @@ impl Worker {
         let trusted = result.audits.iter().filter(|a| a.trusted()).count();
         self.post(&format!("/v1/work/{id}/result"), &serde_json::to_value(&result)?).await?;
         Ok(format!("{placed} of {} placed, {trusted} trusted", numbers.len()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::{Bridge, AGENT, OPERATOR, VIEWER};
+    use crate::worker::tests::{dead_base, junk_fixtures, room_cloud, wait_job, PID, SCAN0};
+
+    /// Serve the bridge's routes on a local port; returns its base URL.
+    async fn serve(b: &Bridge) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let app = crate::routes::router(b.st.clone());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn cache_dir() -> PathBuf {
+        let d = std::env::temp_dir().join(crate::util::new_id("x9-worker-cache"));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn worker(base: &str, token: &str) -> Worker {
+        Worker { http: reqwest::Client::new(), base: base.into(), token: token.into(), name: "laptop".into(), cache: cache_dir(), prepared: HashMap::new(), checks: AuditCache::new() }
+    }
+
+    /// Have the bridge offer the project's registration and claim it.
+    async fn claim_registration(b: &Bridge, w: &Worker) -> (String, Value) {
+        // Seen first, so the bridge offers rather than registers itself.
+        assert!(w.claim().await.unwrap().is_none());
+        let (_, job) = b.call("POST", &format!("/v1/projects/{PID}/registration"), Some(OPERATOR), None).await;
+        let id = job["job_id"].as_str().unwrap().to_string();
+        let t0 = std::time::Instant::now();
+        loop {
+            if let Some(j) = w.claim().await.unwrap() {
+                assert_eq!(j["job_id"], id.as_str());
+                return (id, j);
+            }
+            assert!(t0.elapsed() < Duration::from_secs(5), "never offered");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn log_has(b: &Bridge, needle: &str) -> bool {
+        b.st.inner.lock().unwrap().log.iter().any(|e| e.text.contains(needle))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_worker_registers_a_cached_station_and_the_bridge_records_it() {
+        let b = Bridge::new().await;
+        let w = &mut worker(&serve(&b).await, AGENT);
+        std::fs::write(w.cache.join(crate::worker::cloud_name(SCAN0)), room_cloud([1.0, 0.5, 0.0], 0.0).to_bytes()).unwrap();
+        let (id, job) = claim_registration(&b, w).await;
+        let summary = w.register(&job).await.unwrap();
+        assert_eq!(summary, "1 of 1 placed, 1 trusted");
+        let j = wait_job(&b, &id, 5.0).await;
+        assert_eq!(j["state"], "succeeded", "{j}");
+        assert_eq!(j["result"]["placed"], 1, "{j}");
+        assert!(log_has(&b, "Registration (registered on laptop)"));
+        assert!(b.st.merged(PID).is_some());
+        assert!(w.prepared.contains_key(SCAN0));
+
+        // The next job reuses the prepared station: no cloud is read.
+        std::fs::remove_file(w.cache.join(crate::worker::cloud_name(SCAN0))).unwrap();
+        let (id, job) = claim_registration(&b, w).await;
+        assert_eq!(w.register(&job).await.unwrap(), "1 of 1 placed, 1 trusted");
+        assert_eq!(wait_job(&b, &id, 5.0).await["state"], "succeeded");
+        std::fs::remove_dir_all(&w.cache).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_station_whose_scan_cannot_be_fetched_is_skipped() {
+        // The mock has no scan file to give the bridge.
+        let b = Bridge::new().await;
+        let w = &mut worker(&serve(&b).await, AGENT);
+        // A broken cached cloud is fetched again.
+        std::fs::write(w.cache.join(crate::worker::cloud_name(SCAN0)), b"junk").unwrap();
+        let (id, job) = claim_registration(&b, w).await;
+        assert_eq!(w.register(&job).await.unwrap(), "0 of 0 placed, 0 trusted");
+        let j = wait_job(&b, &id, 5.0).await;
+        assert_eq!(j["state"], "succeeded", "{j}");
+        assert!(log_has(&b, "Station 1 could not be registered: fetching the scan: 502"));
+        std::fs::remove_dir_all(&w.cache).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scan_file_that_does_not_decode_is_skipped_with_the_decoder_error() {
+        let (fx, cfg) = junk_fixtures();
+        let b = Bridge::with_mock(cfg).await;
+        let w = &mut worker(&serve(&b).await, AGENT);
+        let (id, job) = claim_registration(&b, w).await;
+        assert_eq!(w.register(&job).await.unwrap(), "0 of 0 placed, 0 trusted");
+        assert_eq!(wait_job(&b, &id, 5.0).await["state"], "succeeded");
+        assert!(!w.cache.join(crate::worker::cloud_name(SCAN0)).exists());
+        assert!(log_has(&b, "Station 1 could not be registered"));
+        std::fs::remove_dir_all(&w.cache).unwrap();
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scan_file_that_does_not_decode_leaves_no_download_behind() {
+        let (fx, cfg) = junk_fixtures();
+        let b = Bridge::with_mock(cfg).await;
+        let w = &mut worker(&serve(&b).await, AGENT);
+        let (_, job) = claim_registration(&b, w).await;
+        w.register(&job).await.unwrap();
+        let left: Vec<_> = std::fs::read_dir(&w.cache).unwrap().map(|e| e.unwrap().file_name()).collect();
+        std::fs::remove_dir_all(&w.cache).unwrap();
+        std::fs::remove_dir_all(fx).unwrap();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_the_bridge_took_back_cannot_be_delivered() {
+        let b = Bridge::new().await;
+        let w = &mut worker(&serve(&b).await, AGENT);
+        std::fs::write(w.cache.join(crate::worker::cloud_name(SCAN0)), room_cloud([1.0, 0.5, 0.0], 0.0).to_bytes()).unwrap();
+        let (id, job) = claim_registration(&b, w).await;
+        b.call("POST", &format!("/v1/jobs/{id}/cancel"), Some(OPERATOR), None).await;
+        assert_eq!(wait_job(&b, &id, 5.0).await["state"], "cancelled");
+        let e = w.register(&job).await.unwrap_err().to_string();
+        assert!(e.starts_with("uploading merged points: 409"), "{e}");
+        std::fs::remove_dir_all(&w.cache).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_job_without_an_id_or_stations_is_refused() {
+        let mut w = worker("http://127.0.0.1:1", AGENT);
+        assert_eq!(w.register(&json!({})).await.unwrap_err().to_string(), "job_id");
+        assert_eq!(w.register(&json!({"job_id": "job_1"})).await.unwrap_err().to_string(), "stations");
+        std::fs::remove_dir_all(&w.cache).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_request_is_an_error_with_the_bridges_status() {
+        let b = Bridge::new().await;
+        let base = serve(&b).await;
+        let w = worker(&base, VIEWER);
+        let e = w.claim().await.unwrap_err().to_string();
+        assert!(e.starts_with("/v1/work/claim: 403"), "{e}");
+        let w = worker(&base, AGENT);
+        let e = w.post("/v1/work/claim", &json!({"worker": "no spaces"})).await.unwrap_err().to_string();
+        assert!(e.starts_with("/v1/work/claim: 400"), "{e}");
+        // Progress on a job it doesn't hold is dropped quietly.
+        w.progress("job_nope", "matching", Some(0.5)).await;
+        let w = worker(&dead_base().await, AGENT);
+        assert!(w.claim().await.is_err());
+        std::fs::remove_dir_all(&w.cache).unwrap();
+    }
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `run` reads `X9_WORKER_TOKEN` before the token file; with it set these
+    /// tests would talk to the default bridge, so they stand down.
+    fn token_in_env() -> bool {
+        std::env::var("X9_WORKER_TOKEN").is_ok_and(|t| !t.trim().is_empty())
+    }
+
+    #[tokio::test]
+    async fn the_worker_command_refuses_bad_arguments() {
+        let e = run(&args(&["--frobnicate"])).await.unwrap_err().to_string();
+        assert!(e.starts_with("usage: x9-bridge worker"), "{e}");
+        let e = run(&args(&["--name", "laptop", "--bridge"])).await.unwrap_err().to_string();
+        assert_eq!(e, "--bridge needs a value");
+        if token_in_env() {
+            return;
+        }
+        let missing = std::env::temp_dir().join(crate::util::new_id("no-token"));
+        let e = run(&args(&["--token-file", missing.to_str().unwrap()])).await.unwrap_err().to_string();
+        assert!(e.starts_with("reading the token from"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn the_worker_command_cannot_create_its_cache() {
+        if token_in_env() {
+            return;
+        }
+        let dir = cache_dir();
+        std::fs::write(dir.join("token"), format!("{AGENT}\n")).unwrap();
+        std::fs::write(dir.join("file"), b"in the way").unwrap();
+        let cache = dir.join("file/cache");
+        let e = run(&args(&["--bridge", "http://127.0.0.1:1", "--token-file", dir.join("token").to_str().unwrap(), "--cache", cache.to_str().unwrap()])).await;
+        assert!(e.unwrap_err().to_string().starts_with("creating "));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_worker_command_takes_registrations_until_stopped() {
+        if token_in_env() {
+            return;
+        }
+        let b = Bridge::new().await;
+        let base = serve(&b).await;
+        let dir = cache_dir();
+        std::fs::write(dir.join("token"), format!("{AGENT}\n")).unwrap();
+        let a = args(&["--bridge", &format!("{base}/"), "--token-file", dir.join("token").to_str().unwrap(), "--name", "desk-1", "--cache", dir.join("cache").to_str().unwrap()]);
+        let task = tokio::spawn(async move { run(&a).await });
+        b.wait_for("/v1/workers", OPERATOR, 5.0, |v| v[0]["worker"] == "desk-1").await;
+        let (_, job) = b.call("POST", &format!("/v1/projects/{PID}/registration"), Some(OPERATOR), None).await;
+        // It claims within its 2 s poll and delivers (the station is skipped:
+        // the mock has no scan file).
+        let j = wait_job(&b, job["job_id"].as_str().unwrap(), 8.0).await;
+        assert_eq!(j["state"], "succeeded", "{j}");
+        assert!(log_has(&b, "Worker desk-1 took the registration job"));
+        assert!(log_has(&b, "Registration (registered on desk-1)"));
+        assert!(!task.is_finished());
+        task.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_worker_command_keeps_trying_an_unreachable_bridge() {
+        if token_in_env() {
+            return;
+        }
+        let dir = cache_dir();
+        std::fs::write(dir.join("token"), AGENT).unwrap();
+        let a = args(&["--bridge", &dead_base().await.replace("/api/v1", ""), "--token-file", dir.join("token").to_str().unwrap(), "--cache", dir.join("cache").to_str().unwrap()]);
+        let task = tokio::spawn(async move { run(&a).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!task.is_finished());
+        task.abort();
+        assert!(dir.join("cache").is_dir());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_worker_is_named_after_the_computer() {
+        assert!(!hostname().is_empty());
     }
 }

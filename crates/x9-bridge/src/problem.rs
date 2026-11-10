@@ -116,4 +116,43 @@ mod tests {
         let garbled = ApiError::from(X9Error::Json(serde_json::from_str::<u8>("x").unwrap_err()));
         assert_eq!(garbled.code, "scanner_disconnected");
     }
+
+    #[test]
+    fn a_problem_document_carries_its_detail_and_hint_only_when_set() {
+        let bare = ApiError::not_found("scan").to_json();
+        assert_eq!(bare, json!({"type": "https://x9-bridge.local/problems/not_found", "title": "No such scan", "status": 404, "code": "not_found"}));
+        let full = ApiError::disconnected("connection refused").to_json();
+        assert_eq!(full["status"], 503);
+        assert_eq!(full["detail"], "connection refused");
+        assert!(full["hint"].as_str().unwrap().contains("X9"));
+        let hinted = ApiError::invalid("x").hint("try y").to_json();
+        assert_eq!((hinted["code"].as_str(), hinted["hint"].as_str()), (Some("invalid_request"), Some("try y")));
+    }
+
+    #[test]
+    fn each_constructor_has_its_status_and_code() {
+        for (e, status, code) in [
+            (ApiError::unauthorized(), StatusCode::UNAUTHORIZED, "unauthorized"),
+            (ApiError::forbidden("start scans"), StatusCode::FORBIDDEN, "forbidden"),
+            (ApiError::not_found("job"), StatusCode::NOT_FOUND, "not_found"),
+            (ApiError::invalid("bad"), StatusCode::BAD_REQUEST, "invalid_request"),
+            (ApiError::conflict("busy"), StatusCode::CONFLICT, "conflict"),
+            (ApiError::disconnected("gone"), StatusCode::SERVICE_UNAVAILABLE, "scanner_disconnected"),
+            (ApiError::cache("disk full"), StatusCode::INTERNAL_SERVER_ERROR, "cache_error"),
+        ] {
+            assert_eq!((e.status, e.code), (status, code));
+        }
+        assert_eq!(ApiError::forbidden("start scans").title, "Your role can't start scans");
+        assert!(ApiError::cache("disk full").hint.unwrap().contains("BRIDGE_DATA"));
+    }
+
+    #[tokio::test]
+    async fn a_problem_responds_as_problem_json_with_its_status() {
+        let res = ApiError::conflict("the queue is full").into_response();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "application/problem+json");
+        let body = axum::body::to_bytes(res.into_body(), 1 << 16).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!((v["code"].as_str(), v["detail"].as_str()), (Some("conflict"), Some("the queue is full")));
+    }
 }

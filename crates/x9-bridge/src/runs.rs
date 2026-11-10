@@ -672,4 +672,351 @@ mod tests {
         assert!(nw.start_va < 0.7 && nw.start_va + nw.delta_va <= std::f64::consts::PI + 1e-12);
         nw.validate().unwrap();
     }
+
+    // ------------------------------------------------- runs on a bridge ---
+
+    use crate::recipe::RecipeInput;
+    use crate::testkit::{fast_mock, Bridge, OPERATOR};
+
+    /// The mock's project.
+    const PROJECT: &str = "39187455-8278-428c-89ad-8a4835f95be6";
+
+    fn who(name: &str, role: Role) -> Caller {
+        Caller { name: name.into(), role }
+    }
+
+    /// A step the way a recipe file gives one.
+    fn step(v: Value) -> RecipeStep {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// A recipe as given, unchecked (runs take what they are handed).
+    fn recipe(steps: Vec<Value>) -> Recipe {
+        Recipe { recipe_id: "t".into(), title: "Test".into(), version: "1".into(), summary: String::new(),
+                 inputs: vec![RecipeInput { name: "purpose".into(), kind: "choice".into(), choices: vec!["blinds".into(), "trim".into()], prompt: None }],
+                 steps: steps.into_iter().map(step).collect() }
+    }
+
+    fn person(id: &str, needs: &[&str]) -> Value {
+        json!({"id": id, "kind": "person", "instructions": format!("Answer {id}."), "needs": needs})
+    }
+
+    /// Wait (up to `secs`) for the run to satisfy `pred`.
+    async fn until(st: &AppState, run_id: &str, secs: f64, pred: impl Fn(&Run) -> bool) -> Run {
+        let end = std::time::Instant::now() + Duration::from_secs_f64(secs);
+        loop {
+            let r = snapshot(st, run_id).expect("run");
+            if pred(&r) {
+                return r;
+            }
+            if std::time::Instant::now() > end {
+                let log: Vec<String> = st.inner.lock().unwrap().log.iter().rev().take(12).map(|e| e.text.clone()).collect();
+                panic!("run {run_id} stuck: {}\nlog (newest first): {log:#?}", serde_json::to_string(&r).unwrap());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn waiting_at(st: &AppState, run_id: &str, step_id: &str) -> Run {
+        until(st, run_id, 5.0, |r| r.waiting_for.as_deref() == Some("input") && r.current_step_id.as_deref() == Some(step_id)).await
+    }
+
+    async fn finished(st: &AppState, run_id: &str, secs: f64) -> Run {
+        until(st, run_id, secs, |r| r.finished_at.is_some()).await
+    }
+
+    fn logged(st: &AppState, needle: &str) -> bool {
+        st.inner.lock().unwrap().log.iter().any(|e| e.text.contains(needle))
+    }
+
+    /// No scanner needed: a bridge whose scanner never answers.
+    fn offline() -> Bridge {
+        Bridge::on_scanner("http://127.0.0.1:9/api/v1")
+    }
+
+    #[tokio::test]
+    async fn a_run_needs_each_input_and_one_of_its_choices() {
+        let b = offline();
+        let r = recipe(vec![person("p", &["x"])]);
+        let go = |inputs: Value| start(&b.st, who("agent", Role::Agent), r.clone(), PROJECT.into(), inputs);
+        assert_eq!(go(Value::Null).unwrap_err().detail.unwrap(), "input \"purpose\" is required");
+        assert_eq!(go(json!({"purpose": "paint"})).unwrap_err().detail.unwrap(), "input \"purpose\" must be one of: blinds, trim");
+        assert!(go(json!({"purpose": 3})).is_err());
+        let run = go(json!({"purpose": "trim"})).unwrap();
+        assert_eq!((run.state.as_str(), run.steps.len(), run.started_by.as_str()), ("running", 1, "agent"));
+        assert!(logged(&b.st, "Recipe \"Test\" v1 started"));
+        // Who may steer it.
+        assert!(may_steer(&b.st, &run.run_id, &who("agent", Role::Agent), "advance runs").is_ok());
+        assert_eq!(may_steer(&b.st, &run.run_id, &who("other", Role::Agent), "advance runs").unwrap_err().code, "forbidden");
+        assert_eq!(may_steer(&b.st, "run_nope", &who("op", Role::Operator), "advance runs").unwrap_err().code, "not_found");
+        assert_eq!(scans_left(&b.st, "run_nope"), 0);
+        assert!(snapshot(&b.st, "run_nope").is_none());
+        // A run that doesn't exist can't be advanced, proposed to or cancelled.
+        assert_eq!(advance(&b.st, "run_nope", "p", json!({}), true).unwrap_err().code, "not_found");
+        assert_eq!(propose(&b.st, "run_nope", "p", json!({}), None, "agent").unwrap_err().code, "not_found");
+        assert_eq!(cancel(&b.st, "run_nope").unwrap_err().code, "not_found");
+        cancel(&b.st, &run.run_id).unwrap();
+        assert_eq!(finished(&b.st, &run.run_id, 5.0).await.state, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn person_steps_count_confirmations_corrections_and_answers() {
+        let b = offline();
+        let r = recipe(vec![
+            person("box", &["width"]),
+            person("size", &["w", "label"]),
+            person("note", &["text"]),
+            person("agent_only", &["checks"]),
+            json!({"id": "verify", "kind": "check", "of": "agent_only", "expect": ["seen"]}),
+            json!({"id": "log", "kind": "action", "operation": "addLogNote", "arguments": {"text": "Done for {{input.purpose}} in {{project_id}}"}}),
+        ]);
+        let run = start(&b.st, who("agent", Role::Agent), r, PROJECT.into(), json!({"purpose": "blinds"})).unwrap();
+        let id = run.run_id.clone();
+        waiting_at(&b.st, &id, "box").await;
+        // Nothing to advance but the waiting step, with an object holding what it needs.
+        assert_eq!(advance(&b.st, &id, "nope", json!({}), true).unwrap_err().code, "not_found");
+        assert_eq!(advance(&b.st, &id, "size", json!({}), true).unwrap_err().code, "conflict");
+        assert_eq!(advance(&b.st, &id, "box", json!([1]), true).unwrap_err().detail.unwrap(), "input must be an object");
+        assert_eq!(advance(&b.st, &id, "box", json!({"w": 1}), true).unwrap_err().detail.unwrap(), "missing: width");
+        assert_eq!(propose(&b.st, &id, "box", json!({}), None, "agent").unwrap_err().code, "invalid_request");
+        // The agent proposes; a person accepts it (1185 and 1185.0 are one answer).
+        let p = propose(&b.st, &id, "box", json!({"width": 1185}), Some("from the preview".into()), "agent").unwrap();
+        assert_eq!(p.steps[0].proposal.as_ref().unwrap().note.as_deref(), Some("from the preview"));
+        assert!(logged(&b.st, "agent proposed an answer for step \"box\""));
+        advance(&b.st, &id, "box", json!({"width": 1185.0}), true).unwrap();
+        assert!(logged(&b.st, "Step \"box\": agent's proposal accepted"));
+
+        // A person changes a proposal, relayed by the agent from the chat.
+        waiting_at(&b.st, &id, "size").await;
+        propose(&b.st, &id, "size", json!({"w": 10, "label": "left"}), None, "agent").unwrap();
+        advance(&b.st, &id, "size", json!({"w": 12.5, "label": "right", "confirmed_via": "relayed by the agent: it's the right one"}), true).unwrap();
+        assert!(logged(&b.st, "Step \"size\": agent's proposal changed by a person"));
+
+        // A person answers a step nobody proposed for; the agent fills its own.
+        waiting_at(&b.st, &id, "note").await;
+        advance(&b.st, &id, "note", json!({"text": "north side"}), true).unwrap();
+        waiting_at(&b.st, &id, "agent_only").await;
+        advance(&b.st, &id, "agent_only", json!({"checks": [{"name": "seen", "ok": true}]}), false).unwrap();
+
+        let done = finished(&b.st, &id, 5.0).await;
+        assert_eq!(done.state, "succeeded", "{done:?}");
+        assert!(done.current_step_id.is_none() && done.waiting_for.is_none());
+        assert!(done.steps.iter().all(|s| s.state == "done"));
+        assert_eq!(done.steps[0].output.as_ref().unwrap()["proposal_accepted"], true);
+        assert_eq!(done.steps[1].output.as_ref().unwrap()["proposal_accepted"], false);
+        assert_eq!(done.steps[4].output.as_ref().unwrap()["checked"], json!(["seen"]));
+        assert!(done.steps[5].output.as_ref().unwrap()["entry_id"].is_string());
+        let iv = &done.interventions;
+        assert_eq!((iv.total, iv.confirmed, iv.corrected, iv.answered, iv.relayed, iv.approvals), (3, 1, 1, 1, 1, 0));
+        assert_eq!(iv.corrections, vec![
+            json!({"step_id": "size", "field": "w", "proposed": 10, "given": 12.5, "delta": 2.5}),
+            json!({"step_id": "size", "field": "label", "proposed": "left", "given": "right"}),
+        ]);
+        assert!(logged(&b.st, &format!("Done for blinds in {PROJECT}")));
+        assert!(logged(&b.st, &format!("Run {id} succeeded after 3 person interventions (1 confirmation, 1 correction, 1 answer, 1 relayed by the agent)")));
+        // Finished: nothing waits, and cancelling changes nothing.
+        assert_eq!(advance(&b.st, &id, "note", json!({"text": "x"}), true).unwrap_err().code, "conflict");
+        assert_eq!(cancel(&b.st, &id).unwrap().state, "succeeded");
+    }
+
+    /// Runs whose steps can't go on fail with the reason, before reaching a scanner.
+    #[tokio::test]
+    async fn a_step_that_cannot_run_fails_the_run_with_its_reason() {
+        let b = offline();
+        let check = |expect: Value| json!({"id": "verify", "kind": "check", "of": "p", "expect": expect});
+        let action = |op: &str, args: Value| json!({"id": "a", "kind": "action", "operation": op, "arguments": args});
+        let cases: Vec<(Vec<Value>, &str, &str)> = vec![
+            (vec![json!({"id": "x", "kind": "dance"})], "invalid_request", "unknown step kind \"dance\""),
+            (vec![action("rmRf", json!({}))], "invalid_request", "unknown operation \"rmRf\""),
+            (vec![action("addLogNote", json!({"text": " "}))], "invalid_request", "step \"a\": text must be 1–4000 characters"),
+            (vec![action("addLogNote", json!({"text": "{{steps.later.x}}"}))], "invalid_request", "{{steps.later.x}} has no value yet"),
+            (vec![action("startScan", json!({"kind": "sideways", "mode": "STD_L0"}))], "invalid_request", "step \"a\": unknown variant"),
+            (vec![action("exportPoints", json!({"format": "ply"}))], "invalid_request", "exportPoints needs scan_id"),
+            (vec![action("exportPoints", json!({"scan_id": "s", "format": "e57"}))], "invalid_request", "step \"a\": unknown variant"),
+            (vec![action("measureOpening", json!({}))], "invalid_request", "measureOpening needs scan_id"),
+            (vec![action("measureOpening", json!({"scan_id": "s", "window": {"start_ha": "wide"}}))], "invalid_request", "step \"a\""),
+            (vec![action("aimFromPreview", json!({"box": {}}))], "invalid_request", "step \"a\""),
+            (vec![action("startScan", json!({"kind": "full_dome", "mode": "STD_L0"}))], "scanner_disconnected", ""),
+        ];
+        for (steps, code, detail) in cases {
+            let run = start(&b.st, who("crew", Role::Operator), recipe(steps), PROJECT.into(), json!({"purpose": "trim"})).unwrap();
+            let done = finished(&b.st, &run.run_id, 5.0).await;
+            assert_eq!(done.state, "failed");
+            let p = done.problem.as_ref().unwrap();
+            assert_eq!(p["code"], code, "{p}");
+            assert!(p["detail"].as_str().unwrap_or("").contains(detail), "{p}");
+            assert!(done.steps.iter().all(|s| s.state == "failed"), "{done:?}");
+        }
+        // A check names what is missing and what isn't ok.
+        let run = start(&b.st, who("crew", Role::Operator), recipe(vec![person("p", &["checks"]), check(json!(["a", "b", "c"]))]), PROJECT.into(), json!({"purpose": "trim"})).unwrap();
+        waiting_at(&b.st, &run.run_id, "p").await;
+        advance(&b.st, &run.run_id, "p", json!({"checks": [{"name": "a", "ok": true}, {"name": "b", "ok": false, "detail": "3 of 4"}, {"name": "x"}]}), true).unwrap();
+        let done = finished(&b.st, &run.run_id, 5.0).await;
+        let p = done.problem.unwrap();
+        assert_eq!((p["code"].as_str(), p["detail"].as_str()), (Some("check_failed"), Some("b (3 of 4); c (missing)")));
+        assert!(logged(&b.st, &format!("Run {} failed: b (3 of 4); c (missing) (1 person intervention (1 answer))", run.run_id)));
+    }
+
+    /// A close-up of a wall 1.2 m away, 2 × 1.8 m, with a 1.2 × 1.1 m opening
+    /// (glass 12 cm behind), optionally cropped `crop_right` m beyond the
+    /// opening on the scanner's right, and with a box standing 20 cm in front
+    /// of the wall below and left of the opening when `in_front`.
+    fn close_up(crop_right: Option<f64>, in_front: bool) -> Vec<u8> {
+        use crate::export::tests::tzf_bytes;
+        let (n, t) = ([0.6f64, -0.8], [0.8f64, 0.6]);
+        let u_min = crop_right.map_or(-1.0, |c| -0.6 - c);
+        let wall = move |va: f64, ha: f64| -> Option<f64> {
+            let d = [va.sin() * ha.cos(), va.sin() * ha.sin(), va.cos()];
+            let dn = n[0] * d[0] + n[1] * d[1];
+            if dn <= 0.0 {
+                return None;
+            }
+            let at = |dist: f64| {
+                let r = dist / dn;
+                (r, t[0] * d[0] * r + t[1] * d[1] * r, d[2] * r)
+            };
+            let (r, u, z) = at(1.2);
+            if !(u_min..=1.0).contains(&u) || z.abs() > 0.9 {
+                return None;
+            }
+            if in_front && (0.7..0.9).contains(&u) && (-0.85..-0.6).contains(&z) {
+                return Some(at(1.0).0);
+            }
+            Some(if u.abs() < 0.6 && z > -0.5 && z < 0.6 { at(1.32).0 } else { r })
+        };
+        let ha_c = (-0.8f64).atan2(0.6).rem_euclid(std::f64::consts::TAU);
+        let step = 0.0033;
+        tzf_bytes(424, 455, std::f64::consts::FRAC_PI_2 - 0.7, ha_c - 0.75, step, wall)
+    }
+
+    /// The scanner's fixtures: a full dome of a walled yard and the close-up.
+    fn fixtures(crop_right: Option<f64>) -> std::path::PathBuf {
+        use crate::export::tests::{grey_jpeg, room_dome, scratch};
+        let dir = scratch("x9-run-fixtures");
+        std::fs::write(dir.join("dome.tzf"), room_dome(720, [-6.0, -4.0, -1.5], [5.0, 6.0, 3.0])).unwrap();
+        std::fs::write(dir.join("area.tzf"), close_up(crop_right, true)).unwrap();
+        for f in ["dome.jpg", "area.jpg"] {
+            std::fs::write(dir.join(f), grey_jpeg()).unwrap();
+        }
+        dir
+    }
+
+    async fn bridge_with(fixtures: &std::path::Path) -> Bridge {
+        let b = Bridge::with_mock(x9_mock::Config { fixtures: Some(fixtures.to_string_lossy().into_owned()), ..fast_mock() }).await;
+        b.start_worker();
+        b
+    }
+
+    /// The window-measurement recipe from end to end on the mock: the agent
+    /// runs it, a person approves the first scan for the whole run and
+    /// confirms the opening the bridge measured.
+    #[tokio::test]
+    async fn the_window_recipe_runs_with_one_approval_and_one_confirmation() {
+        let fx = fixtures(None);
+        let b = bridge_with(&fx).await;
+        let r = Recipe::parse(include_str!("../tests/recipes/window-measurement.toml")).unwrap();
+        let run = start(&b.st, who("agent", Role::Agent), r, PROJECT.into(), json!({"purpose": "blinds"})).unwrap();
+        let id = run.run_id.clone();
+        assert_eq!(scans_left(&b.st, &id), 3, "overview, close-up and one rescan");
+        let w = until(&b.st, &id, 10.0, |r| r.waiting_for.as_deref() == Some("approval")).await;
+        let job = w.steps[0].job_id.clone().unwrap();
+        let (code, body) = b.call("POST", &format!("/v1/jobs/{job}/approve"), Some(OPERATOR), Some(json!({"run": true}))).await;
+        assert!(code.is_success(), "{body}");
+        waiting_at(&b.st, &id, "box").await;
+        advance(&b.st, &id, "box", json!({"box": {"x0": 3, "y0": 2, "x1": 6, "y1": 5}}), false).unwrap();
+        waiting_at(&b.st, &id, "confirm").await;
+        let r = snapshot(&b.st, &id).unwrap();
+        let measured = r.steps[6].output.clone().unwrap();
+        assert_eq!(measured["site_check"]["rescans"], 0);
+        assert!((measured["opening_width_mm"].as_f64().unwrap() - 1200.0).abs() < 15.0, "{measured}");
+        let proposal = r.steps[8].proposal.clone().expect("the bridge proposes the measured size");
+        assert_eq!(proposal.by, "bridge");
+        assert!(proposal.note.unwrap().starts_with("Measured by the bridge from step \"measure\""));
+        assert_eq!(r.authorized_by.len(), 1, "the close-up ran under the run's grant: {:?}", r.authorized_by);
+        assert_eq!(r.authorized_by[0]["granted_by"], "crew");
+        advance(&b.st, &id, "confirm", proposal.input.clone(), true).unwrap();
+        let done = finished(&b.st, &id, 10.0).await;
+        assert_eq!(done.state, "succeeded", "{done:?}");
+        assert_eq!((done.interventions.approvals, done.interventions.confirmed, done.interventions.total), (1, 1, 2));
+        assert!(done.steps[2].output.as_ref().unwrap()["window"]["delta_ha"].as_f64().unwrap() > 0.0);
+        assert!(done.steps[4].output.as_ref().unwrap()["checks"].as_array().unwrap().iter().all(|c| c["ok"] == true));
+        assert!(logged(&b.st, "scans under a grant from crew"));
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    /// A close-up short of wall on one side is rescanned wider, once, under the run.
+    #[tokio::test]
+    async fn a_close_up_short_of_wall_is_rescanned_wider_once() {
+        let fx = fixtures(Some(0.01));
+        let b = bridge_with(&fx).await;
+        let win = json!({"start_ha": 4.6, "delta_ha": 1.5, "start_va": 0.87, "delta_va": 1.4});
+        let r = recipe(vec![
+            json!({"id": "closeup", "kind": "action", "operation": "startScan", "arguments": {"kind": "area", "mode": "STD_L2", "window": win}}),
+            json!({"id": "measure", "kind": "action", "operation": "measureOpening", "arguments": {"scan_id": "{{steps.closeup.scan_id}}", "window": win, "rescans": 1}}),
+        ]);
+        let run = start(&b.st, who("crew", Role::Operator), r, PROJECT.into(), json!({"purpose": "trim"})).unwrap();
+        let done = finished(&b.st, &run.run_id, 20.0).await;
+        assert_eq!(done.state, "succeeded", "{done:?}");
+        let sc = &done.steps[1].output.as_ref().unwrap()["site_check"];
+        assert_eq!((sc["rescans"].as_u64(), sc["ok"].as_bool()), (Some(1), Some(false)), "{sc}");
+        assert_eq!(sc["attempts"][0]["short_sides"], json!(["right"]));
+        assert_ne!(sc["attempts"][0]["scan_id"], sc["attempts"][1]["scan_id"]);
+        assert!(logged(&b.st, "Site check: not enough wall at the right of the opening"));
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    /// A job that fails fails its run; cancelling a run cancels the job it waits on.
+    #[tokio::test]
+    async fn a_failed_job_fails_the_run_and_a_cancel_stops_its_job() {
+        let b = Bridge::new().await;
+        b.start_worker();
+        let scan = json!({"id": "overview", "kind": "action", "operation": "startScan", "arguments": {"kind": "full_dome", "mode": "STD_L0"}});
+        let export = json!({"id": "export", "kind": "action", "operation": "exportPoints", "arguments": {"scan_id": "{{steps.overview.scan_id}}", "format": "ply"}});
+        // No scan files on this scanner: the export fails.
+        let run = start(&b.st, who("crew", Role::Operator), recipe(vec![scan.clone(), export]), PROJECT.into(), json!({"purpose": "trim"})).unwrap();
+        let done = finished(&b.st, &run.run_id, 10.0).await;
+        assert_eq!(done.state, "failed");
+        assert_eq!(done.steps[0].state, "done");
+        assert!(done.problem.unwrap()["detail"].as_str().unwrap().contains("failed"));
+        // The agent's scan waits for approval; cancelling the run cancels it.
+        let run = start(&b.st, who("agent", Role::Agent), recipe(vec![scan]), PROJECT.into(), json!({"purpose": "trim"})).unwrap();
+        let w = until(&b.st, &run.run_id, 5.0, |r| r.waiting_for.as_deref() == Some("approval")).await;
+        assert_eq!(w.state, "waiting_for_person");
+        let job = w.steps[0].job_id.clone().unwrap();
+        cancel(&b.st, &run.run_id).unwrap();
+        let done = finished(&b.st, &run.run_id, 5.0).await;
+        assert_eq!(done.state, "cancelled");
+        assert_eq!(done.steps[0].state, "skipped");
+        let (_, j) = b.call("GET", &format!("/v1/jobs/{job}"), Some(OPERATOR), None).await;
+        assert_eq!(j["state"], "cancelled");
+    }
+
+    #[test]
+    fn widen_keeps_a_window_on_the_sphere_near_the_poles() {
+        use crate::model::Window;
+        let w = Window { start_ha: 6.2, delta_ha: 6.0, start_va: 0.02, delta_va: 3.1 };
+        let (nw, a) = widen(w, &["right".into(), "bottom".into()], 0.1);
+        assert!((a - (0.15f64 / 0.3).atan()).abs() < 1e-12, "a close wall counts as 0.3 m away");
+        assert_eq!(nw.delta_ha, std::f64::consts::TAU);
+        assert_eq!((nw.start_va, nw.start_va + nw.delta_va), (0.0, std::f64::consts::PI));
+        let (same, _) = widen(w, &[], 2.0);
+        assert_eq!(same, w);
+    }
+
+    /// Found while building the run fixtures: with nothing in front of the
+    /// wall and little range noise, the wall's points all fall in the first
+    /// 5 mm bin of `measure::opening`'s depth histogram, which its search for
+    /// the frontmost surface skips (`1..nb`), so the glass 12 cm behind is
+    /// taken for the wall face and no opening is found.
+    #[test]
+    fn a_close_up_with_nothing_in_front_of_the_wall_measures_its_opening() {
+        let t = trimble_tzf::Tzf::from_bytes(close_up(None, false)).unwrap();
+        let pts: Vec<[f64; 3]> = t.grid_points().unwrap().iter().map(|g| [g.point.x as f64, g.point.y as f64, g.point.z as f64]).collect();
+        // The same scene with a box in front of the wall measures fine.
+        let t2 = trimble_tzf::Tzf::from_bytes(close_up(None, true)).unwrap();
+        let with_box: Vec<[f64; 3]> = t2.grid_points().unwrap().iter().map(|g| [g.point.x as f64, g.point.y as f64, g.point.z as f64]).collect();
+        assert!((crate::measure::opening(&with_box).unwrap().width_m - 1.2).abs() < 0.015);
+        let o = crate::measure::opening(&pts).expect("the opening");
+        assert!((o.width_m - 1.2).abs() < 0.015 && (o.height_m - 1.1).abs() < 0.015, "{} × {}", o.width_m, o.height_m);
+    }
 }

@@ -1161,4 +1161,218 @@ mod tests {
         lost.again_reading = None;
         assert!(questions_html(&[lost]).contains("no longer"));
     }
+
+    // ------------------------------------- asking a synthetic yard's wall ---
+
+    use crate::export::tests::{room_dome, scratch};
+    use crate::register::{Registration, StationPose, Wall};
+
+    const SCAN: &str = "5b5314cf-76b8-4f59-a445-ceee1e6df4c3";
+    const PROJECT: &str = "39187455-8278-428c-89ad-8a4835f95be6";
+
+    fn yard_dome() -> Vec<u8> {
+        room_dome(960, [-6.0, -4.0, -1.5], [5.0, 6.0, 3.0])
+    }
+
+    fn east() -> Face {
+        Face { from: [5.0, -4.0], to: [5.0, 6.0] }
+    }
+
+    /// The east wall's 10 cm points as station 1 saw them.
+    fn east_merged() -> Merged {
+        let mut m = Merged::default();
+        for iy in 0..=100 {
+            for iz in 0..=43 {
+                m.pts.push([5.0, -4.0 + iy as f32 * 0.1, -1.4 + iz as f32 * 0.1]);
+                m.spacing_mm.push(10.0);
+                m.station.push(1);
+            }
+        }
+        m
+    }
+
+    fn east_wall() -> Wall {
+        face_wall("w1", &Face { from: [5.0, -6.0], to: [5.0, 6.0] }, [-1.5, 3.0], vec![1])
+    }
+
+    fn identity() -> Pose {
+        Pose { turn_deg: 0.0, xyz_m: [0.0, 0.0, 0.0] }
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_command_line_settles_then_answers_like_the_bridge() {
+        let dir = scratch("x9-ask-cli");
+        let station = dir.join("station_01.tzf");
+        std::fs::write(&station, yard_dome()).unwrap();
+        std::fs::write(dir.join("merged.bin"), east_merged().to_bytes()).unwrap();
+        std::fs::write(dir.join("stations.json"), serde_json::to_vec(&json!([
+            {"station": 1, "trusted": true, "pose": identity(), "file": station},
+            {"station": 2, "trusted": false, "pose": identity(), "file": "/nonexistent/station_02.tzf"}])).unwrap()).unwrap();
+        std::fs::write(dir.join("walls.json"), serde_json::to_vec(&json!({"walls": [east_wall()]})).unwrap()).unwrap();
+        let p = |n: &str| dir.join(n).to_string_lossy().into_owned();
+        let (reg, state, png) = (p(""), p("state.json"), p("east.png"));
+        let ask = |extra: &[&str]| {
+            let mut a = strs(&["--state", state.as_str(), "--png", png.as_str(), "--id", "east"]);
+            a.extend(strs(extra));
+            a.extend(strs(&[reg.as_str(), "5,-4,5,6"]));
+            cli(&a).unwrap();
+            let k: Kept = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+            k
+        };
+        // First pass: a fit that passes waits for a second look.
+        let k = ask(&[]);
+        let q = k.question.unwrap();
+        assert_eq!((q.verdict, q.reason.as_str(), q.asked), (Some(Verdict::NotYet), "settling", true));
+        let settling = k.settling.expect("the reading waits");
+        assert!(settling.out_of_plumb_mm.abs() < 2.0 && settling.flat_rms_mm < 2.0, "{settling:?}");
+        assert_eq!(&std::fs::read(&png).unwrap()[1..4], b"PNG", "the face as fitted so far");
+        // Seen again by the same station: still settling.
+        assert_eq!(ask(&[]).question.unwrap().reason, "settling");
+        // As if a new station saw it too: the reading holds, and it is the answer.
+        let mut k: Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+        k["settling"]["stations"] = json!([]);
+        std::fs::write(&state, serde_json::to_vec(&k).unwrap()).unwrap();
+        let k = ask(&[]);
+        assert_eq!(k.question.as_ref().unwrap().verdict, Some(Verdict::Answer));
+        assert!(k.settling.is_none());
+        assert_eq!(&std::fs::read(&png).unwrap()[1..4], b"PNG");
+        // The answer stands while nothing new sees the face; --reference judges it alone.
+        assert_eq!(ask(&[]).question.unwrap().verdict, Some(Verdict::Answer));
+        cli(&strs(&["--reference", reg.as_str(), "5,-4,5,6"])).unwrap();
+        let reg = reg.as_str();
+        // What the command refuses.
+        cli(&strs(&["-h"])).unwrap();
+        let err = |v: &[&str]| format!("{:#}", cli(&strs(v)).unwrap_err());
+        assert!(err(&[reg]).starts_with("usage: x9-bridge ask"));
+        assert!(err(&["--state"]).starts_with("usage: x9-bridge ask"));
+        assert!(err(&[reg, "5,-4,5"]).starts_with("usage: x9-bridge ask"));
+        assert!(err(&[reg, "5,-4,5,north"]).starts_with("usage: x9-bridge ask"));
+        assert!(err(&[reg, "5,0,5,0.1"]).contains("shorter than 20 cm"));
+        assert!(err(&["/nonexistent", "5,-4,5,6"]).contains("stations.json: run `x9-bridge register` again"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn target(id: &str, face: Option<Face>, question: bool) -> Value {
+        let mut t = json!({"target_id": id, "name": format!("Target {id}")});
+        if let Some(f) = face {
+            t["face"] = json!(f);
+        }
+        if question {
+            t["question"] = json!({"kind": "plumb"});
+            t["tolerance"] = json!({"words": "10 mm over the height", "mm_per_m": 2.0, "max_mm": 10.0});
+        }
+        t
+    }
+
+    /// A bridge on the mock whose one scan is a full dome of the yard, with
+    /// that scan registered as station 1 and a mission asking about walls.
+    async fn yard_bridge() -> (crate::testkit::Bridge, std::path::PathBuf) {
+        let fx = scratch("x9-ask-fixtures");
+        std::fs::write(fx.join("dome.tzf"), yard_dome()).unwrap();
+        std::fs::write(fx.join("dome.jpg"), crate::export::tests::grey_jpeg()).unwrap();
+        let b = crate::testkit::Bridge::with_mock(x9_mock::Config { fixtures: Some(fx.to_string_lossy().into_owned()), ..crate::testkit::fast_mock() }).await;
+        let mission: crate::mission::Mission = serde_json::from_value(json!({
+            "mission_id": "m1", "project_id": PROJECT, "goal": "Is the east wall plumb?", "kind": "custom", "done_when": "answered",
+            "state": "active", "created_by": "crew", "created_at": "2026-11-10T10:00:00Z", "targets": [
+                target("east", Some(east()), true),
+                target("longer", Some(Face { from: [5.0, -4.0], to: [5.0, 16.0] }), true),
+                target("tiny", Some(Face { from: [5.0, 0.0], to: [5.0, 0.1] }), true),
+                target("no-question", Some(east()), false),
+                target("no-face", None, true),
+            ]})).unwrap();
+        let reg = Registration { project_id: PROJECT.into(), frame_scan_id: Some(SCAN.into()),
+                                 stations: vec![StationPose { scan_id: SCAN.into(), station: 1, pose: Some(identity()), audit: None }],
+                                 pairs: vec![], walls: vec![east_wall()], summary: String::new(), updated_at: String::new() };
+        {
+            let mut inner = b.st.inner.lock().unwrap();
+            inner.missions.insert(PROJECT.into(), mission);
+            inner.registrations.insert(PROJECT.into(), reg);
+            inner.merged.insert(PROJECT.into(), std::sync::Arc::new(east_merged()));
+        }
+        (b, fx)
+    }
+
+    #[tokio::test]
+    async fn on_the_bridge_a_question_settles_then_answers_with_evidence() {
+        let (b, fx) = yard_bridge().await;
+        let st = &b.st;
+        let first = on_bridge(st, PROJECT, "east", "agent").await.unwrap();
+        assert_eq!((first["verdict"].as_str(), first["reason"].as_str()), (Some("not_yet"), Some("settling")), "{first}");
+        assert!(first.get("evidence_url").is_none() && first.get("unseen").is_none());
+        assert_eq!(first["face"]["length_m"], 10.0);
+        assert_eq!(first["face"]["runs_on"]["past_from_m"], 2.0, "the detected wall runs 2 m past the face's start");
+        assert_eq!(first["tolerance"]["max_mm"], 10.0);
+        // As if a new station had seen it: the kept reading confirms the answer.
+        {
+            let mut inner = st.inner.lock().unwrap();
+            let kept = inner.settling.get_mut(&(PROJECT.to_string(), "east".to_string())).expect("kept while settling");
+            kept.1.stations.clear();
+        }
+        let answer = on_bridge(st, PROJECT, "east", "bridge").await.unwrap();
+        assert_eq!(answer["verdict"], "answer", "{answer}");
+        assert_eq!(answer["answer"]["within"], true, "{answer}");
+        assert_eq!(answer["evidence_url"], format!("/v1/projects/{PROJECT}/mission/targets/east/ask/image"));
+        {
+            let inner = st.inner.lock().unwrap();
+            assert!(inner.evidence.contains_key(&(PROJECT.to_string(), "east".to_string())));
+            let t = &inner.missions[PROJECT].targets[0];
+            assert_eq!(t.question.as_ref().unwrap().verdict, Some(Verdict::Answer));
+            assert!(t.question.as_ref().unwrap().asked, "the agent asked it first");
+        }
+        assert!(st.inner.lock().unwrap().log.iter().any(|e| e.text.starts_with("Re-checked Target east (plumb): answer:")));
+
+        // Half of a longer face is unseen: where, and the preview columns that frame it from station 1.
+        let half = on_bridge(st, PROJECT, "longer", "agent").await.unwrap();
+        assert_eq!(half["verdict"], "not_yet");
+        let gap = &half["unseen"][0];
+        assert_eq!(gap["subject"]["scan_id"], SCAN, "{half}");
+        assert_eq!(gap["subject"]["station"], 1);
+        assert!(gap["subject"]["x0"].as_u64().unwrap() < 16 && gap["subject"]["query"].is_string());
+
+        // What can't be asked.
+        for (project, target, code, detail) in [
+            ("nope", "east", "not_found", ""), (PROJECT, "nope", "not_found", ""),
+            (PROJECT, "no-question", "invalid_request", "asks no question"), (PROJECT, "no-face", "invalid_request", "has no wall face"),
+            (PROJECT, "tiny", "invalid_request", "shorter than 20 cm"),
+        ] {
+            let e = on_bridge(st, project, target, "agent").await.unwrap_err();
+            assert_eq!(e.code, code, "{target}");
+            assert!(e.detail.unwrap_or_default().contains(detail), "{target}");
+        }
+        // After a registration every question target is judged again; one that can't be is logged.
+        assert!(recheck(st, PROJECT).await >= 0.0);
+        let log: Vec<String> = st.inner.lock().unwrap().log.iter().map(|e| e.text.clone()).collect();
+        assert!(log.iter().any(|t| t.starts_with("Could not re-check target tiny: target tiny: the face is shorter than 20 cm")), "{log:#?}");
+        assert!(log.iter().any(|t| t.starts_with("Re-checked 3 questions after the registration")), "{log:#?}");
+        assert_eq!(recheck(st, "elsewhere").await, 0.0);
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    #[test]
+    fn a_face_with_no_files_gets_coverage_but_no_fit() {
+        let cov = json!({"seen_share": 0.9, "length_m": 10.0, "stations": [{"station": 1}], "height_m": [-1.0, 2.0]});
+        // Files for other stations only: nothing is read, and there is no reading.
+        let (c, fit) = look("east", &east(), &cov, &[(2, identity(), "/nonexistent".into())], &Opts::default()).unwrap();
+        assert_eq!((c.stations.clone(), c.seen_share), (vec![1], 0.9));
+        assert!(c.fit.is_none() && fit.is_some_and(|f| f.result.out_of_plumb_mm.is_none()));
+        // Too short, under-seen or with no heights: not fitted at all.
+        for cov in [json!({"seen_share": 0.9, "length_m": 3.0, "height_m": [0.0, 2.0]}), json!({"seen_share": 0.5, "length_m": 10.0, "height_m": [0.0, 2.0]}),
+                    json!({"seen_share": 0.9, "length_m": 10.0, "height_m": [null, null]}), json!({"seen_share": 0.9, "length_m": 10.0, "height_m": [2.0, 2.0]})] {
+            assert!(look("east", &east(), &cov, &[], &Opts::default()).unwrap().1.is_none(), "{cov}");
+        }
+        assert!(column_azimuths(std::path::Path::new("/nonexistent.tzf")).is_none());
+    }
+
+    #[test]
+    fn inches_round_to_sixteenths_in_lowest_terms() {
+        assert_eq!(inches(0.0), "0 in");
+        assert_eq!(inches(25.4), "1 in");
+        assert_eq!(inches(-12.7), "1/2 in");
+        assert_eq!(inches(30.1625), "1 3/16 in");
+        assert_eq!(inches(1.5875), "1/16 in");
+    }
 }

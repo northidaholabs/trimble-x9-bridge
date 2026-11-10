@@ -7,6 +7,6 @@ description = "Mock X9 scanner API: serves /api/v1 with canned responses for off
 
 [dependencies]
 axum = "0.7"
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal", "net"] }
 serde_json = { workspace = true }
 uuid = { version = "1", features = ["v4"] }

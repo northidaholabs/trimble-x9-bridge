@@ -487,6 +487,7 @@ fn fingerprint(files: &[String]) -> anyhow::Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn pose(deg: f64, x: f64, y: f64) -> Option<Pose> {
         Some(Pose { turn_deg: deg, xyz_m: [x, y, 0.0] })
@@ -535,5 +536,112 @@ mod tests {
         assert_eq!(s, Score { stations: 5, wrong_accepts: 1, wrong_rejects: 1, unplaced: 1, trusted_right: 1, no_reference: 0 });
         // A small turn error alone also makes a placement wrong.
         assert_eq!(score(&[true], &[true], &[Some((1.0, 0.5))]).wrong_accepts, 1);
+    }
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_command_line_refuses_what_it_cannot_run() {
+        cli(&args(&["--help"])).unwrap();
+        let err = |v: &[&str]| format!("{:#}", cli(&args(v)).unwrap_err());
+        assert!(err(&[]).contains("need at least two stations"));
+        assert!(err(&["one.tzf"]).contains("need at least two stations"));
+        assert!(err(&["--orders"]).starts_with("usage: x9-bridge bench"));
+        assert!(err(&["--orders", "many", "a", "b"]).contains("invalid digit"));
+        assert!(err(&["--threads", "-1", "a", "b"]).contains("invalid digit"));
+        assert!(err(&["--plant", "3", "a", "b"]).contains("--plant N:dx,dy,deg"));
+        assert!(err(&["--plant", "3:0.1,0", "a", "b"]).contains("--plant N:dx,dy,deg"));
+        assert!(err(&["--plant", "3:x,0,0", "a", "b"]).contains("invalid float"));
+        assert!(err(&["--truth", "/nonexistent/poses.json", "a", "b"]).contains("reading /nonexistent/poses.json"));
+        // Files that don't exist, or aren't scans.
+        assert!(err(&["/nonexistent/1.tzf", "/nonexistent/2.tzf"]).contains("No such file"));
+        let dir = crate::export::tests::scratch("x9-bench-junk");
+        for f in ["station_02.tzf", "station_01.tzf", "notes.txt"] {
+            std::fs::write(dir.join(f), b"not a scan").unwrap();
+        }
+        let e = err(&[dir.to_str().unwrap(), "--label", "x", "--json", "/nonexistent/out.json", "--scoreboard", "/nonexistent/b", "--no-plants", "--write-reference", "/nonexistent/r"]);
+        assert!(e.contains("opening") && e.contains("station_01.tzf"), "{e}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stations_are_numbered_from_their_file_names_else_by_order() {
+        assert_eq!(station_number(0, "/s/station_07.tzf"), 7);
+        assert_eq!(station_number(4, "/s/12.tzf"), 12);
+        assert_eq!(station_number(2, "/s/north.tzf"), 3);
+        assert_eq!(station_number(0, ""), 1);
+    }
+
+    #[test]
+    fn a_fingerprint_changes_with_names_and_sizes_only() {
+        let dir = crate::export::tests::scratch("x9-bench-fp");
+        let survey = dir.join("yard");
+        std::fs::create_dir_all(&survey).unwrap();
+        let f = |n: &str, len: usize| {
+            let p = survey.join(n);
+            std::fs::write(&p, vec![7u8; len]).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let files = vec![f("1.tzf", 10), f("2.tzf", 20)];
+        let a = fingerprint(&files).unwrap();
+        assert_eq!((a["name"].as_str(), a["stations"].as_u64(), a["bytes"].as_u64()), (Some("yard"), Some(2), Some(30)));
+        std::fs::write(&files[1], vec![9u8; 20]).unwrap();
+        assert_eq!(fingerprint(&files).unwrap()["hash"], a["hash"], "contents don't count");
+        std::fs::write(&files[1], vec![9u8; 21]).unwrap();
+        assert_ne!(fingerprint(&files).unwrap()["hash"], a["hash"]);
+        assert!(fingerprint(&["/nonexistent/1.tzf".to_string()]).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn small_helpers_compose_invert_wrap_and_take_medians() {
+        let a = [0.7, 1.0, -2.0, 0.5];
+        let back = compose(a, invert(a));
+        assert!(back.iter().all(|v| v.abs() < 1e-12), "{back:?}");
+        assert_eq!(wrap_deg(190.0), -170.0);
+        assert_eq!(wrap_deg(-190.0), 170.0);
+        assert_eq!(median(&mut Vec::new()), None);
+        assert_eq!(median(&mut [5.0, 1.0, 3.0, 9.0]), Some(5.0));
+        // No station with both a pose and a reference: nothing to compare.
+        assert_eq!(errors(&[None, pose(0.0, 1.0, 0.0)], &[pose(0.0, 0.0, 0.0), None, pose(0.0, 0.0, 0.0)]), vec![None, None]);
+        assert_eq!(orders(3, 2).iter().map(|o| o.1.clone()).collect::<Vec<_>>(), vec![vec![0, 1, 2], vec![2, 1, 0]]);
+    }
+
+    /// The bench on two synthetic stations of one walled yard, a metre
+    /// apart: the given order only (so its own solve is the reference), a
+    /// plant on a station that doesn't exist, every output written; then
+    /// again against the reference it wrote.
+    #[test]
+    fn the_bench_scores_a_small_survey_and_writes_its_reports() {
+        use crate::export::tests::{room_dome, scratch};
+        let dir = scratch("x9-bench-run");
+        let survey = dir.join("yard");
+        std::fs::create_dir_all(&survey).unwrap();
+        std::fs::write(survey.join("station_01.tzf"), room_dome(720, [-6.0, -4.0, -1.5], [5.0, 6.0, 3.0])).unwrap();
+        std::fs::write(survey.join("station_02.tzf"), room_dome(720, [-7.0, -4.5, -1.5], [4.0, 5.5, 3.0])).unwrap();
+        let p = |n: &str| dir.join(n).to_string_lossy().into_owned();
+        let (json_out, board, reference) = (p("bench.json"), p("scores.jsonl"), p("reference.json"));
+        let survey = survey.to_string_lossy().into_owned();
+        cli(&args(&["--orders", "1", "--threads", "2", "--plant", "9:0.1,0,0", "--label", "synthetic", "--json", &json_out,
+                    "--scoreboard", &board, "--write-reference", &reference, &survey])).unwrap();
+        let r: Value = serde_json::from_slice(&std::fs::read(&json_out).unwrap()).unwrap();
+        assert_eq!(r["label"], "synthetic");
+        assert_eq!(r["survey"]["stations"], 2);
+        assert_eq!(r["reference"], "own solve, given order");
+        assert_eq!(r["summary"]["pass"], true);
+        assert_eq!(r["summary"]["plants"], 0, "no station 9 to plant on");
+        assert_eq!(r["orders"].as_array().unwrap().len(), 1);
+        assert_eq!(r["orders"][0]["sequence"], json!(["1", "2"]));
+        let poses: Vec<Option<Pose>> = serde_json::from_slice(&std::fs::read(&reference).unwrap()).unwrap();
+        assert_eq!(poses.len(), 2);
+        // Against the written reference, with a plant on each station; the scoreboard grows a line a run.
+        cli(&args(&["--orders", "1", "--truth", &reference, "--no-plants", "--scoreboard", &board, &survey])).unwrap();
+        let lines = std::fs::read_to_string(&board).unwrap();
+        assert_eq!(lines.lines().count(), 2);
+        let last: Value = serde_json::from_str(lines.lines().last().unwrap()).unwrap();
+        assert_eq!(last["reference"], reference.as_str());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

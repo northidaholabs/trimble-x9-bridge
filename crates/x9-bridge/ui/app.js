@@ -204,7 +204,20 @@ const byNewest = (a, b) => String(b.created_at).localeCompare(String(a.created_a
 // stream has already delivered a newer state (a sign-off that finishes the run
 // at once), so never let an older copy replace a newer one.
 const runProgress = (r) => (["succeeded", "failed", "cancelled"].includes(r.state) ? 1e6 : 0)
-  + 10 * (r.steps || []).filter((s) => s.state === "done").length + (r.interventions?.total ?? 0);
+  + 10 * (r.steps || []).filter((s) => s.state === "done").length + (r.interventions?.total ?? 0)
+  // With the same steps done, waiting for the person comes after running.
+  + (r.state === "waiting_for_person" ? 0.5 : 0);
+// A job only moves forward too: approval, the queue, running, then an end. A
+// request's reply can arrive after the event stream has delivered a newer
+// state (an export that fails at once), so a reply never moves a job back.
+// Events from the stream are applied as they come.
+const JOB_STAGE = { awaiting_approval: 0, queued: 1, running: 2, succeeded: 3, failed: 3, cancelled: 3 };
+const jobProgress = (j) => 10 * (JOB_STAGE[j.state] ?? 0) + (j.progress ?? 0);
+function upsertJob(j) {
+  const e = S.jobs.find((x) => x.job_id === j.job_id);
+  if (e && jobProgress(j) < jobProgress(e)) return;
+  upsert(S.jobs, j, "job_id");
+}
 function upsertRun(r) {
   const e = S.runs.find((x) => x.run_id === r.run_id);
   if (e && runProgress(r) < runProgress(e)) return;
@@ -1169,7 +1182,7 @@ function viewRun(id) {
         <p>The agent decides this step and goes on; you review it with the result at the end.</p>
         ${prop ? `<div class="note">${esc(prop.by)} proposed: “${esc(prop.note ?? "an answer")}”.</div>` : ""}
         <p class="hint">${esc(d.instructions ?? "")}</p>
-        ${mayAdvance(r) ? `<details><summary class="hint">Answer it yourself instead</summary>
+        ${mayAdvance(r) ? `<details data-keep-open="${esc(key)}"><summary class="hint">Answer it yourself instead</summary>
           ${needs.includes("box") ? (previewScan ? picker(key, previewScan) : "") : ""}
           <form data-form="advance" data-run="${esc(r.run_id)}" data-step="${esc(cur.step_id)}" data-key="${esc(key)}">${fields}
           <button class="btn primary wide" ${S.busy || (needs.includes("box") && !S.boxes[key]) ? "disabled" : ""}>Continue with my answer</button></form></details>` : ""}</div>`;
@@ -1434,6 +1447,7 @@ function render(force = false) {
   });
   const focusKey = document.activeElement && root.contains(document.activeElement) ? fieldKey(document.activeElement) : null;
   const scroll = {};
+  const opened = new Set([...root.querySelectorAll("details[data-keep-open][open]")].map((d) => d.dataset.keepOpen));
   root.querySelectorAll("[data-keep-scroll]").forEach((el) => { scroll[el.dataset.keepScroll] = el.scrollLeft; });
   if (!S.token || !S.me) {
     if (!root.querySelector("[data-form=signin]") || S.signinError !== render.lastErr || S.busy !== render.lastBusy) root.innerHTML = viewSignin();
@@ -1443,6 +1457,7 @@ function render(force = false) {
   }
   root.innerHTML = viewTop() + `<main>${viewMain()}</main>` + viewSheet() +
     (S.toast ? `<div class="toast ${S.toast.bad ? "bad" : ""}" role="status">${esc(S.toast.text)}</div>` : "");
+  root.querySelectorAll("details[data-keep-open]").forEach((d) => { if (opened.has(d.dataset.keepOpen)) d.open = true; });
   root.querySelectorAll("[data-keep-scroll]").forEach((el) => {
     const k = el.dataset.keepScroll;
     const pick = el.querySelector("[data-picker]");
@@ -1607,19 +1622,19 @@ const actions = {
   "spot-focus": (el) => { const r = Number(el.dataset.rank); S.spotFocus = S.spotFocus === r ? null : r; render(true); },
   "spot-no": (el) => { S.sheet = { type: "spot", pid: el.dataset.pid, station: el.dataset.station, rank: el.dataset.rank }; render(true); },
   bumped: (el) => act(() => logNote(`Station ${el.dataset.station}: the person says the tripod ${el.dataset.said} during the scan.`, el.dataset.pid), "Noted for the agent"),
-  "approve-run": (el) => act(() => api(`/jobs/${encodeURIComponent(el.dataset.id)}/approve`, { method: "POST", body: { run: true } }).then((j) => { upsert(S.jobs, j, "job_id"); load("grants"); }), "Run approved"),
+  "approve-run": (el) => act(() => api(`/jobs/${encodeURIComponent(el.dataset.id)}/approve`, { method: "POST", body: { run: true } }).then((j) => { upsertJob(j); load("grants"); }), "Run approved"),
   "grant-project": () => act(async () => {
     const expires = new Date(Date.now() + GRANT_HOURS * 3600e3).toISOString().replace(/\.\d+Z$/, "Z");
     await api("/grants", { method: "POST", body: { project_id: S.project, expires_at: expires, max_scans: GRANT_SCANS } });
     await load("grants");
   }, "Agents may scan here"),
   "revoke-grant": (el) => act(async () => { await api(`/grants/${encodeURIComponent(el.dataset.id)}`, { method: "DELETE" }); await load("grants"); }, "Permission revoked"),
-  approve: (el) => act(() => api(`/jobs/${encodeURIComponent(el.dataset.id)}/approve`, { method: "POST" }).then((j) => upsert(S.jobs, j, "job_id")), "Approved"),
+  approve: (el) => act(() => api(`/jobs/${encodeURIComponent(el.dataset.id)}/approve`, { method: "POST" }).then((j) => upsertJob(j)), "Approved"),
   "cancel-job": (el) => {
     const j = S.jobs.find((x) => x.job_id === el.dataset.id);
     const running = j?.state === "running";
     if (running && !confirm("Stop this scan? The scanner keeps the part it has swept.")) return;
-    return act(() => api(`/jobs/${encodeURIComponent(el.dataset.id)}/cancel`, { method: "POST" }).then((j2) => upsert(S.jobs, j2, "job_id")), running ? "Stopping" : "Denied");
+    return act(() => api(`/jobs/${encodeURIComponent(el.dataset.id)}/cancel`, { method: "POST" }).then((j2) => upsertJob(j2)), running ? "Stopping" : "Denied");
   },
   "cancel-run": (el) => {
     if (!confirm("Cancel this run? A scan in progress is stopped too.")) return;
@@ -1638,18 +1653,18 @@ const actions = {
     const mode = document.querySelector("select[data-change=mode]")?.value || store.get("x9.mode") || "STD_L0";
     return act(async () => {
       const j = await api("/scans", { method: "POST", body: { project_id: s.project_id, kind: "area", mode, window: S.aim[id].window, note: `area from station ${s.station}` } });
-      upsert(S.jobs, j, "job_id");
+      upsertJob(j);
       location.hash = "#/now";
     }, isOp() ? "Area scan queued" : "Area scan sent for approval");
   },
   export: (el) => act(async () => {
     const j = await api(`/scans/${encodeURIComponent(el.dataset.id)}/exports`, { method: "POST", body: { format: el.dataset.format, intensity: "auto" } });
-    upsert(S.jobs, j, "job_id");
+    upsertJob(j);
     S.watchExport[el.dataset.id] = j.job_id;
   }),
   measure: (el) => act(async () => {
     const j = await api(`/scans/${encodeURIComponent(el.dataset.id)}/measurements`, { method: "POST", body: { kind: "opening" } });
-    upsert(S.jobs, j, "job_id");
+    upsertJob(j);
     S.watchMeasure[el.dataset.id] = j.job_id;
   }),
   "dl-export": (el, e) => { e.preventDefault(); return act(() => download(`/exports/${encodeURIComponent(el.dataset.id)}/file`, `${el.dataset.id}`)); },
@@ -1693,7 +1708,7 @@ const forms = {
       const body = { project_id: f.project_id.value, kind: "full_dome", mode: f.mode.value, color: f.color.checked };
       if (f.note.value.trim()) body.note = f.note.value.trim();
       const j = await api("/scans", { method: "POST", body });
-      upsert(S.jobs, j, "job_id");
+      upsertJob(j);
       S.sheet = null;
       location.hash = "#/now";
     }, isOp() ? "Scan queued" : "Scan sent for approval");
@@ -1746,7 +1761,9 @@ const forms = {
     if (S.project) body.project_id = S.project;
     const e = await api("/log", { method: "POST", body });
     if (e && !S.log.some((x) => x.entry_id === e.entry_id)) S.log.unshift(e);
-    f.text.value = "";
+    // act() redrew the page before this ran, so `f` may be the old copy:
+    // empty the box on the page as well.
+    for (const box of [f.text, document.querySelector('form[data-form="note"] [name="text"]')]) if (box) box.value = "";
   }, "Noted"),
 };
 
@@ -1778,12 +1795,11 @@ async function boot() {
     S.token = t;
   }
   S.route = parseRoute();
-  if (S.token) {
-    if (!(await signIn(S.token))) return;
-  } else {
-    render(true);
-  }
+  // Both timers wait for a signed-in person, so start them now: a refused
+  // link token must not leave a later sign-in on the form without them.
   setInterval(() => { if (S.me && !document.hidden) { load("status"); load("workers"); } }, 5000);
   setInterval(() => { if (S.me && S.jobs.some((j) => j.state === "running")) render(); }, 1000);
+  if (S.token) await signIn(S.token);
+  else render(true);
 }
 boot();

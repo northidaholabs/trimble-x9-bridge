@@ -1024,7 +1024,7 @@ pub async fn run_measure(st: Arc<AppState>, job_id: String, scan_id: String, cro
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{busy, echo_mismatch, Busy};
     use serde_json::json;
     use std::collections::HashSet;
@@ -1053,5 +1053,861 @@ mod tests {
         let fallback = json!({"scanMode": "STD_L0", "scanType": "FullDome", "startHA": -1, "colorMode": "ON"});
         assert_eq!(echo_mismatch(&sent, &fallback).len(), 4);
         assert_eq!(echo_mismatch(&sent, &json!({})).len(), 4);
+    }
+
+    // ------------------------------------------------------------------
+    // The job worker on a mock scanner (see `testkit`).
+
+    use super::{crop_cells, queue_register, run_export, run_measure, Cells};
+    use crate::model::{Job, JobState, ScanKind, ScanRequest};
+    use crate::register::{Cloud, Pose, Registration, StationPose};
+    use crate::state::{AppState, JobRecord};
+    use crate::testkit::{fast_mock, Bridge, AGENT, OPERATOR};
+    use crate::util::now_rfc3339;
+    use axum::{http::StatusCode, routing::get, Json, Router};
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// The mock's project.
+    pub(crate) const PID: &str = "39187455-8278-428c-89ad-8a4835f95be6";
+    /// The mock's one scan, `mock_project/1.tzf`.
+    pub(crate) const SCAN0: &str = "5b5314cf-76b8-4f59-a445-ceee1e6df4c3";
+
+    fn dome(mode: &str, color: bool) -> Value {
+        json!({"project_id": PID, "kind": "full_dome", "mode": mode, "color": color})
+    }
+
+    /// Queue a scan as the operator; returns its job id.
+    async fn submit(b: &Bridge, body: Value) -> String {
+        let (code, job) = b.call("POST", "/v1/scans", Some(OPERATOR), Some(body)).await;
+        assert_eq!(code, StatusCode::ACCEPTED, "{job}");
+        job["job_id"].as_str().unwrap().to_string()
+    }
+
+    /// Put a queued scan job straight into the state, past the admission
+    /// checks (which would refuse it on a dead or flat scanner).
+    fn queue_direct(st: &AppState, req: ScanRequest) -> String {
+        let id = crate::util::new_id("job");
+        let job = Job {
+            job_id: id.clone(),
+            kind: "scan".into(),
+            state: JobState::Queued,
+            phase: None,
+            progress: None,
+            requested_by: "crew".into(),
+            run_id: None,
+            created_at: now_rfc3339(),
+            started_at: None,
+            finished_at: None,
+            result: None,
+            problem: None,
+            partial_scan_id: None,
+            request: Some(req.clone()),
+            project_name: Some("mock_project".into()),
+        };
+        st.inner.lock().unwrap().jobs.push(JobRecord {
+            job,
+            request: Some(req.clone()),
+            project_id: req.project_id.clone(),
+            project_name: "mock_project".into(),
+            scanner_task_id: None,
+            cancel_requested: false,
+            grant_id: None,
+        });
+        st.wake.notify_one();
+        id
+    }
+
+    fn dome_req() -> ScanRequest {
+        ScanRequest { project_id: PID.into(), kind: ScanKind::FullDome, mode: "STD_L0".into(), color: false, window: None, note: None }
+    }
+
+    /// A running job record that no worker drives (for `run_export` and friends).
+    fn running_job(st: &AppState, kind: &str, cancel: bool) -> String {
+        let id = crate::util::new_id("job");
+        let job = Job {
+            job_id: id.clone(),
+            kind: kind.into(),
+            state: JobState::Running,
+            phase: None,
+            progress: None,
+            requested_by: "crew".into(),
+            run_id: None,
+            created_at: now_rfc3339(),
+            started_at: Some(now_rfc3339()),
+            finished_at: None,
+            result: None,
+            problem: None,
+            partial_scan_id: None,
+            request: None,
+            project_name: None,
+        };
+        st.inner.lock().unwrap().jobs.push(JobRecord {
+            job,
+            request: None,
+            project_id: PID.into(),
+            project_name: String::new(),
+            scanner_task_id: None,
+            cancel_requested: cancel,
+            grant_id: None,
+        });
+        id
+    }
+
+    fn is_final(j: &Value) -> bool {
+        matches!(j["state"].as_str(), Some("succeeded" | "failed" | "cancelled"))
+    }
+
+    pub(crate) async fn wait_job(b: &Bridge, id: &str, secs: f64) -> Value {
+        b.wait_for(&format!("/v1/jobs/{id}"), OPERATOR, secs, is_final).await
+    }
+
+    fn job_state(b: &Bridge, id: &str) -> crate::state::JobRecord {
+        b.st.inner.lock().unwrap().jobs.iter().find(|j| j.job.job_id == id).cloned().unwrap()
+    }
+
+    fn logged(st: &AppState, needle: &str) -> bool {
+        st.inner.lock().unwrap().log.iter().any(|e| e.text.contains(needle))
+    }
+
+    /// The registration jobs, newest last.
+    fn register_jobs(st: &AppState) -> Vec<Job> {
+        st.inner.lock().unwrap().jobs.iter().filter(|j| j.job.kind == "register").map(|j| j.job.clone()).collect()
+    }
+
+    /// Phases a job's events went through, in order, without repeats.
+    fn phases(rx: &mut tokio::sync::broadcast::Receiver<crate::state::Event>, id: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(ev) if ev.kind == "job" && ev.data["job_id"] == id => {
+                    if let Some(p) = ev.data["phase"].as_str() {
+                        if out.last().map(String::as_str) != Some(p) {
+                            out.push(p.to_string());
+                        }
+                    }
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => return out,
+            }
+        }
+    }
+
+    /// A local port nothing listens on.
+    pub(crate) async fn dead_base() -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        format!("http://{addr}/api/v1")
+    }
+
+    /// Fixture files the mock serves for every scan: not a real scan file or
+    /// JPEG (those are private), so decoding them fails.
+    pub(crate) fn junk_fixtures() -> (std::path::PathBuf, x9_mock::Config) {
+        let dir = std::env::temp_dir().join(crate::util::new_id("x9-fixtures"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["dome.tzf", "dome.jpg", "area.tzf", "area.jpg"] {
+            std::fs::write(dir.join(f), b"not a real scan file").unwrap();
+        }
+        let cfg = x9_mock::Config { fixtures: Some(dir.to_string_lossy().into_owned()), ..fast_mock() };
+        (dir, cfg)
+    }
+
+    // ---------------------------------------------------------------- scans ---
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_dome_goes_from_leveling_through_sweeping_to_a_new_scan_and_registers() {
+        let b = Bridge::new().await;
+        let mut rx = b.st.events.subscribe();
+        b.start_worker();
+        let id = submit(&b, dome("STD_L0", false)).await;
+        let j = wait_job(&b, &id, 10.0).await;
+        assert_eq!(j["state"], "succeeded", "{j}");
+        assert_eq!(j["progress"], 1.0);
+        let scan_id = j["result"]["scan_id"].as_str().unwrap().to_string();
+        assert!(!scan_id.is_empty() && scan_id != SCAN0);
+        let seen = phases(&mut rx, &id);
+        assert_eq!(seen.first().map(String::as_str), Some("leveling"), "{seen:?}");
+        assert!(seen.iter().any(|p| p == "sweeping"), "{seen:?}");
+        assert!(!seen.iter().any(|p| p == "imaging"), "no color, no imaging: {seen:?}");
+        // The bridge keeps when it ran and how long each part took.
+        let (_, scan) = b.call("GET", &format!("/v1/scans/{scan_id}"), Some(OPERATOR), None).await;
+        assert_eq!(scan["kind"], "full_dome");
+        assert!(scan["timings"]["geometry_ready_s"].as_f64().is_some(), "{scan}");
+        assert!(scan["timings"]["done_s"].as_f64().is_some(), "{scan}");
+        assert!(logged(&b.st, "Geometry ready: mock_project/2.tzf (station 2)"));
+        assert!(logged(&b.st, "Scanner started STD_L0 (color off)"));
+        assert!(logged(&b.st, &format!("Scan job {id} finished")));
+        // A new station is registered at once. No scan file can be fetched
+        // from the mock, so every station is skipped, and that is logged.
+        b.wait_for(&format!("/v1/jobs/{id}"), OPERATOR, 5.0, |_| !register_jobs(&b.st).is_empty()).await;
+        let reg = register_jobs(&b.st);
+        assert_eq!(reg.len(), 1);
+        let r = wait_job(&b, &reg[0].job_id, 10.0).await;
+        assert_eq!(r["state"], "succeeded", "{r}");
+        assert_eq!(r["result"]["placed"], 0, "{r}");
+        assert!(logged(&b.st, "Station 1 could not be registered"));
+        assert!(logged(&b.st, "Station 2 could not be registered"));
+        assert!(b.st.inner.lock().unwrap().registrations.contains_key(PID));
+        assert!(b.dir.join("data/registrations.json").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_color_scan_is_imaging_after_its_geometry_lands() {
+        let b = Bridge::new().await;
+        let mut rx = b.st.events.subscribe();
+        b.start_worker();
+        let id = submit(&b, dome("STD_L0", true)).await;
+        let j = wait_job(&b, &id, 10.0).await;
+        assert_eq!(j["state"], "succeeded", "{j}");
+        let seen = phases(&mut rx, &id);
+        let (s, i) = (seen.iter().position(|p| p == "sweeping"), seen.iter().position(|p| p == "imaging"));
+        assert!(s.is_some() && i.is_some() && s < i, "{seen:?}");
+        assert!(logged(&b.st, "(color on)"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_area_scan_keeps_its_window_and_queues_no_registration() {
+        let b = Bridge::new().await;
+        b.start_worker();
+        let w = json!({"start_ha": 1.0, "delta_ha": 0.5, "start_va": 1.2, "delta_va": 0.4});
+        let id = submit(&b, json!({"project_id": PID, "kind": "area", "mode": "STD_L0", "window": w})).await;
+        let j = wait_job(&b, &id, 10.0).await;
+        assert_eq!(j["state"], "succeeded", "{j}");
+        let scan_id = j["result"]["scan_id"].as_str().unwrap();
+        let (_, scan) = b.call("GET", &format!("/v1/scans/{scan_id}"), Some(OPERATOR), None).await;
+        assert_eq!(scan["kind"], "area", "{scan}");
+        assert_eq!(scan["window"]["start_ha"], 1.0, "{scan}");
+        assert!(register_jobs(&b.st).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn another_clients_task_fails_the_scan_as_scanner_busy() {
+        let b = Bridge::with_mock(x9_mock::Config { speed: 20.0, ..fast_mock() }).await;
+        // Someone else (the vendor app) starts a scan on the scanner directly.
+        let req = x9_client::models::ScanRequest { scan_mode: Some("STD_L0".into()), project_name: Some("mock_project".into()), ..Default::default() };
+        let theirs = b.st.scanner.launch_scan(&req).await.unwrap();
+        b.start_worker();
+        let id = submit(&b, dome("STD_L0", false)).await;
+        let j = wait_job(&b, &id, 5.0).await;
+        assert_eq!(j["state"], "failed", "{j}");
+        assert_eq!(j["problem"]["code"], "scanner_busy", "{j}");
+        assert_eq!(j["problem"]["detail"], "1 task(s) running", "{j}");
+        // The bridge left their task alone.
+        let tasks = b.st.scanner.tasks().await.unwrap();
+        assert_eq!(tasks.first().and_then(|t| t.id), theirs.id);
+        assert!(logged(&b.st, &format!("Scan job {id} failed: scanner_busy")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_queued_scan_gives_its_grant_use_back_and_never_reaches_the_scanner() {
+        let b = Bridge::new().await;
+        // An agent's scan under a grant: queued without approval, using the grant.
+        let g = json!({"project_id": PID, "expires_at": "2099-01-01T00:00:00Z", "max_scans": 1});
+        let (code, grant) = b.call("POST", "/v1/grants", Some(OPERATOR), Some(g)).await;
+        assert_eq!(code, StatusCode::CREATED, "{grant}");
+        let (code, job) = b.call("POST", "/v1/scans", Some(AGENT), Some(dome("STD_L0", false))).await;
+        assert_eq!((code, job["state"].as_str()), (StatusCode::ACCEPTED, Some("queued")), "{job}");
+        assert_eq!(b.st.inner.lock().unwrap().grants[0].scans_used, 1);
+        let id = job["job_id"].as_str().unwrap();
+        let (code, j) = b.call("POST", &format!("/v1/jobs/{id}/cancel"), Some(AGENT), None).await;
+        assert_eq!((code, j["state"].as_str()), (StatusCode::OK, Some("cancelled")), "{j}");
+        assert_eq!(b.st.inner.lock().unwrap().grants[0].scans_used, 0);
+        // The worker passes over it.
+        b.start_worker();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(b.st.scanner.tasks().await.unwrap().is_empty());
+        assert_eq!(b.st.scanner.scans().await.unwrap().len(), 1);
+        assert_eq!(job_state(&b, id).job.state, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_mid_sweep_stops_the_task_and_points_at_the_partial_scan() {
+        // Slow enough to cancel mid-sweep; the cancelled task lingers 0.1 s.
+        let b = Bridge::with_mock(x9_mock::Config { speed: 40.0, cancel_linger: 4.0, ..fast_mock() }).await;
+        b.start_worker();
+        let id = submit(&b, dome("STD_L0", false)).await;
+        b.wait_for(&format!("/v1/jobs/{id}"), OPERATOR, 5.0, |j| j["phase"] == "sweeping" && j["progress"].as_f64().unwrap_or(0.0) > 0.0).await;
+        let (code, j) = b.call("POST", &format!("/v1/jobs/{id}/cancel"), Some(OPERATOR), None).await;
+        assert_eq!((code, j["state"].as_str()), (StatusCode::OK, Some("running")), "{j}");
+        let j = b.wait_for(&format!("/v1/jobs/{id}"), OPERATOR, 5.0, |j| !j["partial_scan_id"].is_null()).await;
+        assert_eq!(j["state"], "cancelled", "{j}");
+        let partial = j["partial_scan_id"].as_str().unwrap();
+        assert_ne!(partial, SCAN0);
+        assert!(logged(&b.st, &format!("kept a partial scan from cancelled job {id}")));
+        assert!(b.st.inner.lock().unwrap().scan_meta.contains_key(partial));
+        // The scanner listed it: fewer points than a full sweep.
+        let scans = b.st.scanner.scans().await.unwrap();
+        let s = scans.iter().find(|s| s.scan_uuid.as_deref() == Some(partial)).unwrap();
+        assert!(s.tzf.as_ref().and_then(|t| t.nb_points).unwrap() < 6_281_859);
+        // A cancelled scan queues no registration.
+        assert!(register_jobs(&b.st).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_while_leveling_leaves_no_partial_scan() {
+        let b = Bridge::with_mock(x9_mock::Config { speed: 20.0, cancel_linger: 2.0, ..fast_mock() }).await;
+        b.start_worker();
+        let id = submit(&b, dome("STD_L0", false)).await;
+        b.wait_for(&format!("/v1/jobs/{id}"), OPERATOR, 5.0, |_| job_state(&b, &id).scanner_task_id.is_some()).await;
+        b.call("POST", &format!("/v1/jobs/{id}/cancel"), Some(OPERATOR), None).await;
+        let j = wait_job(&b, &id, 5.0).await;
+        assert_eq!(j["state"], "cancelled", "{j}");
+        // Wait for the worker to be done following the cancelled task.
+        let t0 = std::time::Instant::now();
+        while !b.st.inner.lock().unwrap().cancelled_tasks.is_empty() {
+            assert!(t0.elapsed() < Duration::from_secs(5), "the cancelled task was never seen to clear");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(job_state(&b, &id).job.partial_scan_id.is_none());
+        assert_eq!(b.st.scanner.scans().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fallback_echo_fails_the_job_and_the_next_waits_out_the_cancelled_task() {
+        // The mock runs HS_L1 requests as a default color full dome. Its
+        // cancelled task stays listed 0.25 s.
+        let cfg = x9_mock::Config { fallback_mode: Some("HS_L1".into()), cancel_linger: 100.0, ..fast_mock() };
+        let b = Bridge::with_mock(cfg).await;
+        let mut rx = b.st.events.subscribe();
+        let bad = submit(&b, dome("HS_L1", false)).await;
+        let good = submit(&b, dome("STD_L0", false)).await;
+        b.start_worker();
+        let j = wait_job(&b, &bad, 5.0).await;
+        assert_eq!(j["state"], "failed", "{j}");
+        let detail = j["problem"]["detail"].as_str().unwrap();
+        assert!(detail.contains("did not accept the request as sent"), "{detail}");
+        assert!(detail.contains(r#"scanMode: sent "HS_L1", echoed "STD_L0""#), "{detail}");
+        assert!(detail.contains(r#"colorMode: sent "OFF", echoed "ON""#), "{detail}");
+        // The next scan waited for the stopped task to clear, then ran.
+        let j = wait_job(&b, &good, 5.0).await;
+        assert_eq!(j["state"], "succeeded", "{j}");
+        let seen = phases(&mut rx, &good);
+        assert_eq!(&seen[..3], ["leveling", "waiting", "leveling"], "{seen:?}");
+        assert!(logged(&b.st, "Waiting for the scanner to clear the cancelled task"));
+        assert!(b.st.inner.lock().unwrap().cancelled_tasks.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_scan_waiting_on_a_cancelled_task_gives_its_grant_use_back() {
+        // The fallback task lingers a full second.
+        let cfg = x9_mock::Config { fallback_mode: Some("HS_L1".into()), cancel_linger: 400.0, ..fast_mock() };
+        let b = Bridge::with_mock(cfg).await;
+        let g = json!({"project_id": PID, "expires_at": "2099-01-01T00:00:00Z", "max_scans": 5});
+        b.call("POST", "/v1/grants", Some(OPERATOR), Some(g)).await;
+        let bad = submit(&b, dome("HS_L1", false)).await;
+        let (_, job) = b.call("POST", "/v1/scans", Some(AGENT), Some(dome("STD_L0", false))).await;
+        let id = job["job_id"].as_str().unwrap().to_string();
+        assert_eq!(b.st.inner.lock().unwrap().grants[0].scans_used, 1);
+        b.start_worker();
+        assert_eq!(wait_job(&b, &bad, 5.0).await["state"], "failed");
+        b.wait_for(&format!("/v1/jobs/{id}"), OPERATOR, 5.0, |j| j["phase"] == "waiting").await;
+        b.call("POST", &format!("/v1/jobs/{id}/cancel"), Some(AGENT), None).await;
+        let j = wait_job(&b, &id, 5.0).await;
+        assert_eq!(j["state"], "cancelled", "{j}");
+        assert!(j["partial_scan_id"].is_null());
+        assert_eq!(b.st.inner.lock().unwrap().grants[0].scans_used, 0);
+        assert!(std::fs::read_to_string(b.dir.join("data/grants.json")).unwrap().contains("\"scans_used\": 0"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_scanner_fails_the_job_as_disconnected() {
+        let b = Bridge::on_scanner(&dead_base().await);
+        let id = queue_direct(&b.st, dome_req());
+        b.start_worker();
+        let j = wait_job(&b, &id, 5.0).await;
+        assert_eq!(j["state"], "failed", "{j}");
+        assert_eq!(j["problem"]["code"], "scanner_disconnected", "{j}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flat_battery_fails_the_job_before_the_scanner_starts() {
+        let b = Bridge::with_mock(x9_mock::Config { battery: 5, ..fast_mock() }).await;
+        let id = queue_direct(&b.st, dome_req());
+        b.start_worker();
+        let j = wait_job(&b, &id, 5.0).await;
+        assert_eq!(j["problem"]["code"], "battery_low", "{j}");
+        assert!(b.st.scanner.tasks().await.unwrap().is_empty());
+    }
+
+    // A scripted scanner for failures the mock can't produce.
+
+    #[derive(Clone, Default)]
+    struct Fake {
+        /// `/tasks` answers this many times, then fails.
+        tasks_ok: usize,
+        scans_fail: bool,
+        launch_fail: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    async fn fake_scanner(f: Fake) -> String {
+        let status = || async { Json(json!({"batteryLevel": 80, "pluggedToAC": false, "storage": {"availableSize": 20_000_000_000u64}})) };
+        let (f1, f2, f3) = (f.clone(), f.clone(), f.clone());
+        let app = Router::new()
+            .route("/api/v1/status", get(status))
+            .route("/api/v1/projects", get(|| async { Json(json!([{"id": 0, "projectName": "mock_project", "projectUUID": PID}])) }))
+            .route(
+                "/api/v1/tasks",
+                get(move || {
+                    let f = f1.clone();
+                    async move {
+                        if f.calls.fetch_add(1, Ordering::SeqCst) < f.tasks_ok {
+                            Ok(Json(json!([])))
+                        } else {
+                            Err(StatusCode::INTERNAL_SERVER_ERROR)
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/scans",
+                get(move || {
+                    let f = f2.clone();
+                    async move { if f.scans_fail { Err(StatusCode::INTERNAL_SERVER_ERROR) } else { Ok(Json(json!([]))) } }
+                })
+                .post(move |Json(req): Json<Value>| {
+                    let f = f3.clone();
+                    async move {
+                        if f.launch_fail {
+                            Err(StatusCode::INTERNAL_SERVER_ERROR)
+                        } else {
+                            Ok((StatusCode::ACCEPTED, Json(json!({"id": 7, "state": "initializing", "scanRequest": req}))))
+                        }
+                    }
+                }),
+            );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        format!("http://{addr}/api/v1")
+    }
+
+    async fn run_on_fake(f: Fake) -> Value {
+        let b = Bridge::on_scanner(&fake_scanner(f).await);
+        let id = queue_direct(&b.st, dome_req());
+        b.start_worker();
+        let j = wait_job(&b, &id, 5.0).await;
+        assert_eq!(j["state"], "failed", "{j}");
+        j["problem"].clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scanner_whose_task_list_fails_fails_the_job_before_launching() {
+        let p = run_on_fake(Fake::default()).await;
+        assert_eq!(p["code"], "scanner_error", "{p}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scanner_whose_scan_list_fails_fails_the_job_before_launching() {
+        let p = run_on_fake(Fake { tasks_ok: usize::MAX, scans_fail: true, ..Default::default() }).await;
+        assert_eq!(p["code"], "scanner_error", "{p}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_launch_fails_the_job() {
+        let p = run_on_fake(Fake { tasks_ok: usize::MAX, launch_fail: true, ..Default::default() }).await;
+        assert_eq!(p["code"], "scanner_error", "{p}");
+        assert!(p["title"].as_str().unwrap().contains("(500)"), "{p}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_the_scanner_mid_scan_fails_after_ten_errors_in_a_row() {
+        // One good `/tasks` (the idle check), then errors.
+        let f = Fake { tasks_ok: 1, ..Default::default() };
+        let calls = f.calls.clone();
+        let p = run_on_fake(f).await;
+        assert_eq!(p["code"], "scanner_error", "{p}");
+        assert_eq!(calls.load(Ordering::SeqCst), 11);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scan_that_ends_without_a_file_fails() {
+        // The scanner takes the scan, lists no task and files nothing.
+        let p = run_on_fake(Fake { tasks_ok: usize::MAX, ..Default::default() }).await;
+        assert_eq!(p["detail"], "the scanner finished without producing a scan file", "{p}");
+    }
+
+    // -------------------------------------------------------- registration ---
+
+    type Rect = ([f32; 3], [f32; 3]);
+
+    fn boxed(lo: [f32; 3], hi: [f32; 3]) -> Vec<Rect> {
+        (0..3)
+            .flat_map(|k| {
+                [lo[k], hi[k]].map(|v| {
+                    let (mut a, mut b) = (lo, hi);
+                    a[k] = v;
+                    b[k] = v;
+                    (a, b)
+                })
+            })
+            .collect()
+    }
+
+    /// A station's 5 cm cloud of a 12 × 8 m room with a partition (so it has
+    /// one right fit), as a scanner at `at` turned by `turn` (rad) sees it.
+    pub(crate) fn room_cloud(at: [f32; 3], turn: f32) -> Cloud {
+        let mut rects = boxed([-6.0, -4.0, -1.5], [6.0, 4.0, 1.2]);
+        rects.push(([3.0, -4.0, -1.5], [3.0, -1.0, 0.5]));
+        let (s, c) = turn.sin_cos();
+        let (mut pts, mut range) = (Vec::new(), Vec::new());
+        for (lo, hi) in rects {
+            let steps = |k: usize| ((hi[k] - lo[k]) / 0.05).round() as usize;
+            for i in 0..=steps(0) {
+                for j in 0..=steps(1) {
+                    for k in 0..=steps(2) {
+                        let w = [lo[0] + i as f32 * 0.05, lo[1] + j as f32 * 0.05, lo[2] + k as f32 * 0.05];
+                        let d = [w[0] - at[0], w[1] - at[1], w[2] - at[2]];
+                        pts.push([c * d[0] + s * d[1], -s * d[0] + c * d[1], d[2]]);
+                        range.push((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt());
+                    }
+                }
+            }
+        }
+        Cloud { step_rad: 0.0005, pts, range }
+    }
+
+    /// Run a scan on the mock outside the bridge; returns its scan id.
+    async fn scan_on_mock(b: &Bridge) -> String {
+        let before: HashSet<String> = b.st.scanner.scans().await.unwrap().into_iter().filter_map(|s| s.scan_uuid).collect();
+        let req = x9_client::models::ScanRequest {
+            scan_mode: Some("STD_L0".into()),
+            scan_type: Some("FullDome".into()),
+            project_name: Some("mock_project".into()),
+            project_uuid: Some(PID.into()),
+            ..Default::default()
+        };
+        b.st.scanner.launch_scan(&req).await.unwrap();
+        let t0 = std::time::Instant::now();
+        loop {
+            assert!(t0.elapsed() < Duration::from_secs(5), "the mock's scan never finished");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if !b.st.scanner.tasks().await.unwrap().is_empty() {
+                continue;
+            }
+            let now = b.st.scanner.scans().await.unwrap();
+            if let Some(id) = now.into_iter().filter_map(|s| s.scan_uuid).find(|u| !before.contains(u)) {
+                return id;
+            }
+        }
+    }
+
+    async fn register(b: &Bridge) -> Value {
+        let (code, job) = b.call("POST", &format!("/v1/projects/{PID}/registration"), Some(OPERATOR), None).await;
+        assert_eq!(code, StatusCode::ACCEPTED, "{job}");
+        wait_job(b, job["job_id"].as_str().unwrap(), 10.0).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_bridge_registers_a_station_whose_cloud_it_already_has() {
+        let b = Bridge::new().await;
+        // As if decoded before: no scan file is needed (the real ones are private).
+        let dir = b.dir.join("data/registration");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(super::cloud_name(SCAN0)), room_cloud([1.0, 0.5, 0.0], 0.0).to_bytes()).unwrap();
+        // Clouds cut at an older range are dropped.
+        std::fs::write(dir.join(format!("{SCAN0}.r60.cloud")), b"old").unwrap();
+        let j = register(&b).await;
+        assert_eq!(j["state"], "succeeded", "{j}");
+        assert_eq!((j["result"]["stations"].as_u64(), j["result"]["placed"].as_u64()), (Some(1), Some(1)), "{j}");
+        assert!(!dir.join(format!("{SCAN0}.r60.cloud")).exists());
+        assert!(logged(&b.st, "Station 1 is the project frame"));
+        assert!(b.st.merged_path(PID).unwrap().exists());
+        assert_eq!(b.st.prepared.lock().unwrap().len(), 1);
+        // Again, from the prepared station in memory; an unchanged verdict logs nothing.
+        let n = b.st.inner.lock().unwrap().log.len();
+        assert_eq!(register(&b).await["result"]["placed"], 1);
+        let after: Vec<String> = b.st.inner.lock().unwrap().log[n..].iter().map(|e| e.text.clone()).collect();
+        assert!(!after.iter().any(|t| t.starts_with("Station ")), "{after:?}");
+    }
+
+    fn audit(verdict: &str, ties: &[&str]) -> crate::register::Audit {
+        crate::register::Audit { verdict: verdict.into(), ties: ties.iter().map(|s| s.to_string()).collect(), reasons: vec!["a reason".into()], ..Default::default() }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_frame_carries_the_mission_faces_and_each_verdict_is_logged() {
+        let b = Bridge::new().await;
+        let mut ids = vec![SCAN0.to_string()];
+        for _ in 0..5 {
+            ids.push(scan_on_mock(&b).await);
+        }
+        // A mission with one wall face, in station 2's frame (the frame before).
+        let m = json!({"goal": "Survey the room", "kind": "room", "done_when": "every wall is seen",
+                       "targets": [{"target_id": "east", "name": "East wall", "kind": "wall", "face": {"from": [1.0, 0.0], "to": [1.0, 2.0]}}]});
+        let (code, v) = b.call("PUT", &format!("/v1/projects/{PID}/mission"), Some(OPERATOR), Some(m)).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        let prev = Registration {
+            project_id: PID.into(),
+            frame_scan_id: Some(ids[1].clone()),
+            stations: vec![StationPose { scan_id: ids[1].clone(), station: 2, pose: Some(Pose { turn_deg: 0.0, xyz_m: [0.0; 3] }), audit: None }],
+            pairs: vec![],
+            walls: vec![],
+            summary: String::new(),
+            updated_at: now_rfc3339(),
+        };
+        b.st.inner.lock().unwrap().registrations.insert(PID.into(), prev);
+
+        // A worker registers the six stations (station 6 it could not decode).
+        b.st.work.lock().unwrap().claim("laptop", "agent");
+        let (_, job) = b.call("POST", &format!("/v1/projects/{PID}/registration"), Some(OPERATOR), None).await;
+        let id = job["job_id"].as_str().unwrap().to_string();
+        b.wait_for(&format!("/v1/jobs/{id}"), OPERATOR, 5.0, |_| b.st.work.lock().unwrap().claim("laptop", "agent").is_some()).await;
+        let p2 = Pose { turn_deg: 30.0, xyz_m: [-3.0, -1.5, 0.0] };
+        let res = crate::work::WorkResult {
+            pairs: vec![],
+            poses: vec![Some(Pose { turn_deg: 0.0, xyz_m: [0.0; 3] }), Some(p2), Some(p2), Some(p2), None],
+            audits: vec![audit("frame", &[]), audit("confirmed", &[&ids[0]]), audit("single", &[&ids[0]]), audit("doubtful", &[]), audit("ambiguous", &[])],
+            walls: vec![],
+            skipped: vec![(6, "open: not a scan file".into())],
+            frame: Some(ids[0].clone()),
+        };
+        {
+            let mut w = b.st.work.lock().unwrap();
+            w.put_merged(&id, "agent", crate::register::Merged::default().to_bytes()).unwrap();
+            w.deliver(&id, "agent", Ok(res)).unwrap();
+        }
+        let j = wait_job(&b, &id, 5.0).await;
+        assert_eq!(j["state"], "succeeded", "{j}");
+        assert_eq!((j["result"]["stations"].as_u64(), j["result"]["placed"].as_u64()), (Some(5), Some(4)), "{j}");
+        let reg = b.st.inner.lock().unwrap().registrations.get(PID).cloned().unwrap();
+        assert_eq!(reg.frame_scan_id.as_deref(), Some(ids[0].as_str()));
+        // The face moved with station 2 into station 1's frame.
+        let face = b.st.inner.lock().unwrap().missions[PID].targets[0].face.unwrap();
+        let (s, c) = 30f64.to_radians().sin_cos();
+        assert!((face.from[0] - (c - 3.0)).abs() < 1e-9 && (face.from[1] - (s - 1.5)).abs() < 1e-9, "{face:?}");
+        assert!(std::fs::read_to_string(b.dir.join("data/missions.json")).unwrap().contains("East wall"));
+        for text in [
+            "The project frame is now station 1's",
+            "Station 1 is the project frame",
+            "Station 2 registered and confirmed",
+            "Station 3 registered on one tie",
+            "Station 4 is doubtful: a reason",
+            "Station 5 is not placed: a reason",
+            "Station 6 could not be registered: open: not a scan file",
+            "Registration (registered on laptop)",
+        ] {
+            assert!(logged(&b.st, text), "{text}");
+        }
+        // Untrusted verdicts are checks, trusted ones notes.
+        let kind = |t: &str| b.st.inner.lock().unwrap().log.iter().find(|e| e.text.starts_with(t)).map(|e| e.kind.clone()).unwrap();
+        assert_eq!((kind("Station 2 registered").as_str(), kind("Station 4 is doubtful").as_str()), ("note", "check"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_station_that_lands_during_a_registration_runs_it_once_more() {
+        let b = Bridge::new().await;
+        let first = queue_register(&b.st, PID, "crew");
+        // While it runs, another full dome lands: the same job, run again.
+        let again = queue_register(&b.st, PID, "crew");
+        assert_eq!(first.job_id, again.job_id);
+        let j = wait_job(&b, &first.job_id, 10.0).await;
+        assert_eq!(j["state"], "succeeded", "{j}");
+        assert_eq!(register_jobs(&b.st).len(), 1);
+        assert!(b.st.inner.lock().unwrap().registering.is_empty());
+        assert!(b.st.inner.lock().unwrap().register_again.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn junk_scan_files_are_skipped_with_the_decoder_error() {
+        let (fx, cfg) = junk_fixtures();
+        let b = Bridge::with_mock(cfg).await;
+        let j = register(&b).await;
+        assert_eq!(j["state"], "succeeded", "{j}");
+        assert_eq!(j["result"]["stations"], 0, "{j}");
+        let log = b.st.inner.lock().unwrap().log.clone();
+        let skip = log.iter().find(|e| e.text.starts_with("Station 1 could not be registered")).unwrap();
+        assert!(skip.text.contains("open: "), "{}", skip.text);
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unwritable_registration_directory_fails_the_job_as_a_cache_error() {
+        let b = Bridge::new().await;
+        // A file where the directory should be.
+        std::fs::write(b.dir.join("data/registration"), b"in the way").unwrap();
+        let j = register(&b).await;
+        assert_eq!(j["state"], "failed", "{j}");
+        assert_eq!(j["problem"]["code"], "cache_error", "{j}");
+        assert!(j["problem"]["detail"].as_str().unwrap().starts_with("registration directory"), "{j}");
+        assert!(logged(&b.st, "Registration job"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreadable_station_cloud_fails_the_registration() {
+        let b = Bridge::new().await;
+        let dir = b.dir.join("data/registration");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(super::cloud_name(SCAN0)), b"not a cloud").unwrap();
+        let j = register(&b).await;
+        assert_eq!(j["state"], "failed", "{j}");
+        assert_eq!(j["problem"]["code"], "cache_error", "{j}");
+        assert_eq!(j["problem"]["detail"], "not a station cloud", "{j}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_registration_stops_it() {
+        let b = Bridge::new().await;
+        // Hold the worker list so the bridge offers the job and waits.
+        b.st.work.lock().unwrap().claim("laptop", "agent");
+        let (_, job) = b.call("POST", &format!("/v1/projects/{PID}/registration"), Some(OPERATOR), None).await;
+        let id = job["job_id"].as_str().unwrap();
+        b.wait_for(&format!("/v1/jobs/{id}"), OPERATOR, 5.0, |j| j["phase"] == "waiting for a worker").await;
+        b.call("POST", &format!("/v1/jobs/{id}/cancel"), Some(OPERATOR), None).await;
+        let j = wait_job(&b, id, 5.0).await;
+        assert_eq!(j["state"], "cancelled", "{j}");
+        assert!(logged(&b.st, &format!("Registration job {id} cancelled")));
+    }
+
+    #[test]
+    fn set_phase_reports_a_workers_progress_on_the_job() {
+        let st = AppState::new(
+            x9_client::Client::connect("http://127.0.0.1:1/api/v1").unwrap(),
+            Default::default(),
+            Default::default(),
+            Duration::from_millis(20),
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        let id = running_job(&st, "register", false);
+        super::set_phase(&st, &id, "matching on laptop", Some(0.5));
+        super::set_phase(&st, &id, "checking", None);
+        let j = st.inner.lock().unwrap().jobs[0].job.clone();
+        assert_eq!((j.phase.as_deref(), j.progress), (Some("checking"), Some(0.5)));
+        // An unknown job is a no-op.
+        super::set_phase(&st, "job_nope", "x", None);
+    }
+
+    // ------------------------------------------------- exports, measuring ---
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_export_of_a_scan_with_no_file_fails() {
+        let b = Bridge::new().await;
+        let (code, job) = b.call("POST", &format!("/v1/scans/{SCAN0}/exports"), Some(OPERATOR), Some(json!({"format": "ply"}))).await;
+        assert_eq!(code, StatusCode::ACCEPTED, "{job}");
+        let j = wait_job(&b, job["job_id"].as_str().unwrap(), 5.0).await;
+        assert_eq!(j["state"], "failed", "{j}");
+        assert_eq!(j["problem"]["code"], "scanner_error", "{j}");
+        assert!(logged(&b.st, "Export job"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_export_of_a_junk_scan_file_fails_to_decode_and_leaves_no_file() {
+        let (fx, cfg) = junk_fixtures();
+        let b = Bridge::with_mock(cfg).await;
+        let (_, job) = b.call("POST", &format!("/v1/scans/{SCAN0}/exports"), Some(OPERATOR), Some(json!({"format": "las"}))).await;
+        let j = wait_job(&b, job["job_id"].as_str().unwrap(), 5.0).await;
+        assert_eq!(j["problem"]["code"], "decode_failed", "{j}");
+        let left = std::fs::read_dir(b.dir.join("data/exports")).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(left, 0);
+        // Without intensity it skips the preview, and fails the same way.
+        let (_, job) = b.call("POST", &format!("/v1/scans/{SCAN0}/exports"), Some(OPERATOR), Some(json!({"format": "ply", "intensity": "none"}))).await;
+        let j = wait_job(&b, job["job_id"].as_str().unwrap(), 5.0).await;
+        assert_eq!(j["problem"]["code"], "decode_failed", "{j}");
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unwritable_exports_directory_fails_the_export_as_a_cache_error() {
+        let (fx, cfg) = junk_fixtures();
+        let b = Bridge::with_mock(cfg).await;
+        std::fs::write(b.dir.join("data/exports"), b"in the way").unwrap();
+        let (_, job) = b.call("POST", &format!("/v1/scans/{SCAN0}/exports"), Some(OPERATOR), Some(json!({"format": "ply"}))).await;
+        let j = wait_job(&b, job["job_id"].as_str().unwrap(), 5.0).await;
+        assert_eq!(j["problem"]["code"], "cache_error", "{j}");
+        assert!(j["problem"]["detail"].as_str().unwrap().starts_with("exports directory"), "{j}");
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_export_or_measurement_cancelled_before_it_starts_is_cancelled() {
+        let b = Bridge::new().await;
+        let req: crate::export::ExportRequest = serde_json::from_value(json!({"format": "ply"})).unwrap();
+        let id = running_job(&b.st, "export", true);
+        run_export(b.st.clone(), id.clone(), SCAN0.into(), req).await;
+        assert_eq!(job_state(&b, &id).job.state, JobState::Cancelled);
+        assert!(logged(&b.st, &format!("Export job {id} cancelled")));
+        let id = running_job(&b.st, "measure", true);
+        run_measure(b.st.clone(), id.clone(), SCAN0.into(), None).await;
+        assert_eq!(job_state(&b, &id).job.state, JobState::Cancelled);
+        assert!(logged(&b.st, &format!("Measurement job {id} cancelled")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn measuring_a_junk_scan_file_fails() {
+        let (fx, cfg) = junk_fixtures();
+        let b = Bridge::with_mock(cfg).await;
+        let (code, job) = b.call("POST", &format!("/v1/scans/{SCAN0}/measurements"), Some(OPERATOR), Some(json!({"kind": "opening"}))).await;
+        assert_eq!(code, StatusCode::ACCEPTED, "{job}");
+        let j = wait_job(&b, job["job_id"].as_str().unwrap(), 5.0).await;
+        assert_eq!(j["problem"]["code"], "measure_failed", "{j}");
+        assert!(j["problem"]["detail"].as_str().unwrap().starts_with("open: "), "{j}");
+        // A crop needs the preview's size: a junk JPEG fails first.
+        let body = json!({"kind": "opening", "box": {"x0": 10, "y0": 10, "x1": 20, "y1": 20}});
+        let (_, job) = b.call("POST", &format!("/v1/scans/{SCAN0}/measurements"), Some(OPERATOR), Some(body)).await;
+        let j = wait_job(&b, job["job_id"].as_str().unwrap(), 5.0).await;
+        assert_eq!(j["problem"]["code"], "invalid_request", "{j}");
+        assert!(j["problem"]["detail"].as_str().unwrap().starts_with("preview: "), "{j}");
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn measuring_a_scan_with_no_file_fails() {
+        let b = Bridge::new().await;
+        let id = running_job(&b.st, "measure", false);
+        run_measure(b.st.clone(), id.clone(), SCAN0.into(), Some(([0, 0, 10, 10], 0.01))).await;
+        let j = job_state(&b, &id).job;
+        assert_eq!(j.state, JobState::Failed);
+        assert_eq!(j.problem.unwrap()["code"], "scanner_error");
+    }
+
+    fn meta(rows: u32, cols: u32) -> trimble_tzf::ScanMeta {
+        trimble_tzf::ScanMeta {
+            grid_rows: rows,
+            grid_cols: cols,
+            tile_size: 0,
+            n_points: 0,
+            angle_step_rad: [std::f64::consts::TAU / cols as f64, std::f64::consts::PI / rows as f64],
+            start_ha_rad: 0.0,
+            start_va_rad: 0.0,
+            tilt: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        }
+    }
+
+    #[test]
+    fn a_preview_box_maps_onto_grid_cells_with_its_margin() {
+        let m = meta(1000, 2000);
+        // Preview 200 × 100: 10 cells a pixel each way; no margin.
+        let c = crop_cells(&m, 200, 100, [20, 10, 40, 30], 0.0).unwrap();
+        assert_eq!((c.r0, c.r1, c.c0, c.c1), (100, 300, 200, 400));
+        assert!(c.contains(150, 300) && !c.contains(50, 300) && !c.contains(150, 500));
+        // A margin of 5 cells' angle each way, clamped at the top row.
+        let step = m.angle_step_rad[0];
+        let c = crop_cells(&m, 200, 100, [20, 0, 40, 30], 5.0 * step).unwrap();
+        assert_eq!((c.r0, c.c0, c.c1), (0, 195, 405));
+        // Across the seam: x1 < x0 wraps.
+        let c = crop_cells(&m, 200, 100, [190, 10, 10, 30], 0.0).unwrap();
+        assert_eq!((c.c0, c.c1), (1900, 100));
+        assert!(c.contains(150, 1950) && c.contains(150, 50) && !c.contains(150, 1000));
+        let w = Cells { r0: 0, r1: 1, c0: 5, c1: 2 };
+        assert!(w.contains(0, 6) && w.contains(1, 1) && !w.contains(2, 1));
+    }
+
+    #[test]
+    fn a_preview_box_outside_the_preview_or_empty_is_refused() {
+        let m = meta(100, 200);
+        for b in [[-1, 0, 10, 10], [0, 0, 201, 10], [0, 10, 10, 10], [0, 0, 10, 101], [5, 0, 5, 10]] {
+            assert!(crop_cells(&m, 200, 100, b, 0.0).err().unwrap().contains("200x100"), "{b:?}");
+        }
+    }
+
+    #[test]
+    fn cloud_names_carry_the_range_they_were_cut_at() {
+        assert_eq!(super::cloud_name("abc"), "abc.r60t30.cloud");
+        assert!(super::prepared_budget() > 0);
     }
 }

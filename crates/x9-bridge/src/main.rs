@@ -39,12 +39,17 @@ mod view3d;
 mod work;
 mod worker;
 mod workmode;
+#[cfg(test)]
+mod testkit;
 
 use anyhow::{bail, Context};
 use model::{Caller, Role, Rules};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// How long open connections get to close after Ctrl-C.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 fn load_tokens(path: &str) -> anyhow::Result<HashMap<String, Caller>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading token file {path}"))?;
@@ -117,10 +122,108 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(worker::run(st.clone()));
     let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
     eprintln!("x9-bridge {} listening on http://{addr}/v1 (scanner {base})", routes::VERSION);
-    axum::serve(listener, routes::router(st))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    // On Ctrl-C, finish requests in flight, but an event stream never
+    // finishes: give open connections a few seconds, then stop anyway.
+    let stopping = Arc::new(tokio::sync::Notify::new());
+    let signal = stopping.clone();
+    let server = axum::serve(listener, routes::router(st)).with_graceful_shutdown(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        signal.notify_one();
+    });
+    tokio::select! {
+        served = server => served?,
+        _ = async {
+            stopping.notified().await;
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+        } => eprintln!("x9-bridge: open connections did not close within {} s; stopping", SHUTDOWN_GRACE.as_secs()),
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token_file(text: &str) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(util::new_id("x9-tokens"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tokens");
+        std::fs::write(&path, text).unwrap();
+        let p = path.to_string_lossy().into_owned();
+        (dir, p)
+    }
+
+    #[test]
+    fn load_tokens_reads_name_role_token_lines_and_skips_comments() {
+        let (dir, p) = token_file("# the crew\n\n  crew operator operator-token-0123456789\nbot   agent\tagent-token-0123456789abc  \n");
+        let t = load_tokens(&p).unwrap();
+        assert_eq!(t.len(), 2);
+        let crew = &t["operator-token-0123456789"];
+        assert_eq!((crew.name.as_str(), crew.role), ("crew", Role::Operator));
+        assert_eq!(t["agent-token-0123456789abc"].role, Role::Agent);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn load_tokens_names_the_line_that_is_wrong() {
+        for (text, want) in [
+            ("crew operator\n", "tokens:1: expected `name role token`"),
+            ("# ok\ncrew operator token-0123456789abcdef extra\n", "tokens:2: expected `name role token`"),
+            ("crew root token-0123456789abcdef\n", "tokens:1: unknown role \"root\""),
+            ("crew viewer short\n", "tokens:1: token for crew is shorter than 16 characters"),
+            ("# nobody\n\n", "holds no tokens"),
+        ] {
+            let (dir, p) = token_file(text);
+            let e = format!("{:#}", load_tokens(&p).unwrap_err());
+            assert!(e.contains(want), "{text:?}: {e}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        let e = format!("{:#}", load_tokens("/nonexistent/x9-tokens").unwrap_err());
+        assert!(e.starts_with("reading token file /nonexistent/x9-tokens"), "{e}");
+    }
+
+    /// `main` as the service starts, up to binding its address: every step
+    /// before it runs, and a bad address stops it there. (Skipped when the
+    /// test filter happens to be a subcommand name, which `main` would run.)
+    #[test]
+    fn main_reads_its_environment_and_stops_at_the_first_problem() {
+        let subcommands = ["register", "bench", "analyze", "ask", "plan", "worker"];
+        if std::env::args().nth(1).is_some_and(|a| subcommands.contains(&a.as_str())) {
+            return;
+        }
+        let vars = ["BRIDGE_TOKENS", "BRIDGE_POLL_MS", "BRIDGE_DATA", "BRIDGE_RECIPES", "BRIDGE_ADDR", "X9_BASE"];
+        let clear = || vars.iter().for_each(|k| std::env::remove_var(k));
+        clear();
+        let err = |r: anyhow::Result<()>| format!("{:#}", r.unwrap_err());
+        assert!(err(main()).contains("BRIDGE_TOKENS must point at a token file"));
+
+        let (dir, tokens) = token_file("crew operator operator-token-0123456789\n");
+        std::env::set_var("BRIDGE_TOKENS", &tokens);
+        std::env::set_var("BRIDGE_POLL_MS", "soon");
+        assert!(err(main()).contains("BRIDGE_POLL_MS"));
+
+        // Everything in place but the address: state kept from before a
+        // restart is loaded, a bad recipe is skipped, then binding fails.
+        let (data, recipes) = (dir.join("data"), dir.join("recipes"));
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&recipes).unwrap();
+        std::fs::write(recipes.join("broken.toml"), "id = \"x\"\n").unwrap();
+        std::fs::write(data.join("grants.json"), r#"[{"project_id": "p", "expires_at": "2099-01-01T00:00:00Z", "grant_id": "g1", "granted_by": "crew", "scans_used": 0}]"#).unwrap();
+        std::fs::write(data.join("registrations.json"), r#"[{"project_id": "p", "frame_scan_id": null, "stations": [], "pairs": [], "walls": [], "summary": "", "updated_at": ""}]"#).unwrap();
+        std::fs::write(data.join("missions.json"), r#"[{"mission_id": "m1", "project_id": "p", "goal": "Scan the yard", "kind": "custom", "done_when": "seen",
+                                                        "state": "active", "created_by": "crew", "created_at": "2026-11-10T10:00:00Z", "targets": []}]"#).unwrap();
+        std::env::set_var("BRIDGE_POLL_MS", "50");
+        std::env::set_var("BRIDGE_DATA", &data);
+        std::env::set_var("BRIDGE_RECIPES", &recipes);
+        std::env::set_var("X9_BASE", "http://127.0.0.1:9/api/v1");
+        std::env::set_var("BRIDGE_ADDR", "not-an-address");
+        assert!(err(main()).starts_with("binding not-an-address"));
+        // BRIDGE_RECIPES defaults to a folder in the data directory.
+        std::env::remove_var("BRIDGE_RECIPES");
+        std::env::set_var("BRIDGE_DATA", dir.join("fresh"));
+        assert!(err(main()).starts_with("binding not-an-address"));
+        assert!(dir.join("fresh").join("recipes").is_dir());
+        clear();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
