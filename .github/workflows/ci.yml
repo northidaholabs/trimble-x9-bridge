@@ -19,3 +19,53 @@ jobs:
           python-version: "3.13"
       - run: pip install jsonschema==4.23.0
       - run: python3 specs/list-mission/check.py
+  coverage:
+    # Line coverage of unit and end-to-end tests. Reported in the job summary
+    # and as an artifact; nothing is sent to an outside service.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: scripts/coverage.sh target/coverage
+        env:
+          COVERAGE_MIN: "90"
+      - if: always()
+        run: cat target/coverage/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: target/coverage/
+  ui:
+    # The web UI in a browser, against the simulator and the bridge.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/x9-bridge/ui-tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: cargo build --locked -p x9-bridge -p x9-mock
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test
+      - if: always()
+        # The web UI's JavaScript coverage, as a table in the job summary.
+        run: |
+          test -f coverage/ui-coverage.json || exit 0
+          node -e '
+            const c = require("./coverage/ui-coverage.json").files;
+            console.log("| File | Bytes run | Functions entered |\n| --- | ---: | ---: |");
+            for (const [f, v] of Object.entries(c)) console.log(`| ${f} | ${v.bytes.pct}% | ${v.functions.pct}% |`);
+          ' >> "$GITHUB_STEP_SUMMARY"
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-test-results
+          path: crates/x9-bridge/ui-tests/test-results/
+

@@ -1930,9 +1930,11 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "tower",
  "trimble-tzf",
  "uuid",
  "x9-client",
+ "x9-mock",
  "zune-jpeg",
 ]
 
@@ -1946,6 +1948,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "x9-client",
+ "x9-mock",
 ]
 
 [[package]]
@@ -1960,6 +1963,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "url",
+ "x9-mock",
 ]
 
 [[package]]

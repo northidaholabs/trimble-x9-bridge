@@ -219,7 +219,8 @@ pub struct Timings {
 
 #[cfg(test)]
 mod tests {
-    use super::JobState;
+    use super::*;
+    use serde_json::Value;
 
     #[test]
     fn job_state_spelling_matches_serde() {
@@ -227,5 +228,76 @@ mod tests {
         for s in [AwaitingApproval, Queued, Running, Succeeded, Failed, Cancelled] {
             assert_eq!(serde_json::to_value(s).unwrap(), s.as_str());
         }
+    }
+
+
+    #[test]
+    fn only_operators_and_admins_are_operators() {
+        assert_eq!([Role::Viewer, Role::Agent, Role::Operator, Role::Admin].map(Role::is_operator), [false, false, true, true]);
+        assert_eq!(serde_json::to_value(Role::Admin).unwrap(), "admin");
+        assert!(serde_json::from_value::<Role>(serde_json::json!("root")).is_err());
+    }
+
+    #[test]
+    fn default_rules_ask_for_approval_and_keep_a_reserve() {
+        let r = Rules::default();
+        assert!(r.require_approval_for_scans && r.refuse_aim_after_move);
+        assert_eq!((r.min_battery_pct_to_scan, r.max_queue_length), (15, 20));
+        assert_eq!(serde_json::to_value(&r).unwrap()["min_storage_free_bytes"], 2_000_000_000u64);
+    }
+
+    #[test]
+    fn a_window_must_lie_on_the_sphere() {
+        let w = |start_ha, delta_ha, start_va, delta_va| Window { start_ha, delta_ha, start_va, delta_va };
+        assert!(w(0.0, TAU, 0.0, PI).validate().is_ok());
+        assert!(w(6.0, 0.5, 1.0, 0.5).validate().is_ok());
+        for bad in [w(TAU, 0.5, 1.0, 0.5), w(-0.1, 0.5, 1.0, 0.5), w(1.0, 0.0, 1.0, 0.5), w(1.0, 7.0, 1.0, 0.5),
+                    w(1.0, 0.5, -0.1, 0.5), w(1.0, 0.5, 1.0, 0.0), w(1.0, 0.5, 3.0, 0.5)] {
+            assert!(bad.validate().unwrap_err().contains("out of range"), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_scan_request_needs_a_mode_and_a_window_only_for_an_area() {
+        let win = Window { start_ha: 1.0, delta_ha: 0.5, start_va: 1.0, delta_va: 0.5 };
+        let req = |kind, mode: &str, window| ScanRequest { project_id: "p".into(), kind, mode: mode.into(), color: false, window, note: None };
+        assert!(req(ScanKind::FullDome, "STD_L0", None).validate().is_ok());
+        assert!(req(ScanKind::Area, "STD_L2", Some(win)).validate().is_ok());
+        assert_eq!(req(ScanKind::FullDome, "  ", None).validate().unwrap_err(), "mode is required");
+        assert_eq!(req(ScanKind::Area, "STD_L2", None).validate().unwrap_err(), "an area scan needs a window");
+        assert_eq!(req(ScanKind::FullDome, "STD_L0", Some(win)).validate().unwrap_err(), "a full-dome scan takes no window");
+        assert!(req(ScanKind::Area, "STD_L2", Some(Window { delta_va: 9.0, ..win })).validate().is_err());
+        let parsed: ScanRequest = serde_json::from_value(serde_json::json!({"project_id": "p", "kind": "full_dome", "mode": "STD_L0"})).unwrap();
+        assert!(!parsed.color && parsed.window.is_none() && parsed.note.is_none());
+    }
+
+    #[test]
+    fn only_succeeded_failed_and_cancelled_are_final() {
+        use JobState::*;
+        let finals: Vec<bool> = [AwaitingApproval, Queued, Running, Succeeded, Failed, Cancelled].iter().map(|s| s.is_final()).collect();
+        assert_eq!(finals, [false, false, false, true, true, true]);
+    }
+
+    #[test]
+    fn a_job_leaves_out_what_it_does_not_have() {
+        let job = Job { job_id: "job_1".into(), kind: "scan".into(), state: JobState::Queued, phase: None, progress: None, requested_by: "agent".into(),
+                        run_id: None, created_at: "t".into(), started_at: None, finished_at: None, result: None, problem: None,
+                        partial_scan_id: None, request: None, project_name: None };
+        let v = serde_json::to_value(&job).unwrap();
+        for absent in ["phase", "progress", "result", "problem", "partial_scan_id", "request", "project_name"] {
+            assert!(v.get(absent).is_none(), "{absent}");
+        }
+        assert_eq!((v["state"].as_str(), v["run_id"].clone()), (Some("queued"), Value::Null));
+        let t = serde_json::to_value(Timings { sweep_s: Some(1.5), ..Default::default() }).unwrap();
+        assert_eq!(t, serde_json::json!({"sweep_s": 1.5}));
+    }
+
+    #[test]
+    fn a_grant_flattens_its_request_and_keeps_its_expiry_private() {
+        let g: Grant = serde_json::from_value(serde_json::json!({"project_id": "p", "expires_at": "2030-01-01T00:00:00Z", "grant_id": "g1", "granted_by": "op", "scans_used": 2})).unwrap();
+        assert_eq!((g.req.max_scans, g.req.allow_color, g.expires_unix), (None, false, 0));
+        let v = serde_json::to_value(&g).unwrap();
+        assert_eq!(v["project_id"], "p");
+        assert!(v.get("expires_unix").is_none() && v.get("note").is_none());
     }
 }

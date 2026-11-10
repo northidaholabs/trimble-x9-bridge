@@ -184,7 +184,10 @@ pub fn opening(all: &[[f64; 3]]) -> Result<Opening, String> {
         hist[((v - smin) / CELL) as usize] += 1;
     }
     let need = 2000usize.max(p.len() * 3 / 100);
-    if let Some(i) = (1..nb).find(|&i| hist[i] >= need && hist[i] >= hist[i - 1] && hist[i] >= hist[i + 1]) {
+    // A bin past either end counts as empty, so a wall whose points all fall in
+    // the first bin (a clean close-up) is still found.
+    let peak = |i: usize| hist[i] >= need && (i == 0 || hist[i] >= hist[i - 1]) && (i == nb || hist[i] >= hist[i + 1]);
+    if let Some(i) = (0..=nb).find(|&i| peak(i)) {
         let d0 = smin + (i as f64 + 0.5) * CELL;
         let sel: Vec<[f64; 2]> = xy.iter().zip(&s).filter(|(_, v)| (*v - d0).abs() < WALL_TOL).map(|(q, _)| *q).collect();
         if let Some((n2, d2)) = fit_line(&sel) {

@@ -342,4 +342,75 @@ expect = ["point_count"]
         assert_eq!(v, json!({"a": {"x0": 1, "y0": 2, "x1": 3, "y1": 4}, "b": "for blinds in p1", "c": 5}));
         assert!(resolve(&json!("{{steps.later.x}}"), &ctx).is_err());
     }
+
+    #[test]
+    fn each_rule_a_recipe_breaks_is_named() {
+        let with = |from: &str, to: &str| {
+            assert!(GOOD.contains(from), "{from}");
+            Recipe::parse(&GOOD.replacen(from, to, 1)).unwrap_err()
+        };
+        assert!(with("id = \"t\"", "id = \"t t\"").contains("recipe id"));
+        assert!(with("id = \"t\"", &format!("id = \"{}\"", "x".repeat(65))).contains("recipe id"));
+        assert!(with("instructions = \"Draw a box.\"", "instructions = \"  \"").contains("needs instructions"));
+        assert!(with("of = \"export\"", "of = \"checks\"").contains("`of` must name an earlier step"));
+        assert!(with("of = \"export\"", "of = \"later\"").contains("`of` must name an earlier step"));
+        assert!(with("expect = [\"point_count\"]", "expect = []").contains("needs `expect`"));
+        assert!(with("kind = \"check\"", "kind = \"wait\"").contains("unknown kind \"wait\""));
+        assert!(with("preview_of = \"overview\"", "preview_of = \"aim\"").contains("`preview_of` must name an earlier step"));
+        assert!(with("operation = \"startScan\"", "operation = \"startScan\"\nreview = \"now\"").contains("`review` is for person steps"));
+        assert!(with("operation = \"startScan\"", "operation = \"startScan\"\npropose_from = \"box\"").contains("`propose_from` is for person steps"));
+        assert!(with("preview_of = \"overview\"", "propose_from = \"box\"").contains("`propose_from` must name an earlier step"));
+        assert!(with("{{input.purpose}}", "{{project_id.x}}").contains("placeholder"));
+        assert!(with("{{input.purpose}}", "{{weather}}").contains("placeholder"));
+        assert!(Recipe::parse("id = \"t\"\ntitle = 3").is_err(), "not a recipe at all");
+        assert_eq!(Recipe::parse("id = \"t\"\ntitle = \"T\"\nversion = \"1\"\nsteps = []\n").unwrap_err(), "a recipe needs at least one step");
+        // `review = "now"` and `propose_from` on a person step are fine.
+        let ok = GOOD.replacen("preview_of = \"overview\"", "preview_of = \"overview\"\nreview = \"now\"", 1);
+        assert_eq!(Recipe::parse(&ok).unwrap().steps[1].review.as_deref(), Some("now"));
+        let ok = format!("{GOOD}[[steps]]\nid = \"confirm\"\nkind = \"person\"\ninstructions = \"Confirm.\"\nneeds = [\"box\"]\npropose_from = \"box\"\n");
+        assert_eq!(Recipe::parse(&ok).unwrap().steps[5].propose_from.as_deref(), Some("box"));
+    }
+
+    #[test]
+    fn placeholders_are_found_in_strings_lists_and_tables() {
+        let mut out = Vec::new();
+        placeholders(&json!({"a": ["{{ input.x }} and {{project_id}}", 3], "b": {"c": "{{steps.s.f}}"}, "d": "{{unclosed"}), &mut out);
+        out.sort();
+        assert_eq!(out, ["input.x", "project_id", "steps.s.f"]);
+    }
+
+    #[test]
+    fn resolving_keeps_text_around_placeholders_and_writes_values_as_json() {
+        let ctx = json!({"project_id": "p1", "input": {"n": 3, "box": {"x0": 1}}, "steps": {"a": {"list": [1, 2]}}});
+        assert_eq!(resolve(&json!("n={{input.n}}, box={{input.box}}"), &ctx).unwrap(), json!("n=3, box={\"x0\":1}"));
+        assert_eq!(resolve(&json!(" {{ steps.a.list }} "), &ctx).unwrap(), json!([1, 2]));
+        assert_eq!(resolve(&json!(["{{project_id}}", true, null]), &ctx).unwrap(), json!(["p1", true, null]));
+        assert_eq!(resolve(&json!("left {{open"), &ctx).unwrap(), json!("left {{open"));
+        assert_eq!(resolve(&json!("{{a}} and {{b}}"), &json!({"a": "x", "b": "y"})).unwrap(), json!("x and y"));
+        assert_eq!(resolve(&json!("x {{input.missing}}"), &ctx).unwrap_err(), "{{input.missing}} has no value yet");
+        assert!(resolve(&json!({"k": ["{{nope}}"]}), &ctx).is_err());
+        assert_eq!(lookup(&ctx, "steps.a.list"), Some(json!([1, 2])));
+        assert_eq!(lookup(&ctx, "steps.b"), None);
+    }
+
+    #[test]
+    fn a_recipe_folder_loads_good_files_and_reports_the_rest() {
+        let dir = std::env::temp_dir().join(crate::util::new_id("x9-recipes"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.toml"), GOOD).unwrap();
+        std::fs::write(dir.join("b.toml"), GOOD).unwrap();
+        std::fs::write(dir.join("c.toml"), "not = [toml").unwrap();
+        std::fs::write(dir.join("d.toml"), include_str!("../tests/recipes/window-measurement.toml")).unwrap();
+        std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
+        let (ok, bad) = load_dir(&dir);
+        assert_eq!(ok.iter().map(|r| r.recipe_id.as_str()).collect::<Vec<_>>(), ["t", "window-measurement"]);
+        assert_eq!(bad.len(), 2);
+        assert_eq!(bad[0], ("b.toml".to_string(), "duplicate recipe id \"t\"".to_string()));
+        assert_eq!(bad[1].0, "c.toml");
+        assert_eq!(load_dir(&dir.join("missing")).0.len(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+        // A recipe serializes without its empty optional fields.
+        let v = serde_json::to_value(&ok[0]).unwrap();
+        assert!(v["steps"][0].get("needs").is_none() && v["steps"][1].get("operation_id").is_none());
+    }
 }

@@ -1,0 +1,14 @@
+id = "log-note"
+title = "Note"
+version = "1"
+
+[[inputs]]
+name = "text"
+type = "string"
+prompt = "What to note"
+
+[[steps]]
+id = "note"
+kind = "action"
+operation = "addLogNote"
+arguments = { text = "{{input.text}}" }

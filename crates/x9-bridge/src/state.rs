@@ -425,4 +425,208 @@ mod tests {
         inner.jobs.push(job("s1", "scan", JobState::Running, None));
         assert_eq!(inner.current_scan_job().unwrap().job_id, "s1");
     }
+
+    // ------------------------------------------------- saved state, callers ---
+
+    use crate::register::{Merged, Registration};
+    use crate::testkit::{Bridge, ADMIN, AGENT, OPERATOR, VIEWER};
+
+    /// A bridge whose scanner is never reached.
+    fn bridge() -> Bridge {
+        Bridge::on_scanner("http://127.0.0.1:1/api/v1")
+    }
+
+    fn errors(st: &AppState) -> Vec<String> {
+        st.inner.lock().unwrap().log.iter().filter(|e| e.kind == "error").map(|e| e.text.clone()).collect()
+    }
+
+    fn mission(project_id: &str, goal: &str) -> crate::mission::Mission {
+        let req: crate::mission::MissionRequest = serde_json::from_value(serde_json::json!({"goal": goal, "kind": "exterior", "done_when": "all four walls are seen"})).unwrap();
+        crate::mission::Mission::new(&req, project_id, "crew")
+    }
+
+    fn registration(project_id: &str) -> Registration {
+        Registration {
+            project_id: project_id.into(),
+            frame_scan_id: Some("s1".into()),
+            stations: vec![],
+            pairs: vec![],
+            walls: vec![],
+            summary: "1 station".into(),
+            updated_at: now_rfc3339(),
+        }
+    }
+
+    #[tokio::test]
+    async fn grants_survive_a_restart_but_expired_ones_do_not() {
+        let b = bridge();
+        let mut live = grant(1);
+        live.grant_id = "live".into();
+        let mut old = grant(0);
+        old.grant_id = "old".into();
+        old.req.expires_at = "2001-01-01T00:00:00Z".into();
+        let mut bad = grant(0);
+        bad.grant_id = "bad".into();
+        bad.req.expires_at = "tomorrow".into();
+        b.st.inner.lock().unwrap().grants = vec![live, old, bad];
+        b.st.save_grants();
+        assert!(b.dir.join("data/grants.json").exists());
+        // No stray temporary files.
+        assert_eq!(std::fs::read_dir(b.dir.join("data")).unwrap().count(), 1);
+
+        let again = Bridge::on_scanner("http://127.0.0.1:1/api/v1");
+        std::fs::copy(b.dir.join("data/grants.json"), again.dir.join("data/grants.json")).unwrap();
+        assert_eq!(again.st.load_grants(), 1);
+        let gs = again.st.inner.lock().unwrap().grants.clone();
+        assert_eq!((gs[0].grant_id.as_str(), gs[0].scans_used), ("live", 1));
+        assert_eq!(gs[0].expires_unix, crate::util::parse_rfc3339("2099-01-01T00:00:00Z").unwrap());
+    }
+
+    #[tokio::test]
+    async fn missing_or_broken_saved_files_load_nothing() {
+        let b = bridge();
+        assert_eq!((b.st.load_grants(), b.st.load_missions(), b.st.load_registrations()), (0, 0, 0));
+        assert!(errors(&b.st).is_empty());
+        for f in ["grants.json", "missions.json", "registrations.json"] {
+            std::fs::write(b.dir.join("data").join(f), b"{not json").unwrap();
+        }
+        assert_eq!((b.st.load_grants(), b.st.load_missions(), b.st.load_registrations()), (0, 0, 0));
+        let e = errors(&b.st);
+        assert_eq!(e.len(), 3, "{e:?}");
+        assert!(e[0].starts_with("Ignoring grants.json") && e[1].starts_with("Ignoring missions.json") && e[2].starts_with("Ignoring registrations.json"), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn missions_survive_a_restart() {
+        let b = bridge();
+        b.st.inner.lock().unwrap().missions.insert("p1".into(), mission("p1", "Survey the house"));
+        b.st.inner.lock().unwrap().missions.insert("p2".into(), mission("p2", "Survey the barn"));
+        b.st.save_missions();
+        b.st.inner.lock().unwrap().missions.clear();
+        assert_eq!(b.st.load_missions(), 2);
+        let ms = b.st.inner.lock().unwrap().missions.clone();
+        assert_eq!(ms["p1"].goal, "Survey the house");
+        assert_eq!(ms["p2"].project_id, "p2");
+    }
+
+    #[tokio::test]
+    async fn registrations_survive_a_restart() {
+        let b = bridge();
+        b.st.inner.lock().unwrap().registrations.insert("p1".into(), registration("p1"));
+        b.st.save_registrations();
+        b.st.inner.lock().unwrap().registrations.clear();
+        assert_eq!(b.st.load_registrations(), 1);
+        let r = b.st.inner.lock().unwrap().registrations["p1"].clone();
+        assert_eq!((r.frame_scan_id.as_deref(), r.summary.as_str()), (Some("s1"), "1 station"));
+    }
+
+    #[tokio::test]
+    async fn a_save_that_cannot_write_is_logged_and_leaves_nothing_behind() {
+        let b = bridge();
+        b.st.inner.lock().unwrap().grants = vec![grant(0)];
+        std::fs::remove_dir_all(b.dir.join("data")).unwrap();
+        b.st.save_grants();
+        b.st.save_missions();
+        b.st.save_registrations();
+        let e = errors(&b.st);
+        assert_eq!(e.len(), 3, "{e:?}");
+        assert!(e[0].starts_with("Could not save grants") && e[1].starts_with("Could not save missions") && e[2].starts_with("Could not save registrations"), "{e:?}");
+        assert!(!b.dir.join("data").exists());
+    }
+
+    #[tokio::test]
+    async fn merged_points_load_from_disk_once_and_only_for_safe_project_ids() {
+        let b = bridge();
+        for bad in ["", "../up", "a/b", "sp ace", &"x".repeat(129)] {
+            assert!(b.st.merged_path(bad).is_none(), "{bad:?}");
+            assert!(b.st.merged(bad).is_none());
+        }
+        let path = b.st.merged_path("p-1_A").unwrap();
+        assert!(path.ends_with("registration/p-1_A.merged"));
+        assert!(b.st.merged("p-1_A").is_none());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"junk").unwrap();
+        assert!(b.st.merged("p-1_A").is_none());
+        let mut m = Merged::default();
+        m.pts.push([1.0, 2.0, 3.0]);
+        m.spacing_mm.push(4.0);
+        m.station.push(1);
+        m.plan.push([1.0, 2.0]);
+        std::fs::write(&path, m.to_bytes()).unwrap();
+        assert_eq!(b.st.merged("p-1_A").unwrap().pts, m.pts);
+        // Kept in memory: the file is no longer read.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(b.st.merged("p-1_A").unwrap().station, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn geo_is_empty_until_the_project_is_registered() {
+        let b = bridge();
+        let g = b.st.geo("p1");
+        assert!(g.scans.is_empty() && g.walls.is_empty() && g.merged.is_none());
+        b.st.inner.lock().unwrap().registrations.insert("p1".into(), registration("p1"));
+        b.st.inner.lock().unwrap().merged.insert("p1".into(), std::sync::Arc::new(Merged::default()));
+        let g = b.st.geo("p1");
+        assert!(g.merged.is_some());
+    }
+
+    #[tokio::test]
+    async fn callers_are_known_by_their_bearer_token_and_role() {
+        let b = bridge();
+        let headers = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(axum::http::header::AUTHORIZATION, v.parse().unwrap());
+            h
+        };
+        assert_eq!(b.st.caller(&HeaderMap::new()).unwrap_err().code, "unauthorized");
+        assert_eq!(b.st.caller(&headers(&format!("Basic {AGENT}"))).unwrap_err().code, "unauthorized");
+        assert_eq!(b.st.caller(&headers("Bearer nope")).unwrap_err().code, "unauthorized");
+        assert_eq!(b.st.caller(&headers(&format!("Bearer {AGENT}  "))).unwrap().role, Role::Agent);
+        assert_eq!(b.st.require(&headers(&format!("Bearer {OPERATOR}")), Role::is_operator, "approve").unwrap().name, "crew");
+        assert_eq!(b.st.require(&headers(&format!("Bearer {ADMIN}")), Role::is_operator, "approve").unwrap().role, Role::Admin);
+        assert_eq!(b.st.require(&headers(&format!("Bearer {VIEWER}")), Role::is_operator, "approve").unwrap_err().code, "forbidden");
+    }
+
+    #[tokio::test]
+    async fn the_log_is_kept_and_published() {
+        let b = bridge();
+        let mut rx = b.st.events.subscribe();
+        let e = b.st.log("note", "Tripod moved", "crew", Some("p1"), &[("scan_id", "s1")]);
+        assert_eq!((e.kind.as_str(), e.project_id.as_deref(), e.refs["scan_id"].as_str()), ("note", Some("p1"), "s1"));
+        let ev = rx.try_recv().unwrap();
+        assert_eq!((ev.kind, ev.data["text"].as_str()), ("log", Some("Tripod moved")));
+        b.st.emit_job(&job("j1", "scan", JobState::Queued, None).job);
+        let ev = rx.try_recv().unwrap();
+        assert_eq!((ev.kind, ev.data["job_id"].as_str()), ("job", Some("j1")));
+        assert_eq!(b.st.inner.lock().unwrap().log.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_reads_the_scanner_or_says_it_is_not_connected() {
+        let b = bridge();
+        let (snap, raw) = b.st.snapshot().await;
+        assert!(!snap.connected && raw.is_none());
+        let b = Bridge::with_mock(x9_mock::Config { battery: 42, on_ac: true, ..crate::testkit::fast_mock() }).await;
+        let (snap, raw) = b.st.snapshot().await;
+        assert!(snap.connected && snap.on_ac);
+        assert_eq!(snap.battery_pct, Some(42));
+        assert!(snap.storage_free.unwrap() > 0);
+        assert!(raw.is_some());
+    }
+
+    #[test]
+    fn finished_jobs_are_left_alone_by_a_cancel() {
+        let mut inner = Inner { grants: vec![grant(1)], ..Default::default() };
+        inner.jobs.push(job("j1", "scan", JobState::Succeeded, Some("g1")));
+        inner.jobs.push(job("j2", "scan", JobState::AwaitingApproval, None));
+        assert_eq!(inner.cancel_job("j1").unwrap().state, JobState::Succeeded);
+        assert_eq!(inner.grants[0].scans_used, 1);
+        let j = inner.cancel_job("j2").unwrap();
+        assert_eq!(j.state, JobState::Cancelled);
+        assert!(j.finished_at.is_some());
+        // A grant that is gone: nothing to give back.
+        inner.jobs.push(job("j3", "scan", JobState::Queued, Some("g9")));
+        inner.cancel_job("j3");
+        assert_eq!(inner.grants[0].scans_used, 1);
+    }
 }

@@ -207,4 +207,166 @@ mod tests {
         assert!(!a.exists() && b.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    // ------------------------------------------------- the cache on the mock ---
+
+    use crate::testkit::{fast_mock, Bridge};
+    use crate::worker::tests::{dead_base, junk_fixtures, SCAN0};
+    use serde_json::json;
+
+    /// A scan id the mock does not list.
+    const GONE: &str = "0000aaaa-1111-2222-3333-444455556666";
+
+    fn touch(p: &Path) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"cached").unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scan_file_and_preview_are_downloaded_once_then_served_from_the_cache() {
+        let (fx, cfg) = junk_fixtures();
+        let b = Bridge::with_mock(cfg).await;
+        let tzf = scan_file(&b.st, SCAN0, FileKind::Tzf).await.unwrap();
+        assert_eq!(tzf, b.dir.join(format!("data/scans/{SCAN0}.tzf")));
+        assert_eq!(std::fs::read(&tzf).unwrap(), b"not a real scan file");
+        let jpg = scan_file(&b.st, SCAN0, FileKind::Preview).await.unwrap();
+        assert!(jpg.to_string_lossy().ends_with(".jpg"));
+        // Cached: the scanner's copy is not fetched again.
+        std::fs::write(&tzf, b"from the cache").unwrap();
+        let again = scan_file(&b.st, SCAN0, FileKind::Tzf).await.unwrap();
+        assert_eq!(std::fs::read(again).unwrap(), b"from the cache");
+        // No partial downloads left.
+        assert_eq!(std::fs::read_dir(b.dir.join("data/scans")).unwrap().count(), 2);
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_leaves_no_partial_file() {
+        // The mock has no file to serve.
+        let b = Bridge::new().await;
+        let e = scan_file(&b.st, SCAN0, FileKind::Tzf).await.unwrap_err();
+        assert_eq!(e.code, "scanner_error", "{e:?}");
+        assert_eq!(std::fs::read_dir(b.dir.join("data/scans")).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_scan_the_scanner_no_longer_lists_is_not_found_and_evicted() {
+        let b = Bridge::new().await;
+        let cached = cache_path(&b.st.data_dir, GONE, FileKind::Tzf);
+        touch(&cached);
+        let e = scan_file(&b.st, GONE, FileKind::Tzf).await.unwrap_err();
+        assert_eq!(e.code, "not_found");
+        assert!(!cached.exists());
+        // Ids that could leave the cache never reach the scanner.
+        assert_eq!(scan_file(&b.st, "../grants.json", FileKind::Tzf).await.unwrap_err().code, "not_found");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_scanner_serves_nothing_even_from_the_cache() {
+        let b = Bridge::on_scanner(&dead_base().await);
+        touch(&cache_path(&b.st.data_dir, SCAN0, FileKind::Tzf));
+        let e = scan_file(&b.st, SCAN0, FileKind::Tzf).await.unwrap_err();
+        assert_eq!(e.code, "scanner_disconnected");
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_cache_directory_is_a_cache_error() {
+        let (fx, cfg) = junk_fixtures();
+        let b = Bridge::with_mock(cfg).await;
+        std::fs::write(b.dir.join("data/scans"), b"in the way").unwrap();
+        let e = scan_file(&b.st, SCAN0, FileKind::Tzf).await.unwrap_err();
+        assert_eq!(e.code, "cache_error");
+        assert!(e.detail.as_deref().unwrap().starts_with("cache directory"), "{e:?}");
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scan_listed_without_a_file_id_has_no_file() {
+        use axum::{routing::get, Json, Router};
+        let app = Router::new().route("/api/v1/scans", get(|| async { Json(json!([{"scanUUID": SCAN0}])) }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let b = Bridge::on_scanner(&format!("http://{addr}/api/v1"));
+        let e = scan_file(&b.st, SCAN0, FileKind::Preview).await.unwrap_err();
+        assert_eq!((e.code, e.title.as_str()), ("not_found", "No such scan file"), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn evicting_a_scan_removes_its_files_exports_and_measurements_only() {
+        let b = Bridge::with_mock(fast_mock()).await;
+        let d = &b.st.data_dir;
+        let mine = [
+            cache_path(d, GONE, FileKind::Tzf),
+            cache_path(d, GONE, FileKind::Preview),
+            d.join(format!("views/{GONE}-2000000.x9v")),
+            d.join(format!("views/{GONE}.coverage.json")),
+            d.join("exports/exp_1.ply"),
+            d.join("measurements/msr_1.png"),
+        ];
+        let others = [cache_path(d, SCAN0, FileKind::Tzf), d.join(format!("views/{SCAN0}.coverage.png")), d.join("exports/exp_2.ply")];
+        for p in mine.iter().chain(&others) {
+            touch(p);
+        }
+        {
+            let mut inner = b.st.inner.lock().unwrap();
+            inner.exports.insert("exp_1".into(), json!({"scan_id": GONE}));
+            inner.export_files.insert("exp_1".into(), mine[4].clone());
+            inner.exports.insert("exp_2".into(), json!({"scan_id": SCAN0}));
+            inner.export_files.insert("exp_2".into(), others[2].clone());
+            inner.measurements.insert("msr_1".into(), json!({"scan_id": GONE}));
+            inner.measurement_files.insert("msr_1".into(), mine[5].clone());
+            inner.next_stations.insert(GONE.into(), (json!({}), vec![]));
+        }
+        evict(&b.st, GONE).await;
+        for p in &mine {
+            assert!(!p.exists(), "{p:?}");
+        }
+        for p in &others {
+            assert!(p.exists(), "{p:?}");
+        }
+        let inner = b.st.inner.lock().unwrap();
+        assert!(!inner.exports.contains_key("exp_1") && inner.exports.contains_key("exp_2"));
+        assert!(inner.measurements.is_empty() && inner.measurement_files.is_empty());
+        assert!(inner.next_stations.is_empty());
+        drop(inner);
+        // A bad id is ignored.
+        evict(&b.st, "../data").await;
+        assert!(b.st.data_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn a_viewer_build_of_a_junk_scan_file_fails_to_decode() {
+        let (fx, cfg) = junk_fixtures();
+        let b = Bridge::with_mock(cfg).await;
+        for part in [ViewPart::Points(VIEW_POINTS), ViewPart::Coverage, ViewPart::Image] {
+            let e = view_file(&b.st, SCAN0, part).await.unwrap_err();
+            assert_eq!(e.code, "decode_failed", "{part:?}");
+            assert!(e.detail.as_deref().unwrap().starts_with("open: "), "{e:?}");
+        }
+        assert!(!b.st.data_dir.join("views").exists());
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    #[tokio::test]
+    async fn built_viewer_files_are_served_from_the_cache() {
+        let (fx, cfg) = junk_fixtures();
+        let b = Bridge::with_mock(cfg).await;
+        let views = b.st.data_dir.join("views");
+        let built = [
+            (ViewPart::Points(50_000), views.join(format!("{SCAN0}-50000.x9v"))),
+            (ViewPart::Coverage, views.join(format!("{SCAN0}.coverage.json"))),
+            (ViewPart::Image, views.join(format!("{SCAN0}.coverage.png"))),
+        ];
+        for (_, p) in &built {
+            touch(p);
+        }
+        for (part, p) in built {
+            assert_eq!(view_file(&b.st, SCAN0, part).await.unwrap(), p);
+        }
+        // Ids are checked first; scans the scanner dropped are not served.
+        assert_eq!(view_file(&b.st, "nope/..", ViewPart::Coverage).await.unwrap_err().code, "not_found");
+        assert_eq!(view_file(&b.st, GONE, ViewPart::Coverage).await.unwrap_err().code, "not_found");
+        std::fs::remove_dir_all(fx).unwrap();
+    }
 }

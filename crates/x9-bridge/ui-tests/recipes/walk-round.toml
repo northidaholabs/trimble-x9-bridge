@@ -1,0 +1,40 @@
+# Test recipe for the UI tests: two person steps (one the agent decides and
+# a person reviews at the end), then a log note. No scanner work.
+
+id = "walk-round"
+title = "Walk-round check"
+version = "1"
+summary = "Name the side, count its windows, and note it in the field log."
+
+[[inputs]]
+name = "side"
+type = "choice"
+choices = ["front", "back"]
+prompt = "Which side of the building?"
+
+[[inputs]]
+name = "floors"
+type = "number"
+prompt = "How many floors?"
+
+[[steps]]
+id = "label"
+title = "Name the side"
+kind = "person"
+instructions = "Say what the side faces, e.g. the street."
+needs = ["label"]
+review = "final"
+
+[[steps]]
+id = "count"
+title = "Count the windows"
+kind = "person"
+instructions = "Count the windows on this side."
+needs = ["windows"]
+
+[[steps]]
+id = "note"
+title = "Note it"
+kind = "action"
+operation = "addLogNote"
+arguments = { text = "Walk-round {{input.side}}: {{steps.count.windows}} windows" }
