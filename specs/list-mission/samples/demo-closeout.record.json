@@ -18,7 +18,8 @@
     },
     {
       "line_id": "1.2", "status": "declined",
-      "reason": "The face never came back into view."
+      "reason": "The face never came back into view.",
+      "decided": { "by": { "name": "The replay's operator (a scripted reply)" }, "via": "a scripted reply in the replay" }
     },
     {
       "line_id": "2.1", "status": "answered", "conformance": "not_applicable",

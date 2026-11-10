@@ -56,7 +56,7 @@
       }
     },
     "point": {
-      "description": "ITP inspection point. H hold: this party's release is owed on the line, and acceptance waits for it. Nothing is locked: the crew can go on and leave, and the record shows the release as owed. W witness: the party is told and may attend; nothing waits for them. R review: the party reviews the record afterwards. S surveillance: no signature.",
+      "description": "ITP inspection point. H hold: as in an ITP, the trade's next work waits for this party's release. The contract enforces that, not the bridge. The bridge never holds the scanning crew; it shows the release as owed until it is given. W witness: the party is told and may attend; nothing waits for them. R review: the party reviews the record afterwards. S surveillance: no signature.",
       "enum": ["H", "W", "R", "S"]
     },
     "tolerance": {

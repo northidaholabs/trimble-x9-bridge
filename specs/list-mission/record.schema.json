@@ -50,6 +50,18 @@
       },
       "allOf": [ { "if": { "required": ["left_open"], "properties": { "left_open": { "minItems": 1 } } }, "then": { "required": ["reason"] } } ]
     },
+    "decision": {
+      "description": "A person's decision on a line that is not a signature: a decline, or an answer below the measured grade. The agent may propose it; a person makes it.",
+      "type": "object",
+      "required": ["by", "via"],
+      "additionalProperties": false,
+      "properties": {
+        "by": { "$ref": "#/$defs/person" },
+        "at": { "type": "string", "format": "date-time" },
+        "via": { "type": "string", "description": "How it reached the bridge: web UI, asked in the chat, relayed by the agent, or a scripted reply in a replay." },
+        "proposed_by_agent": { "type": "boolean", "description": "True when the agent proposed it and the person said yes." }
+      }
+    },
     "agent": {
       "description": "Who proposed or computed it, as specs/control-plane.md part B asks. client, model and plane are declared, not verified.",
       "type": "object",
@@ -68,13 +80,14 @@
         "line_id": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)*$" },
         "status": {
           "enum": ["open", "not_yet", "does_not_fit", "answered", "declined"],
-          "description": "open: nothing captured. not_yet and does_not_fit: the bridge's own verdicts, with its reason. answered: the line has evidence, at the grade the evidence says. declined: a person or the agent closed it without an answer, with a reason. A line left open at sign-off keeps its status and is named in capture_sign_off."
+          "description": "open: nothing captured. not_yet and does_not_fit: the bridge's own verdicts, with its reason. answered: the line has evidence, at the grade the evidence says. declined: a person closed it without an answer, with a reason, named in decided. The agent may propose a decline; it cannot make one. A line left open at sign-off keeps its status and is named in capture_sign_off."
         },
         "conformance": {
           "enum": ["conforming", "non_conforming", "neutral", "not_applicable"],
           "description": "Only with answered. conforming and non_conforming: the evidence against the line's tolerance or requirement. On a measured answer it is the bridge's call; on a seen or attested answer it is the person's. neutral: answered, but the tolerance makes no call for this case. not_applicable: the line asks for a figure or a record, not a pass. The four states are the ones field inspection software already uses."
         },
         "reason": { "type": "string", "description": "Why not yet, does not fit, declined or neutral, in the bridge's words where it has them." },
+        "decided": { "$ref": "#/$defs/decision", "description": "Who declined the line. Required with declined." },
         "evidence": {
           "type": "object",
           "required": ["grade"],
@@ -87,11 +100,13 @@
             "seen_share": { "type": "number", "minimum": 0, "maximum": 1 },
             "pictures": { "type": "array", "items": { "type": "string" }, "description": "Links to the views in the field web UI or the report." },
             "document": { "type": "string", "description": "With attested: the document the statement rests on. Asked for; a statement with none is kept and printed as such." },
+            "by": { "$ref": "#/$defs/decision", "description": "With seen or attested: the person who marked the picture or gave the statement, and so made the conformance call. Never set on measured: that answer is the bridge's." },
             "live": { "type": "boolean", "description": "False when the answer was worked out from finished scans, not asked during the visit." }
           },
           "allOf": [
             { "if": { "properties": { "grade": { "const": "measured" } } }, "then": { "required": ["reading"] } },
-            { "if": { "properties": { "grade": { "const": "seen" } } }, "then": { "required": ["pictures"], "properties": { "pictures": { "minItems": 1 } } } }
+            { "if": { "properties": { "grade": { "const": "seen" } } }, "then": { "required": ["pictures"], "properties": { "pictures": { "minItems": 1 } } } },
+            { "if": { "properties": { "grade": { "enum": ["seen", "attested"] } } }, "then": { "required": ["by"] }, "else": { "not": { "required": ["by"] } } }
           ]
         },
         "place": {
@@ -120,10 +135,10 @@
               "party": { "type": "string" },
               "action": {
                 "enum": ["done", "witnessed", "released", "accepted", "accepted_with_note", "rejected"],
-                "description": "done: the party says the work is finished. witnessed: the party attended. released: a hold point is lifted. accepted, accepted_with_note, rejected: the party's call on the line. Plain accepted is for a conforming or not_applicable answer; a call on anything else carries a note."
+                "description": "done: the party says the work is finished. witnessed: the party attended. released: a hold point is lifted. accepted, accepted_with_note, rejected: the party's call on the line. Plain accepted is for a conforming or not_applicable answer; a call on anything else carries a note. For a hold party, a release or a call settles what it owes; acceptance of the work also needs no rejection."
               },
               "note": { "type": "string" },
-              "on_earlier_answer": { "type": "boolean", "description": "Set by the bridge when the line's answer has changed since. The signature stays in the record and stops counting." },
+              "on_earlier_answer": { "type": "boolean", "description": "Set by the bridge when the line's status or conformance has changed since, including from open to answered, or its figure has moved more than 5 mm. The signature stays in the record and stops counting." },
               "by": { "$ref": "#/$defs/person" },
               "at": { "type": "string", "format": "date-time" },
               "via": { "type": "string" }
@@ -137,6 +152,7 @@
       "allOf": [
         { "if": { "properties": { "status": { "const": "answered" } } }, "then": { "required": ["conformance", "evidence"] }, "else": { "not": { "required": ["conformance"] } } },
         { "if": { "properties": { "status": { "enum": ["not_yet", "does_not_fit", "declined"] } } }, "then": { "required": ["reason"] } },
+        { "if": { "properties": { "status": { "const": "declined" } } }, "then": { "required": ["decided"] }, "else": { "not": { "required": ["decided"] } } },
         { "if": { "properties": { "conformance": { "const": "neutral" } }, "required": ["conformance"] }, "then": { "required": ["reason"] } }
       ]
     }

@@ -1,6 +1,6 @@
 # Spec: A mission from a list
 
-Owner: Jim · Date: 2026-11-09, revised 2026-11-10 · Status: draft, not approved
+Owner: Jim · Date: 2026-11-09, revised twice on 2026-11-10 · Status: draft, not approved
 
 A mission today starts from one sentence. The people who would buy the work
 hold lists: an inspection and test plan, a punch list, a closeout list. This
@@ -51,9 +51,15 @@ with their reason.
 
 ## The rule: tell, don't stop
 
-The bridge stops a person from nothing in this spec. It says what is open
-and what the evidence carries. The person decides. The record prints the
-decision as what it was, with their name and their reason.
+The bridge refuses a person nothing that is theirs to decide. It says what
+is open and what the evidence carries. The person decides, and the record
+prints the decision as what it was, with their name.
+
+Where a person goes past what the bridge said, the bridge asks for one
+sentence of why: leaving with lines open, declining a line, and a call on
+anything that is not a clean pass. That sentence is the only thing it asks
+for. Whether it is required or only asked for is an open question; the
+draft requires it.
 
 A block gets routed around, and the record is then less true. A crew that
 cannot leave with a line open declines the line, and the record says
@@ -64,8 +70,9 @@ Three things stay fixed. None of them is a person's choice being refused:
 - **The record prints what it has.** Evidence carries the grade it was
   given, and a pass is there only where the tolerance or a named person gave
   one. A statement never prints as a measurement.
-- **An agent is not a person.** It signs nothing, attests nothing and marks
-  no picture. It can relay a person's words, marked as relayed.
+- **An agent is not a person.** It signs nothing, attests nothing, marks no
+  picture and declines no line. It can propose any of those, and relay a
+  person's words, marked as relayed.
 - **The instrument's own guards are not in this spec.** Approvals and grants
   stay as [`any-agent.md`](any-agent.md) and
   [`control-plane.md`](control-plane.md) have them. They guard what an agent
@@ -149,6 +156,12 @@ asked, with both grades. The bridge never raises a grade. A `measured`
 answer is the bridge's alone: it carries a reading, and nobody edits its
 figure or its call. A person who disagrees says so in their signature.
 
+Every answer that is not the bridge's names its person. A seen answer names
+who marked the picture, an attested one who gave the statement, and a
+decline who declined. The agent may propose a decline ("the face never came
+back into view"); a person says yes, and the record names them and that the
+agent proposed it.
+
 The other measured kinds the schema names (`height`, `opening`, `clearance`,
 `low_spots`, `map`) are accepted in a list and stay `open`, with the reason
 that the bridge cannot ask them yet. A person can decline them, leave them
@@ -175,9 +188,10 @@ For every client:
 - An `agent` token signs nothing. There is no tool for it and the route
   answers 403. A signature the agent relays from the chat is marked relayed,
   as the mission's sign-off is.
-- A later answer that changes a line's `conformance`, or moves its figure by
-  more than the 5 mm `on-site-answers.md` scores a miss at, marks the calls
-  on that line as made on the earlier answer. They stay in the record, stop
+- A later change to a line's `status` or `conformance`, including from
+  `open` to `answered`, or a move of its figure by more than the 5 mm
+  `on-site-answers.md` scores a miss at, marks the calls on that line as
+  made on the earlier answer. They stay in the record, stop
   counting, and the record and the report flag the line.
 
 ### E. Ready to leave, and accepted
@@ -190,23 +204,35 @@ Two statements. Neither stops anyone.
   sign-off takes one reason and names those lines as left open, and the
   report opens with them. A line left open keeps its status. It is not
   turned into a decline.
-- **Accepted** is new and separate: every hold and review party has made a
-  call that counts on every line it has a point on. It can come days later
-  and from another place. A hold point does not hold the crew. It shows on
-  the line as a call still owed.
+- **Accepted** is new and separate. Nothing is owed: on every line, each
+  hold party has released it or made a call, and each review party has
+  made a call. And no call that counts is a rejection. A rejected line
+  keeps the work from accepted until its answer changes, which marks the
+  rejection as made on the earlier answer, and the party calls it again.
+  Accepted can come days later and from another place.
+- **A hold point keeps its ITP meaning.** The trade's next work waits for
+  the release, and the contract enforces that, not the bridge. The bridge
+  never holds the scanning crew. It shows the release as owed until it is
+  given.
 
 This changes what is built. `on-site-answers.md` criterion 3 has
 `scanner_ready_to_leave` refuse while an asked target is `not_yet`, or
 `does_not_fit` and not declined, and 0.15.0 does that. If this part is
 approved, that criterion is amended for every mission, not only a mission
-from a list, so there is one rule.
+from a list, so there is one rule. That spec's "Unanswered" count changes
+with it: it assumes sign-off refuses an open `not_yet`, and becomes
+questions declined or left open while their last verdict was `not_yet`.
 
 ### F. What the person sees, and what leaves
 
 - The web UI's Now view shows one line: the next to document, with its
   requirement, and where to stand. The whole list is one tap away. Every
   sentence comes from `say`.
-- The report opens with the list, in order: each line's requirement, grade,
+- The report's first line counts the lines the bridge answered, the lines
+  a person answered below the grade asked, and the lines declined or left
+  open, before any acceptance. A record accepted with nothing measured says
+  so at the top.
+- The report then gives the list, in order: each line's requirement, grade,
   status, conformance, evidence and signatures. It carries names, companies
   and roles. It carries no licence number and is not a stamped document.
 - A rejected line can be exported as a BCF topic (BCF API 3.0 JSON):
@@ -219,13 +245,15 @@ from a list, so there is one rule.
 
 1. test: The sample list and record validate against both schemas, and the
    spreadsheet reads into the same lines. The bridge treats each change
-   `list-mission/check.py` makes to the record as the checker does. Seven
+   `list-mission/check.py` makes to the record as the checker does. Ten
    are things the record may not say, and are refused with the reason: a
    sign-off that does not name the lines it left open, a sign-off that
    leaves lines open with no reason, plain acceptance where there is
    something to explain, a measured answer with no reading, a pass on a
    measured answer with no tolerance, answered with no evidence, a signature
-   from a party the list does not name. Six are things a person may do, and
+   from a party the list does not name, a decline with nobody named, a
+   statement with nobody named, a person named on a measured answer. Six
+   are things a person may do, and
    are kept and shown: leaving with lines open, accepting a declined line
    with a note, accepting a neutral answer with a note, signing a line with
    no point on it, answering below the grade asked, a statement with no
@@ -240,7 +268,8 @@ from a list, so there is one rule.
    the bridge's reason. The demonstration replay's long facade, asked
    against "a quarter inch in ten feet" alone, is `answered` and `neutral`.
 4. test: An `attested` line is answered with a person's statement, and with
-   no document named the record says so. An `agent` token's attempt is 403.
+   no document named the record says so. An `agent` token's attempt is 403,
+   and so is its attempt to decline a line; it can propose one.
    A `seen` line is answered when a person marks a picture of that project;
    an agent may attach the picture and cannot mark it. A `height` line stays
    `open` with the reason. A person can decline it, or answer it with a
@@ -255,9 +284,10 @@ from a list, so there is one rule.
 6. test: Ready to leave answers in every state and names each open line
    with what it needs. A sign-off with a required line open succeeds with a
    reason: the record names the lines left open, their status is unchanged,
-   and the report opens with them. `accepted` is false until the last hold
-   or review call that counts, and true after it. No test in this spec has
-   a person refused for the state of a line.
+   and the report opens with them. `accepted` is false while a release or
+   call is owed or a call that counts is a rejection, and true after the
+   last one with none rejected: the checker's three acceptance cases. No
+   test in this spec has a person refused for the state of a line.
 7. test: The Now view renders one line from fixed API responses, and no
    sentence in it is composed outside `say` (`any-agent.md` criterion 1).
 8. test: A rejected line exports a topic with the fields BCF API 3.0
@@ -294,6 +324,11 @@ from a list, so there is one rule.
 - Criterion 9's re-check cannot stay inside the laptop-offload limits at the
   held-out list's size: a list is capped at the number of measured lines
   that fits, and the spec says the number.
+- At the fifth list from a real job, fewer than half of its measured lines
+  ended answered by the bridge; the rest were left open, declined, or
+  answered by picture or statement. The list mission is then a checklist
+  with a scanner beside it. Parts D to F stop until a field visit shows why,
+  and the rule on leaving is reopened.
 - No list from a real job has been run by 2027-03-31: the spec closes.
 
 ## Non-goals
@@ -328,9 +363,8 @@ calls overtaken by a later answer.
 
 What the rule costs is read from four more counts: lines left open at
 sign-off, by reason; lines answered below the grade asked; calls made with a
-note, by the line's status; signatures that did not count. If most measured
-lines on real jobs close by statement, the record is a checklist app with a
-scanner beside it, and the rule is looked at again.
+note, by the line's status; signatures that did not count. The kill-if on
+measured lines reads from them.
 
 Read at the fifth list from a real job, or on 2027-03-31.
 
@@ -346,7 +380,9 @@ Read at the fifth list from a real job, or on 2027-03-31.
 | 2026-11-09 | Who signs? | People, through named tokens. Never an agent. | The same rule as approvals and grants: the model reasons, and the bridge keeps what only a person may do. |
 | 2026-11-09 | Does acceptance hold the crew on site? | No. Ready to leave and accepted are separate. | The checker is often not there. The capture closes on its own; the calls can follow. |
 | 2026-11-10 | Does the bridge stop a person? | No. It says what is open, the person decides, and the record prints the decision with their name and reason. | Jim: people need room to work, and blocking is not good practice. A block also gets routed around: a line that was left gets declined to pass the gate, and the record is less true. |
-| 2026-11-10 | Does a hold point hold the crew on site? | No. It is a call still owed, shown on the line. | The same rule. It closes the open question of 2026-11-09. |
+| 2026-11-10 | Does a hold point hold the crew on site? | No. It keeps its ITP meaning: the trade's next work waits for the release, by contract. The bridge shows the release as owed. | The scanning crew is not the trade. It closes the open question of 2026-11-09. |
+| 2026-11-10 | Who declines a line? | A person, named in the record. The agent may propose a decline. | Declining is a decision on a line, as a signature is. |
+| 2026-11-10 | Is the work accepted once every call is in? | Only if no call that counts is a rejection. A release settles what a hold party owes. | A record where every party rejected every line read as accepted in the first revision. |
 | 2026-11-10 | Must an answer match the grade the line asks for? | No. The line says the grade asked, the answer the grade it has, and the report prints both. The bridge never raises a grade. | A person on site may have only a picture or their word. Refusing it loses the line; printing it at its own grade keeps the record true. |
 | 2026-11-10 | What stays fixed? | What the record prints, that an agent is not a person, and the instrument's guards. | None of the three refuses a person's choice. They keep the record worth signing. |
 

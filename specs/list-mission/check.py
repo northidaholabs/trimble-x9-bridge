@@ -4,7 +4,8 @@
     python3 check.py LIST.json RECORD.json
 
 The rule is tell, don't stop. A problem is something the record may not say:
-it is not whole, or it prints more than it has. A notice is something a
+it is not whole, it prints more than it has, or it does not name who
+decided. A notice is something a
 person chose to do. It is kept, and shown as what it was.
 """
 import copy
@@ -104,13 +105,23 @@ def open_lines(lst, rec):
     return [l["line_id"] for l in lst["lines"] if l.get("required", True) and status.get(l["line_id"], "open") not in CLOSED]
 
 
-def owed(lst, rec):
-    """Calls still owed before the work is accepted: every hold and review party, on every line."""
+def counting(lst, rec):
+    """(line_id, party, action) for every signature that counts."""
     lines = {l["line_id"]: l for l in lst["lines"]}
-    called = {(r["line_id"], s["party"]) for r in rec["lines"] for s in r.get("signatures", [])
-              if r["line_id"] in lines and s["action"] in CALLS and counts(lines[r["line_id"]], s)}
+    return [(r["line_id"], s["party"], s["action"]) for r in rec["lines"] for s in r.get("signatures", [])
+            if r["line_id"] in lines and counts(lines[r["line_id"]], s)]
+
+
+def owed(lst, rec):
+    """What is still owed: a hold party owes a release or a call, a review party a call, on every line."""
+    settled = {(lid, p) for lid, p, a in counting(lst, rec) if a in CALLS or a == "released"}
     return [f"{l['line_id']}:{p}" for l in lst["lines"] for p, pt in l.get("points", {}).items()
-            if pt in ("H", "R") and (l["line_id"], p) not in called]
+            if pt in ("H", "R") and (l["line_id"], p) not in settled]
+
+
+def accepted(lst, rec):
+    """The work is accepted when nothing is owed and no call that counts is a rejection."""
+    return not owed(lst, rec) and not any(a == "rejected" for _, _, a in counting(lst, rec))
 
 
 def check(lst, rec):
@@ -158,9 +169,10 @@ def main(argv):
     for n in notices:
         print("  notice:", n)
     print("  ready to leave would name:", ", ".join(open_lines(lst, rec)) or "nothing")
-    print("  calls owed before acceptance:", len(owed(lst, rec)))
+    print("  releases and calls owed:", len(owed(lst, rec)), "· accepted:", "yes" if accepted(lst, rec) else "no")
 
     sig = {"by": {"name": "Test Signer"}, "at": "2026-01-01T00:00:00Z", "via": "web UI"}
+    who = {"by": {"name": "Test Person"}, "via": "web UI"}
     still = open_lines(lst, rec)
 
     def line(doc, lid):
@@ -174,14 +186,19 @@ def main(argv):
     def call_without_tolerance(d): line(d, "2.1")["conformance"] = "conforming"
     def no_evidence(d): line(d, "5.2").update(status="answered", conformance="conforming")
     def unknown_party(d): line(d, "2.1")["signatures"] = [dict(sig, party="passer_by", action="done")]
+    def decline_unnamed(d): line(d, "1.2").pop("decided")
+    def statement_unnamed(d): line(d, "6.1").update(status="answered", conformance="conforming", evidence={"grade": "attested", "document": "Synthetic: torque log."})
+    def measured_with_person(d): line(d, "1.1")["evidence"]["by"] = dict(who)
 
     # What a person may do. Each is kept, and shown.
     def leave_open(d): d["capture_sign_off"] = dict(sig, left_open=still, reason="Synthetic: the rooms were locked.")
     def accept_declined(d): line(d, "1.2")["signatures"] = [dict(sig, party="checker", action="accepted_with_note", note="Synthetic: accepted on the drawing.")]
     def accept_neutral_note(d): line(d, "1.1")["signatures"] = [dict(sig, party="checker", action="accepted_with_note", note="Height is past the tolerance's ten feet; accepted on the figure.")]
     def no_point(d): line(d, "2.1")["signatures"] = [dict(sig, party="trade", action="done")]
-    def below_grade(d): line(d, "1.2").update(status="answered", conformance="conforming", evidence={"grade": "attested", "document": "Synthetic: site walk notes."})
-    def no_document(d): line(d, "6.1").update(status="answered", conformance="conforming", evidence={"grade": "attested"})
+    def below_grade(d):
+        line(d, "1.2").pop("decided")
+        line(d, "1.2").update(status="answered", conformance="conforming", evidence={"grade": "attested", "document": "Synthetic: site walk notes.", "by": dict(who)})
+    def no_document(d): line(d, "6.1").update(status="answered", conformance="conforming", evidence={"grade": "attested", "by": dict(who)})
 
     refused = [
         ("a sign-off that does not name the lines it left open", sign_off_unnamed),
@@ -191,6 +208,9 @@ def main(argv):
         ("a pass on a measured answer with no tolerance", call_without_tolerance),
         ("answered with no evidence", no_evidence),
         ("a signature from a party the list does not name", unknown_party),
+        ("a decline with nobody named", decline_unnamed),
+        ("a statement with nobody named", statement_unnamed),
+        ("a person named on a measured answer", measured_with_person),
     ]
     allowed = [
         ("leaving with lines open", leave_open),
@@ -215,6 +235,23 @@ def main(argv):
         got, said = check(lst, doc)
         failed |= bool(got) or not said
         print(f"  {'kept' if not got else 'REFUSED'}  {name}: {(got or said or ['NOT SHOWN'])[0]}")
+
+    def every_call(hold, review):
+        d = copy.deepcopy(rec)
+        for r in d["lines"]:
+            l = next(x for x in lst["lines"] if x["line_id"] == r["line_id"])
+            acts = {"H": hold, "R": review}
+            r["signatures"] = [dict(sig, party=p, action=acts[pt], **({} if acts[pt] == "released" else {"note": "Synthetic."}))
+                               for p, pt in l.get("points", {}).items() if pt in acts]
+        return d
+    print("acceptance of the work:")
+    for name, d, want in [("every hold and review party rejects", every_call("rejected", "rejected"), False),
+                          ("every hold released, every review accepted with a note", every_call("released", "accepted_with_note"), True),
+                          ("holds released, every review rejects", every_call("released", "rejected"), False)]:
+        got, _ = check(lst, d)
+        ok = not got and accepted(lst, d) == want
+        failed |= not ok
+        print(f"  {'ok' if ok else 'WRONG'}  {name}: accepted {'yes' if accepted(lst, d) else 'no'}")
     return 1 if failed else 0
 
 

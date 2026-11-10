@@ -3,9 +3,10 @@
 The formats behind [`../list-mission.md`](../list-mission.md), a sample, and
 a checker. Draft; nothing in the bridge reads these yet.
 
-The model stops a person from nothing. It refuses only a record that is not
-whole or prints more than it has. What a person chose to do is kept and
-shown as what it was.
+The model refuses a person nothing that is theirs to decide. It refuses a
+record that is not whole, prints more than it has, or does not name who
+decided. What a person chose to do is kept and shown as what it was, and
+going past what the bridge said takes one sentence of why.
 
 | File | What |
 | --- | --- |
@@ -14,7 +15,7 @@ shown as what it was.
 | `samples/demo-closeout.list.json` | Eight lines. 1.1 to 4.1 are the missions on the public visit page; 5.1 to 6.1 are illustrative and say so |
 | `samples/demo-closeout.csv` | The same list as a spreadsheet with an ITP's columns |
 | `samples/demo-closeout.record.json` | Only what the visit page gives, quoted. No signatures: nobody signed a line |
-| `check.py` | Both schemas, the rules a schema cannot say, and the spreadsheet against the list. Then thirteen changes to a copy of the record: seven things the record may not say, each refused, and six things a person may do, each kept and shown |
+| `check.py` | Both schemas, the rules a schema cannot say, and the spreadsheet against the list. Then sixteen changes to a copy of the record: ten things the record may not say, each refused, and six things a person may do, each kept and shown. Then three cases of acceptance of the work |
 
 ```bash
 python3 specs/list-mission/check.py          # needs the jsonschema package
