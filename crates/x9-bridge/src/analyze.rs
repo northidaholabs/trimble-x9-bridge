@@ -26,7 +26,7 @@
 use crate::register::{Pose, Wall};
 use crate::station::Canvas;
 use anyhow::Context;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt::Write as _;
@@ -227,7 +227,7 @@ fn straightedge(profile: &[(f64, f64)], len: f64, step: f64) -> Vec<(f64, f64)> 
     out
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WallResult {
     pub wall_id: String,
     pub kind: String,
@@ -1288,7 +1288,57 @@ impl FaceFit {
     pub fn png(&self, opts: &Opts) -> Vec<u8> {
         wall_png(&self.grid, self.plane, &self.result, opts)
     }
+
+    /// The fit as bytes, so a worker can send it back and the bridge draw its
+    /// evidence exactly as when it fits itself: the result and plane as JSON,
+    /// then the grid's sums and counts, all deflated.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let g = &self.grid;
+        let head = serde_json::to_vec(&serde_json::json!({
+            "result": self.result, "plane": self.plane, "wall": g.wall, "from": g.from, "dir": g.dir, "nrm": g.nrm,
+            "u0": g.u0, "z0": g.z0, "cell": g.cell, "nu": g.nu, "nz": g.nz, "bbox": g.bbox,
+        }))
+        .expect("a fit serializes");
+        let mut raw = Vec::with_capacity(12 + head.len() + g.sum.len() * 8);
+        raw.extend_from_slice(FIT_MAGIC);
+        raw.extend_from_slice(&(head.len() as u32).to_le_bytes());
+        raw.extend_from_slice(&head);
+        for v in &g.sum {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &g.cnt {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        miniz_oxide::deflate::compress_to_vec(&raw, 6)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<FaceFit, String> {
+        let raw = miniz_oxide::inflate::decompress_to_vec_with_limit(bytes, 64 << 20).map_err(|e| format!("not a deflated fit: {e:?}"))?;
+        if raw.len() < 8 || &raw[..4] != FIT_MAGIC {
+            return Err("not a fit".into());
+        }
+        let n = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
+        let head: Value = serde_json::from_slice(raw.get(8..8 + n).ok_or("fit header cut short")?).map_err(|e| format!("fit header: {e}"))?;
+        fn get<T: serde::de::DeserializeOwned>(head: &Value, k: &str) -> Result<T, String> {
+            serde_json::from_value(head[k].clone()).map_err(|e| format!("fit {k}: {e}"))
+        }
+        let (nu, nz): (usize, usize) = (get(&head, "nu")?, get(&head, "nz")?);
+        let cells = nu.checked_mul(nz).filter(|c| *c <= 4_000_000).ok_or("fit grid too large")?;
+        let body = &raw[8 + n..];
+        if body.len() != cells * 8 {
+            return Err(format!("fit grid: {} bytes for {cells} cells", body.len()));
+        }
+        let sum = body[..cells * 4].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
+        let cnt = body[cells * 4..].as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+        let grid = WallGrid {
+            wall: get(&head, "wall")?, from: get(&head, "from")?, dir: get(&head, "dir")?, nrm: get(&head, "nrm")?,
+            u0: get(&head, "u0")?, z0: get(&head, "z0")?, cell: get(&head, "cell")?, nu, nz, sum, cnt, bbox: get(&head, "bbox")?,
+        };
+        Ok(FaceFit { result: get(&head, "result")?, grid, plane: get(&head, "plane")? })
+    }
 }
+
+const FIT_MAGIC: &[u8; 4] = b"XFF1";
 
 /// Walls measured from the full-resolution points of the stations that saw
 /// them (`files`: station number, pose, file), without the ground. Each file

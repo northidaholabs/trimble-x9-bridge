@@ -10,6 +10,14 @@
 //! The bridge registers on its own when no worker has been seen for 15 s,
 //! when none claims the job within 10 s, or when the worker fails or takes
 //! longer than 10 minutes. A job never waits on a laptop that went away.
+//!
+//! A worker can also take question checks (`specs/laptop-offload.md`, part
+//! B): a `check` job lists faces with their coverage and the stations that
+//! saw them. The worker fits them (`ask::look_many`, as the bridge would) and
+//! sends back what each look found, with the fits themselves uploaded as one
+//! blob (`PUT …/merged`). The bridge decides, records and draws the evidence.
+//! It fits them itself on the same rules, with a shorter limit: 120 s for a
+//! re-check, 60 s for one ask.
 
 use crate::register::{Audit, Pair, Pose, Wall};
 use serde::{Deserialize, Serialize};
@@ -42,12 +50,68 @@ pub struct WorkResult {
     pub frame: Option<String>,
 }
 
-type Delivery = Result<(WorkResult, Vec<u8>), String>;
+/// What a worker found for one face of a check job: the look's coverage, as
+/// offered, and its reading when it fitted. `fitted` faces have their fit in
+/// the uploaded blob, in order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckOut {
+    pub target_id: String,
+    pub seen_share: f64,
+    pub length_m: f64,
+    pub stations: Vec<u16>,
+    pub fit: Option<crate::ask::Reading>,
+    #[serde(default)]
+    pub fitted: bool,
+}
+
+/// A worker's answer to a check job: one entry per offered face, in order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckResult {
+    pub checks: Vec<CheckOut>,
+}
+
+/// The fits of a check job as one blob: a count, then each fit's length and
+/// bytes (`FaceFit::to_bytes`).
+pub fn pack_fits(fits: &[Vec<u8>]) -> Vec<u8> {
+    let mut b = (fits.len() as u32).to_le_bytes().to_vec();
+    for f in fits {
+        b.extend_from_slice(&(f.len() as u32).to_le_bytes());
+        b.extend_from_slice(f);
+    }
+    b
+}
+
+pub fn unpack_fits(b: &[u8]) -> Result<Vec<crate::analyze::FaceFit>, String> {
+    let take = |at: usize, n: usize| b.get(at..at + n).ok_or_else(|| "fits cut short".to_string());
+    let count = u32::from_le_bytes(take(0, 4)?.try_into().unwrap()) as usize;
+    let (mut at, mut out) = (4, Vec::new());
+    for _ in 0..count.min(1000) {
+        let n = u32::from_le_bytes(take(at, 4)?.try_into().unwrap()) as usize;
+        out.push(crate::analyze::FaceFit::from_bytes(take(at + 4, n)?)?);
+        at += 4 + n;
+    }
+    if out.len() != count || at != b.len() {
+        return Err("fits don't add up".into());
+    }
+    Ok(out)
+}
+
+enum Delivered {
+    Register(WorkResult),
+    Check(CheckResult),
+}
+
+type Delivery = Result<(Delivered, Option<Vec<u8>>), String>;
+
+enum Job {
+    Register { stations: Vec<(u16, String)>, pairs: Vec<Pair> },
+    /// The offer's body as the worker gets it, and how many faces it lists.
+    Check { body: Value, faces: usize },
+}
 
 struct Offer {
     project_id: String,
-    stations: Vec<(u16, String)>,
-    pairs: Vec<Pair>,
+    job: Job,
     /// (worker name, the caller who claimed it).
     claimed_by: Option<(String, String)>,
     merged: Option<Vec<u8>>,
@@ -78,26 +142,51 @@ impl WorkState {
             .iter()
             .filter(|(_, (t, _))| t.elapsed() < WORKER_SEEN)
             .map(|(name, (t, by))| {
-                let job = self.offers.iter().find(|(_, o)| o.claimed_by.as_ref().is_some_and(|c| &c.0 == name)).map(|(j, _)| j.clone());
-                json!({"worker": name, "token": by, "seen_s_ago": (t.elapsed().as_secs_f64() * 10.0).round() / 10.0, "job_id": job})
+                let job = self.offers.iter().find(|(_, o)| o.claimed_by.as_ref().is_some_and(|c| &c.0 == name));
+                let kind = job.map(|(_, o)| if matches!(o.job, Job::Check { .. }) { "check" } else { "register" });
+                json!({"worker": name, "token": by, "seen_s_ago": (t.elapsed().as_secs_f64() * 10.0).round() / 10.0, "job_id": job.map(|(j, _)| j.clone()), "job_kind": kind})
             })
             .collect();
         v.sort_by(|a, b| a["worker"].as_str().cmp(&b["worker"].as_str()));
         v
     }
 
-    /// A worker asks for work: note it, and hand it the oldest unclaimed job.
+    /// A worker asks for work: note it, and hand it an unclaimed job,
+    /// registrations before checks (a check follows its registration).
     pub fn claim(&mut self, worker: &str, caller: &str) -> Option<Value> {
         self.workers.insert(worker.to_string(), (Instant::now(), caller.to_string()));
-        let (job_id, o) = self.offers.iter_mut().find(|(_, o)| o.claimed_by.is_none())?;
+        let pick = self
+            .offers
+            .iter()
+            .filter(|(_, o)| o.claimed_by.is_none())
+            .min_by_key(|(id, o)| (matches!(o.job, Job::Check { .. }), id.to_string()))
+            .map(|(id, _)| id.clone())?;
+        let o = self.offers.get_mut(&pick)?;
         o.claimed_by = Some((worker.to_string(), caller.to_string()));
-        Some(json!({
-            "job_id": job_id,
-            "kind": "register",
-            "project_id": o.project_id,
-            "stations": o.stations.iter().map(|(n, id)| json!({"station": n, "scan_id": id})).collect::<Vec<_>>(),
-            "pairs": o.pairs,
-        }))
+        Some(match &o.job {
+            Job::Register { stations, pairs } => json!({
+                "job_id": pick,
+                "kind": "register",
+                "project_id": o.project_id,
+                "stations": stations.iter().map(|(n, id)| json!({"station": n, "scan_id": id})).collect::<Vec<_>>(),
+                "pairs": pairs,
+            }),
+            Job::Check { body, .. } => {
+                let mut v = body.clone();
+                v["job_id"] = json!(pick);
+                v["kind"] = json!("check");
+                v["project_id"] = json!(o.project_id);
+                v
+            }
+        })
+    }
+
+    /// The kind of an offered job: `register` or `check`.
+    pub fn kind(&self, job_id: &str) -> Option<&'static str> {
+        self.offers.get(job_id).map(|o| match o.job {
+            Job::Register { .. } => "register",
+            Job::Check { .. } => "check",
+        })
     }
 
     /// The offer `job_id`, if `caller` claimed it.
@@ -122,18 +211,39 @@ impl WorkState {
 
     pub fn deliver(&mut self, job_id: &str, caller: &str, r: Result<WorkResult, String>) -> Result<(), String> {
         let o = self.mine(job_id, caller)?;
-        let d = match r {
-            Ok(res) => {
-                let kept = o.stations.len() - res.skipped.len().min(o.stations.len());
+        let d = match (r, &o.job) {
+            (Ok(res), Job::Register { stations, .. }) => {
+                let kept = stations.len() - res.skipped.len().min(stations.len());
                 if res.poses.len() != kept || res.audits.len() != kept {
                     return Err(format!("poses and audits must list the {kept} stations offered, less those skipped"));
                 }
-                Ok((res, o.merged.take().ok_or("upload the merged points (PUT …/merged) before the result")?))
+                Ok((Delivered::Register(res), Some(o.merged.take().ok_or("upload the merged points (PUT …/merged) before the result")?)))
             }
-            Err(e) => Err(e),
+            (Ok(_), Job::Check { .. }) => return Err("this is a check job: send its checks".into()),
+            (Err(e), _) => Err(e),
         };
         if let Some(tx) = o.done.take() {
             let _ = tx.send(d);
+        }
+        Ok(())
+    }
+
+    /// A worker's answer to a check job: one entry per offered face, and the
+    /// fits uploaded first when any face fitted.
+    pub fn deliver_check(&mut self, job_id: &str, caller: &str, r: CheckResult) -> Result<(), String> {
+        let o = self.mine(job_id, caller)?;
+        let Job::Check { faces, .. } = &o.job else { return Err("this is a registration job: send its result".into()) };
+        if r.checks.len() != *faces {
+            return Err(format!("checks must list the {faces} faces offered, in order"));
+        }
+        let fitted = r.checks.iter().filter(|c| c.fitted).count();
+        let blob = match (fitted, o.merged.take()) {
+            (0, b) => b,
+            (_, Some(b)) => Some(b),
+            (_, None) => return Err("upload the fits (PUT …/merged) before the checks".into()),
+        };
+        if let Some(tx) = o.done.take() {
+            let _ = tx.send(Ok((Delivered::Check(r), blob)));
         }
         Ok(())
     }
@@ -159,8 +269,7 @@ pub async fn offer(
         let (tx, rx) = oneshot::channel();
         w.offers.insert(job_id.to_string(), Offer {
             project_id: project_id.to_string(),
-            stations: stations.to_vec(),
-            pairs: pairs.to_vec(),
+            job: Job::Register { stations: stations.to_vec(), pairs: pairs.to_vec() },
             claimed_by: None,
             merged: None,
             done: Some(tx),
@@ -202,10 +311,81 @@ pub async fn offer(
     };
     take_back();
     match got {
-        Ok(Ok((res, merged))) => Offered::Done(res, merged, worker),
+        Ok(Ok((Delivered::Register(res), Some(merged)))) => Offered::Done(res, merged, worker),
+        Ok(Ok(_)) => Offered::Failed(format!("{worker} sent the wrong kind of result")),
         Ok(Err(e)) => Offered::Failed(format!("{worker}: {e}")),
         Err(_) => Offered::Failed(format!("{worker} went away")),
     }
+}
+
+/// How a check job offered to the workers ended.
+pub enum CheckOffered {
+    /// What each face's look found, its fit when it fitted, and the worker.
+    Done(Vec<(crate::ask::Check, Option<crate::analyze::FaceFit>)>, String),
+    NoWorker,
+    Failed(String),
+}
+
+/// How long a claimed check may take before the bridge fits it itself.
+pub const CHECK_LIMIT_RECHECK: Duration = Duration::from_secs(120);
+pub const CHECK_LIMIT_ASK: Duration = Duration::from_secs(60);
+
+/// Offer faces to the workers to fit, and wait for what they found. `body`
+/// lists them (`faces`: target id, face, coverage) and the stations (number,
+/// scan id, pose); `limit` is how long a claimed check may run.
+pub async fn offer_check(st: &crate::state::AppState, project_id: &str, body: Value, faces: usize, limit: Duration) -> CheckOffered {
+    let job_id = crate::util::new_id("check");
+    let mut rx = {
+        let mut w = st.work.lock().unwrap();
+        w.workers.retain(|_, (t, _)| t.elapsed() < WORKER_SEEN);
+        if w.workers.is_empty() {
+            return CheckOffered::NoWorker;
+        }
+        let (tx, rx) = oneshot::channel();
+        w.offers.insert(job_id.clone(), Offer { project_id: project_id.to_string(), job: Job::Check { body, faces }, claimed_by: None, merged: None, done: Some(tx) });
+        rx
+    };
+    let take_back = || st.work.lock().unwrap().offers.remove(&job_id);
+    let t0 = Instant::now();
+    let worker = loop {
+        if let Some((name, _)) = st.work.lock().unwrap().offers.get(&job_id).and_then(|o| o.claimed_by.clone()) {
+            break name;
+        }
+        if t0.elapsed() > CLAIM_WAIT {
+            take_back();
+            return CheckOffered::NoWorker;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let got = tokio::time::timeout(limit, &mut rx).await;
+    take_back();
+    let (r, blob) = match got {
+        Err(_) => return CheckOffered::Failed(format!("{worker} took longer than {} s", limit.as_secs())),
+        Ok(Err(_)) => return CheckOffered::Failed(format!("{worker} went away")),
+        Ok(Ok(Err(e))) => return CheckOffered::Failed(format!("{worker}: {e}")),
+        Ok(Ok(Ok((Delivered::Check(r), blob)))) => (r, blob),
+        Ok(Ok(Ok(_))) => return CheckOffered::Failed(format!("{worker} sent the wrong kind of result")),
+    };
+    let mut fits = match blob.map(|b| unpack_fits(&b)).transpose() {
+        Ok(f) => f.unwrap_or_default().into_iter(),
+        Err(e) => return CheckOffered::Failed(format!("{worker}: {e}")),
+    };
+    let mut out = Vec::new();
+    for c in r.checks {
+        let fit = if c.fitted {
+            match fits.next() {
+                Some(f) => Some(f),
+                None => return CheckOffered::Failed(format!("{worker}: fewer fits than faces that fitted")),
+            }
+        } else {
+            None
+        };
+        out.push((crate::ask::Check { seen_share: c.seen_share, length_m: c.length_m, stations: c.stations, fit: c.fit }, fit));
+    }
+    if fits.next().is_some() {
+        return CheckOffered::Failed(format!("{worker}: more fits than faces that fitted"));
+    }
+    CheckOffered::Done(out, worker)
 }
 
 #[cfg(test)]
@@ -220,8 +400,7 @@ mod tests {
     fn offer_of(stations: &[(u16, &str)]) -> Offer {
         Offer {
             project_id: "p1".into(),
-            stations: stations.iter().map(|(n, s)| (*n, s.to_string())).collect(),
-            pairs: vec![],
+            job: Job::Register { stations: stations.iter().map(|(n, s)| (*n, s.to_string())).collect(), pairs: vec![] },
             claimed_by: None,
             merged: None,
             done: None,
@@ -289,11 +468,99 @@ mod tests {
         assert!(rx.try_recv().is_err(), "nothing delivered yet");
         w.put_merged("job_1", "agent", merged_bytes()).unwrap();
         w.deliver("job_1", "agent", Ok(result(2, vec![(2, "bad".into())]))).unwrap();
-        let (res, bytes) = rx.try_recv().unwrap().unwrap();
+        let (Delivered::Register(res), Some(bytes)) = rx.try_recv().unwrap().unwrap() else { panic!("a registration result with its points") };
         assert_eq!((res.poses.len(), bytes), (2, merged_bytes()));
         // Delivered once: a second result has no one to go to, but is accepted.
         w.put_merged("job_1", "agent", merged_bytes()).unwrap();
         assert!(w.deliver("job_1", "agent", Ok(result(2, vec![(2, "bad".into())]))).is_ok());
+    }
+
+    fn check_offer(faces: usize) -> Offer {
+        Offer { project_id: "p1".into(), job: Job::Check { body: json!({"faces": [], "stations": []}), faces }, claimed_by: None, merged: None, done: None }
+    }
+
+    fn out(id: &str, fitted: bool) -> CheckOut {
+        CheckOut { target_id: id.into(), seen_share: 0.9, length_m: 8.0, stations: vec![1], fit: None, fitted }
+    }
+
+    #[test]
+    fn registrations_go_out_before_checks() {
+        let mut w = WorkState::default();
+        w.offers.insert("check_a".into(), check_offer(1));
+        w.offers.insert("job_z".into(), offer_of(&[(1, "s1")]));
+        let first = w.claim("laptop", "agent").unwrap();
+        assert_eq!((first["kind"].as_str(), first["job_id"].as_str()), (Some("register"), Some("job_z")));
+        let second = w.claim("laptop", "agent").unwrap();
+        assert_eq!((second["kind"].as_str(), second["project_id"].as_str()), (Some("check"), Some("p1")));
+        assert_eq!((w.kind("check_a"), w.kind("job_z"), w.kind("nope")), (Some("check"), Some("register"), None));
+    }
+
+    #[test]
+    fn a_check_lists_every_face_and_uploads_its_fits_first() {
+        let mut w = WorkState::default();
+        let (tx, mut rx) = oneshot::channel();
+        w.offers.insert("check_1".into(), Offer { done: Some(tx), ..check_offer(2) });
+        w.claim("laptop", "agent").unwrap();
+        let res = |checks| CheckResult { checks };
+        assert!(w.deliver_check("check_1", "agent", res(vec![out("a", false)])).unwrap_err().contains("the 2 faces"));
+        assert!(w.deliver_check("check_1", "agent", res(vec![out("a", true), out("b", false)])).unwrap_err().contains("PUT …/merged"));
+        assert!(w.deliver("check_1", "agent", Ok(result(0, vec![]))).unwrap_err().contains("send its checks"));
+        assert!(w.deliver_check("check_1", "someone-else", res(vec![out("a", false), out("b", false)])).unwrap_err().contains("not claimed with your token"));
+        assert!(rx.try_recv().is_err());
+        w.deliver_check("check_1", "agent", res(vec![out("a", false), out("b", false)])).unwrap();
+        let (Delivered::Check(r), None) = rx.try_recv().unwrap().unwrap() else { panic!("a check result, no fits") };
+        assert_eq!(r.checks.len(), 2);
+        // The other way round: a registration job refuses checks.
+        w.offers.insert("job_2".into(), offer_of(&[(1, "s1")]));
+        w.claim("laptop", "agent").unwrap();
+        assert!(w.deliver_check("job_2", "agent", res(vec![])).unwrap_err().contains("registration job"));
+    }
+
+    #[test]
+    fn fits_pack_and_unpack_and_refuse_a_short_blob() {
+        assert!(unpack_fits(&pack_fits(&[])).unwrap().is_empty());
+        let packed = pack_fits(&[b"not a fit".to_vec()]);
+        assert!(unpack_fits(&packed).err().unwrap().contains("not a deflated fit"));
+        assert!(unpack_fits(&packed[..6]).err().unwrap().contains("cut short"));
+        let mut extra = pack_fits(&[]);
+        extra.push(0);
+        assert!(unpack_fits(&extra).err().unwrap().contains("don't add up"));
+    }
+
+    #[tokio::test]
+    async fn a_check_with_no_worker_seen_is_not_offered() {
+        let b = Bridge::new().await;
+        assert!(matches!(offer_check(&b.st, "p1", json!({}), 1, Duration::from_secs(1)).await, CheckOffered::NoWorker));
+    }
+
+    #[tokio::test]
+    async fn a_check_nobody_claims_comes_back_within_ten_seconds() {
+        let b = Bridge::new().await;
+        b.st.work.lock().unwrap().claim("laptop", "agent"); // seen, but it never claims the check
+        let t0 = Instant::now();
+        assert!(matches!(offer_check(&b.st, "p1", json!({}), 1, Duration::from_secs(60)).await, CheckOffered::NoWorker));
+        let s = t0.elapsed().as_secs_f64();
+        assert!((9.5..12.0).contains(&s), "{s} s");
+        assert!(b.st.work.lock().unwrap().offers.is_empty(), "taken back");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_worker_that_claims_and_goes_silent_loses_the_check_and_its_late_result_is_refused() {
+        let b = Bridge::new().await;
+        b.st.work.lock().unwrap().claim("laptop", "agent");
+        let st = b.st.clone();
+        let offered = tokio::spawn(async move { offer_check(&st, "p1", json!({"faces": [], "stations": []}), 1, Duration::from_millis(400)).await });
+        let job = loop {
+            if let Some(j) = b.st.work.lock().unwrap().claim("laptop", "agent") {
+                break j;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let CheckOffered::Failed(why) = offered.await.unwrap() else { panic!("taken back") };
+        assert!(why.contains("took longer than"), "{why}");
+        let id = job["job_id"].as_str().unwrap();
+        let (code, body) = b.call("POST", &format!("/v1/work/{id}/result"), Some(AGENT), Some(json!({"checks": [serde_json::to_value(out("a", false)).unwrap()]}))).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{body}");
     }
 
     #[test]
@@ -303,7 +570,7 @@ mod tests {
         w.offers.insert("job_1".into(), Offer { done: Some(tx), ..offer_of(&[(1, "s1")]) });
         w.claim("laptop", "agent").unwrap();
         w.deliver("job_1", "agent", Err("out of memory".into())).unwrap();
-        assert_eq!(rx.try_recv().unwrap().unwrap_err(), "out of memory");
+        assert_eq!(rx.try_recv().unwrap().err().as_deref(), Some("out of memory"));
     }
 
     fn state() -> crate::state::AppState {

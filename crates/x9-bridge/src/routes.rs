@@ -1057,7 +1057,8 @@ async fn work_claim(State(st): St, h: HeaderMap, body: Bytes) -> ApiResult<Respo
         None => Ok(StatusCode::NO_CONTENT.into_response()),
         Some(v) => {
             let project = v["project_id"].as_str().map(str::to_string);
-            st.log("note", format!("Worker {w} took the registration job"), &c.name, project.as_deref(), &[("job_id", v["job_id"].as_str().unwrap_or(""))]);
+            let what = if v["kind"] == "check" { "the question check" } else { "the registration job" };
+            st.log("note", format!("Worker {w} took {what}"), &c.name, project.as_deref(), &[("job_id", v["job_id"].as_str().unwrap_or(""))]);
             Ok(Json(v).into_response())
         }
     }
@@ -1082,7 +1083,15 @@ async fn work_progress(State(st): St, h: HeaderMap, Path(job_id): Path<String>, 
 async fn work_merged(State(st): St, h: HeaderMap, Path(job_id): Path<String>, body: Bytes) -> ApiResult<StatusCode> {
     let c = st.require(&h, |r| r != Role::Viewer, "do work for the bridge")?;
     let bytes = body.to_vec();
-    let checked = tokio::task::spawn_blocking(move || crate::register::Merged::from_bytes(&bytes).map(|_| bytes))
+    // A check job uploads its fits here; a registration, its merged points.
+    let check = st.work.lock().unwrap().kind(&job_id) == Some("check");
+    let checked = tokio::task::spawn_blocking(move || {
+        if check {
+            crate::work::unpack_fits(&bytes).map(|_| bytes)
+        } else {
+            crate::register::Merged::from_bytes(&bytes).map(|_| bytes)
+        }
+    })
         .await
         .map_err(|e| ApiError::conflict(e.to_string()))?
         .map_err(ApiError::invalid)?;
@@ -1092,8 +1101,17 @@ async fn work_merged(State(st): St, h: HeaderMap, Path(job_id): Path<String>, bo
 
 async fn work_result(State(st): St, h: HeaderMap, Path(job_id): Path<String>, body: Bytes) -> ApiResult<StatusCode> {
     let c = st.require(&h, |r| r != Role::Viewer, "do work for the bridge")?;
-    let res: crate::work::WorkResult = parse(&body)?;
-    st.work.lock().unwrap().deliver(&job_id, &c.name, Ok(res)).map_err(ApiError::conflict)?;
+    let kind = st.work.lock().unwrap().kind(&job_id);
+    let Some(kind) = kind else {
+        return Err(ApiError::conflict("no such job is offered (it finished, was cancelled, or the bridge took it back)"));
+    };
+    if kind == "check" {
+        let res: crate::work::CheckResult = parse(&body)?;
+        st.work.lock().unwrap().deliver_check(&job_id, &c.name, res).map_err(ApiError::conflict)?;
+    } else {
+        let res: crate::work::WorkResult = parse(&body)?;
+        st.work.lock().unwrap().deliver(&job_id, &c.name, Ok(res)).map_err(ApiError::conflict)?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
