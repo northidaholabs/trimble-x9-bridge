@@ -816,6 +816,8 @@ async fn fit_targets(st: &std::sync::Arc<AppState>, project_id: &str, items: &[&
                 if let crate::work::CheckOffered::Failed(why) = other {
                     st.log("check", format!("The question check on the laptop failed ({why}); the bridge fits it itself"), "bridge", Some(project_id), &[]);
                 }
+                let ids = these.iter().flat_map(|p| p.scans.values().cloned()).collect::<std::collections::BTreeSet<String>>();
+                let _reading = crate::files::reading(st, ids);
                 let files = files_for(st, &these).await.map_err(|e| e.detail.unwrap_or(e.title))?;
                 let targets: Vec<(String, Face, Value)> = these.iter().map(|p| (p.target_id.clone(), p.face, p.coverage.clone())).collect();
                 tokio::task::spawn_blocking(move || look_many(&targets, &files, &Opts::default(), threads)).await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))?

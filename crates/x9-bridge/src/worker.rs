@@ -48,7 +48,7 @@ fn claim_next(st: &AppState) -> Option<String> {
 }
 
 /// Apply a change to a job, publish it, and return whether a cancel was asked for.
-fn update(st: &AppState, job_id: &str, f: impl FnOnce(&mut crate::state::JobRecord)) -> bool {
+pub(crate) fn update(st: &AppState, job_id: &str, f: impl FnOnce(&mut crate::state::JobRecord)) -> bool {
     let (job, cancel) = {
         let mut inner = st.inner.lock().unwrap();
         let Some(rec) = inner.jobs.iter_mut().find(|j| j.job.job_id == job_id) else { return true };
@@ -59,7 +59,7 @@ fn update(st: &AppState, job_id: &str, f: impl FnOnce(&mut crate::state::JobReco
     cancel
 }
 
-fn finish(st: &AppState, job_id: &str, state: JobState, result: Option<serde_json::Value>, problem: Option<&ApiError>) {
+pub(crate) fn finish(st: &AppState, job_id: &str, state: JobState, result: Option<serde_json::Value>, problem: Option<&ApiError>) {
     let project_id = {
         let inner = st.inner.lock().unwrap();
         inner.jobs.iter().find(|j| j.job.job_id == job_id).map(|j| (j.project_id.clone(), j.job.kind.clone()))
@@ -86,6 +86,7 @@ fn finish(st: &AppState, job_id: &str, state: JobState, result: Option<serde_jso
         "export" => "Export",
         "register" => "Registration",
         "measure" | "measurement" => "Measurement",
+        "save" => "Save",
         _ => "Scan",
     };
     st.log(kind, format!("{label} job {job_id} {verb}"), "bridge", project_id.as_deref(), &[("job_id", job_id)]);
@@ -807,6 +808,7 @@ async fn unless_cancelled<T>(st: &AppState, job_id: &str, fut: impl std::future:
 /// scanner beyond downloading the file once). A cancel stops it at the next
 /// check: during the download, between decoding and writing, or while writing.
 pub async fn run_export(st: Arc<AppState>, job_id: String, scan_id: String, req: crate::export::ExportRequest) {
+    let _reading = crate::files::reading(&st, [scan_id.clone()]);
     use crate::export::Intensity;
     use crate::files::{scan_file, FileKind};
     let cancelled = |st: &AppState| finish(st, &job_id, JobState::Cancelled, None, None);
@@ -933,6 +935,7 @@ pub fn crop_cells(m: &trimble_tzf::ScanMeta, pw: usize, ph: usize, b: [i64; 4], 
 }
 
 pub async fn run_measure(st: Arc<AppState>, job_id: String, scan_id: String, crop: Option<([i64; 4], f64)>) {
+    let _reading = crate::files::reading(&st, [scan_id.clone()]);
     use crate::files::{scan_file, FileKind};
     let cancelled = |st: &AppState| finish(st, &job_id, JobState::Cancelled, None, None);
     let tzf = match unless_cancelled(&st, &job_id, scan_file(&st, &scan_id, FileKind::Tzf)).await {

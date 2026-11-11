@@ -76,6 +76,11 @@ pub struct Inner {
     /// field log has said so (once, until it gets back under).
     pub cache_noted: bool,
     pub register_again: HashSet<String>,
+    /// Scan files being read on the Pi now (scan id → readers): the cache
+    /// never drops these (`files::reading`).
+    pub reading: HashMap<String, usize>,
+    /// Each project's latest save to a laptop (`saves.json`).
+    pub saves: HashMap<String, Value>,
     pub runs: HashMap<String, crate::runs::RunRecord>,
     /// Scanner tasks the bridge cancelled that may still be listed in `/tasks`.
     pub cancelled_tasks: HashSet<i64>,
@@ -250,6 +255,37 @@ impl AppState {
             }
             Err(e) => {
                 self.log("error", format!("Ignoring registrations.json: {e}"), "bridge", None, &[]);
+                0
+            }
+        }
+    }
+
+    /// Write the latest saves to `saves.json` (after every save).
+    pub fn save_saves(&self) {
+        let saves = self.inner.lock().unwrap().saves.clone();
+        let path = self.data_dir.join("saves.json");
+        let tmp = path.with_extension(format!("json.{}", new_id("tmp")));
+        let res = serde_json::to_vec(&saves)
+            .map_err(std::io::Error::other)
+            .and_then(|b| std::fs::write(&tmp, b))
+            .and_then(|_| std::fs::rename(&tmp, &path));
+        if let Err(e) = res {
+            let _ = std::fs::remove_file(&tmp);
+            self.log("error", format!("Could not keep the record of saves: {e}"), "bridge", None, &[]);
+        }
+    }
+
+    /// Load the saves recorded before a restart. Returns how many projects.
+    pub fn load_saves(&self) -> usize {
+        let Ok(bytes) = std::fs::read(self.data_dir.join("saves.json")) else { return 0 };
+        match serde_json::from_slice::<HashMap<String, Value>>(&bytes) {
+            Ok(m) => {
+                let n = m.len();
+                self.inner.lock().unwrap().saves = m;
+                n
+            }
+            Err(e) => {
+                self.log("error", format!("Ignoring saves.json: {e}"), "bridge", None, &[]);
                 0
             }
         }

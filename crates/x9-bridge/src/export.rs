@@ -113,7 +113,7 @@ pub fn run(tzf: &Path, preview: Option<&[u8]>, req: &ExportRequest, out: &Path, 
     match req.format {
         Format::Ply => write_ply(out, &pts, &g, stop),
         Format::Las => write_las(out, &pts, &g, stop),
-        Format::Copc => write_copc(out, &pts, &g, stop),
+        Format::Copc => write_copc(out, &pts, &g, LOCAL_WKT, stop),
     }
     .map_err(|e| if e.kind() == std::io::ErrorKind::Interrupted && stop() { Failure::Cancelled } else { Failure::Write(e) })?;
 
@@ -155,6 +155,39 @@ pub fn run(tzf: &Path, preview: Option<&[u8]>, req: &ExportRequest, out: &Path, 
         "bounds_m": {"min": lo, "max": hi},
         "checks": checks,
     }))
+}
+
+/// The project frame's CRS: the frame station's levelled scanner frame.
+pub fn project_wkt(frame_station: u16) -> String {
+    format!(r#"LOCAL_CS["X9 project frame (station {frame_station}, levelled)",LOCAL_DATUM["station {frame_station} scanner origin",0],UNIT["metre",1],AXIS["X",EAST],AXIS["Y",NORTH],AXIS["Z",UP]]"#)
+}
+
+/// One registered station as COPC: its points moved by its pose into the
+/// project frame (`wkt`), grey from the preview when there is one. Returns
+/// the point count, bytes and bounds.
+pub fn save_station(tzf: &Path, preview: Option<&[u8]>, pose: &crate::register::Pose, wkt: &str, out: &Path, stop: &dyn Fn() -> bool) -> Result<Value, Failure> {
+    let bad = Failure::Decode;
+    let t = trimble_tzf::Tzf::open(tzf).map_err(|e| bad(format!("open: {e}")))?;
+    let meta = t.scan_meta().map_err(|e| bad(format!("metadata: {e}")))?;
+    let mut pts = t.grid_points().map_err(|e| bad(format!("decode: {e}")))?;
+    if stop() {
+        return Err(Failure::Cancelled);
+    }
+    let img = preview.map(crate::aim::jpeg_luma).transpose().map_err(bad)?;
+    let grey = Grey::new(&meta, img);
+    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for p in &mut pts {
+        let q = pose.apply([p.point.x, p.point.y, p.point.z]);
+        (p.point.x, p.point.y, p.point.z) = (q[0], q[1], q[2]);
+        for k in 0..3 {
+            lo[k] = lo[k].min(q[k] as f64);
+            hi[k] = hi[k].max(q[k] as f64);
+        }
+    }
+    write_copc(out, &pts, &|p| grey.of(p), wkt, stop)
+        .map_err(|e| if e.kind() == std::io::ErrorKind::Interrupted && stop() { Failure::Cancelled } else { Failure::Write(e) })?;
+    let bytes = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+    Ok(json!({"point_count": pts.len(), "bytes": bytes, "bounds_m": {"min": lo, "max": hi}}))
 }
 
 /// Grey level of a grid point, from a grid-aligned preview (decoded with
@@ -272,7 +305,7 @@ fn write_las(path: &Path, pts: &[trimble_tzf::GridPoint], gray: &dyn Fn(&trimble
 const LOCAL_WKT: &str = r#"LOCAL_CS["X9 scanner frame, levelled",LOCAL_DATUM["scanner origin",0],UNIT["metre",1],AXIS["X",EAST],AXIS["Y",NORTH],AXIS["Z",UP]]"#;
 
 /// COPC 1.0: LAS 1.4, point format 6, LAZ chunks in an octree, 0.1 mm scale.
-fn write_copc(path: &Path, pts: &[trimble_tzf::GridPoint], gray: &dyn Fn(&trimble_tzf::GridPoint) -> u8, stop: &dyn Fn() -> bool) -> std::io::Result<()> {
+fn write_copc(path: &Path, pts: &[trimble_tzf::GridPoint], gray: &dyn Fn(&trimble_tzf::GridPoint) -> u8, wkt: &str, stop: &dyn Fn() -> bool) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
     const SCALE: f64 = 0.0001;
     let err = |e: &dyn std::fmt::Display| Error::other(format!("COPC: {e}"));
@@ -305,7 +338,7 @@ fn write_copc(path: &Path, pts: &[trimble_tzf::GridPoint], gray: &dyn Fn(&trimbl
     let t = |k: usize| las::Transform { scale: SCALE, offset: min[k] };
     b.transforms = las::Vector { x: t(0), y: t(1), z: t(2) };
     b.has_wkt_crs = true;
-    b.vlrs.push(las::Vlr { user_id: "LASF_Projection".into(), record_id: 2112, description: "OGC WKT coordinate system".into(), data: LOCAL_WKT.as_bytes().to_vec() });
+    b.vlrs.push(las::Vlr { user_id: "LASF_Projection".into(), record_id: 2112, description: "OGC WKT coordinate system".into(), data: wkt.as_bytes().to_vec() });
     let mut header = b.into_header().map_err(|e| err(&e))?;
     for p in pts {
         header.add_point(&point(p));
@@ -616,7 +649,7 @@ pub(crate) mod tests {
         let dir = scratch("x9-export-empty");
         write_las(&dir.join("e.las"), &[], &|_| 0, &|| false).unwrap();
         assert_eq!(std::fs::metadata(dir.join("e.las")).unwrap().len(), 227);
-        let e = write_copc(&dir.join("e.copc.laz"), &[], &|_| 0, &|| false).unwrap_err();
+        let e = write_copc(&dir.join("e.copc.laz"), &[], &|_| 0, LOCAL_WKT, &|| false).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
         // A file that isn't COPC can't have its hierarchy completed.
         std::fs::write(dir.join("short.laz"), b"LASF").unwrap();
@@ -632,7 +665,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = pts(3 * STOP_EVERY);
         let grey = |_: &GridPoint| 128u8;
-        for (name, w) in [("a.ply", write_ply as fn(&Path, &[GridPoint], &dyn Fn(&GridPoint) -> u8, &dyn Fn() -> bool) -> std::io::Result<()>), ("a.las", write_las), ("a.copc.laz", write_copc)] {
+        for (name, w) in [("a.ply", write_ply as fn(&Path, &[GridPoint], &dyn Fn(&GridPoint) -> u8, &dyn Fn() -> bool) -> std::io::Result<()>), ("a.las", write_las), ("a.copc.laz", |p, pts, g, stop| write_copc(p, pts, g, LOCAL_WKT, stop))] {
             let out = dir.join(name);
             // Asked to stop after the first batch.
             let polls = Cell::new(0);
@@ -660,7 +693,7 @@ pub(crate) mod tests {
         let p: Vec<GridPoint> = (0..50_000)
             .map(|i| GridPoint { point: Point { x: (i % 250) as f32 * 0.01, y: (i / 250) as f32 * 0.01, z: 1.5 + (i % 7) as f32 * 0.001, intensity: 0.0 }, row: i / 250, col: i % 250 })
             .collect();
-        write_copc(&out, &p, &|g| (g.col % 256) as u8, &|| false).unwrap();
+        write_copc(&out, &p, &|g| (g.col % 256) as u8, LOCAL_WKT, &|| false).unwrap();
         let mut r = copc_rs::CopcReader::from_path(&out).unwrap();
         assert!(r.num_entries() > 0);
         let got: Vec<las::Point> = r.points(copc_rs::LodSelection::All, copc_rs::BoundsSelection::All).unwrap().collect();
@@ -694,7 +727,7 @@ pub(crate) mod tests {
                 p.push(GridPoint { point: Point { x: (d[0] * t) as f32, y: (d[1] * t) as f32, z: (d[2] * t) as f32, intensity: 0.0 }, row: r, col: c });
             }
         }
-        write_copc(&out, &p, &|_| 0, &|| false).unwrap();
+        write_copc(&out, &p, &|_| 0, LOCAL_WKT, &|| false).unwrap();
         assert_eq!(orphans(&out), 0);
         let mut r = copc_rs::CopcReader::from_path(&out).unwrap();
         let n = r.points(copc_rs::LodSelection::All, copc_rs::BoundsSelection::All).unwrap().count();

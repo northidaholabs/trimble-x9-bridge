@@ -147,13 +147,47 @@ fn cached(data_dir: &Path) -> Vec<Cached> {
         .collect()
 }
 
-/// Make room for `incoming` bytes of scan `incoming_id` within `budget`: drop
-/// the cached scan files of other projects, oldest first. Never one of the
-/// incoming scan's project, of a project with a job running or registering
-/// (it may be reading them), or of a scan in no registration while any job
-/// runs. A dropped file is fetched again if it is needed: the scanner keeps
-/// every scan. When nothing more may be dropped and the cache is still over,
-/// the field log says so once. Returns the bytes dropped.
+/// Scan files being read: while it lives, the cache never drops them.
+pub struct Reading<'a> {
+    st: &'a AppState,
+    ids: Vec<String>,
+}
+
+/// Mark scan files as being read, from before they are fetched until the
+/// guard is dropped (a fetch of one may make room by dropping another).
+pub fn reading(st: &AppState, ids: impl IntoIterator<Item = String>) -> Reading<'_> {
+    let ids: Vec<String> = ids.into_iter().collect();
+    let mut inner = st.inner.lock().unwrap();
+    for id in &ids {
+        *inner.reading.entry(id.clone()).or_default() += 1;
+    }
+    Reading { st, ids }
+}
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.st.inner.lock().unwrap();
+        for id in &self.ids {
+            if let Some(n) = inner.reading.get_mut(id) {
+                *n -= 1;
+                if *n == 0 {
+                    inner.reading.remove(id);
+                }
+            }
+        }
+    }
+}
+
+/// Make room for `incoming` bytes of scan `incoming_id` within `budget`.
+/// First the cached scan files of other projects, oldest first: never one of
+/// the incoming scan's project, of a project with a job running or
+/// registering (it may be reading them), or of a scan in no registration
+/// while any job runs. Then, any project's files a connected laptop holds
+/// whose 5 cm clouds are prepared, oldest first (`specs/laptop-offload.md`,
+/// part D). Never a file being read (`reading`). A dropped file is fetched
+/// again if it is needed: the scanner keeps every scan. When nothing more may
+/// be dropped and the cache is still over, the field log says so once.
+/// Returns the bytes dropped.
 pub async fn make_room(st: &AppState, incoming_id: &str, incoming: u64, budget: u64) -> u64 {
     let mut files = cached(&st.data_dir);
     let mut used: u64 = files.iter().map(|f| f.bytes).sum();
@@ -174,8 +208,10 @@ pub async fn make_room(st: &AppState, incoming_id: &str, incoming: u64, budget: 
         (project_of, busy, any_job)
     };
     let mine = project_of.get(incoming_id).cloned();
+    let reading: std::collections::HashSet<String> = st.inner.lock().unwrap().reading.keys().cloned().collect();
     let keep = |f: &Cached| {
         f.scan_id == incoming_id
+            || reading.contains(&f.scan_id)
             || match project_of.get(&f.scan_id) {
                 Some(p) => Some(p) == mine.as_ref() || busy.contains(p),
                 None => any_job || mine.is_none(),
@@ -196,6 +232,33 @@ pub async fn make_room(st: &AppState, incoming_id: &str, incoming: u64, budget: 
     }
     if n > 0 {
         st.log("note", format!("Made room in the scan cache: dropped {n} file{} ({} MB) of other projects, oldest first", if n == 1 { "" } else { "s" }, dropped / MB), "bridge", None, &[]);
+    }
+    if used + incoming > budget {
+        // The second tier: what the laptop holds, once the Pi needs only the
+        // station's prepared cloud.
+        let held = st.work.lock().unwrap().held();
+        let prepared = st.data_dir.join("registration");
+        let mut second: Vec<Cached> = cached(&st.data_dir)
+            .into_iter()
+            .filter(|f| f.scan_id != incoming_id && !reading.contains(&f.scan_id) && held.contains(&f.scan_id))
+            .filter(|f| prepared.join(crate::worker::cloud_name(&f.scan_id)).exists())
+            .collect();
+        second.sort_by_key(|f| f.modified);
+        let (mut freed, mut k) = (0u64, 0usize);
+        for f in second {
+            if used + incoming <= budget {
+                break;
+            }
+            if tokio::fs::remove_file(&f.path).await.is_ok() {
+                used -= f.bytes;
+                freed += f.bytes;
+                k += 1;
+            }
+        }
+        if k > 0 {
+            st.log("note", format!("Made room in the scan cache: dropped {k} file{} ({} MB) the laptop holds; their stations stay registered", if k == 1 { "" } else { "s" }, freed / MB), "bridge", mine.as_deref(), &[]);
+        }
+        dropped += freed;
     }
     if used + incoming > budget {
         let first = !std::mem::replace(&mut st.inner.lock().unwrap().cache_noted, true);
@@ -264,6 +327,7 @@ pub const VIEW_POINTS: usize = 2_000_000;
 /// on the scanner (as for `scan_file`). Builds run one at a time.
 pub async fn view_file(st: &AppState, scan_id: &str, part: ViewPart) -> Result<PathBuf, ApiError> {
     let id = safe_id(scan_id)?;
+    let _reading = reading(st, [id.to_string()]);
     let tzf = scan_file(st, id, FileKind::Tzf).await?;
     let dir = st.data_dir.join("views");
     let points = |max: usize| dir.join(format!("{id}-{max}.x9v"));
@@ -410,6 +474,67 @@ mod tests {
         put(&b, "loose", 100, 500);
         assert_eq!(make_room(&b.st, "stray", 100 * KB, 150 * KB).await, 100 * KB);
         assert_eq!(left(&b), ["loose"]);
+    }
+
+    /// A station whose 5 cm cloud is prepared on the Pi.
+    fn prepared(b: &crate::testkit::Bridge, id: &str) {
+        let dir = b.st.data_dir.join("registration");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(crate::worker::cloud_name(id)), b"cloud").unwrap();
+    }
+
+    #[tokio::test]
+    async fn this_projects_files_the_laptop_holds_go_once_their_clouds_are_prepared() {
+        let b = crate::testkit::Bridge::new().await;
+        {
+            let mut inner = b.st.inner.lock().unwrap();
+            inner.registrations.insert("A".into(), reg("A", &["a1", "a2", "a3", "a4", "a5"]));
+            inner.registering.insert("A".into(), "job_1".into()); // busy: the first tier keeps all of A
+        }
+        put(&b, "a1", 100, 500); // held and prepared, but being read
+        put(&b, "a2", 100, 400); // held and prepared: goes first
+        put(&b, "a3", 100, 300); // held, not prepared: the Pi still needs it
+        put(&b, "a4", 100, 200); // prepared, not held
+        for id in ["a1", "a2", "a4"] {
+            prepared(&b, id);
+        }
+        // No laptop: nothing may go.
+        assert_eq!(make_room(&b.st, "a5", 100 * KB, 350 * KB).await, 0);
+        // The laptop says what it holds.
+        {
+            let mut w = b.st.work.lock().unwrap();
+            w.claim("laptop", "agent");
+            w.note_holds("laptop", ["a1", "a2", "a3"].map(String::from).into());
+        }
+        let _r = reading(&b.st, ["a1".to_string()]);
+        assert_eq!(make_room(&b.st, "a5", 100 * KB, 350 * KB).await, 100 * KB);
+        assert_eq!(left(&b), ["a1", "a3", "a4"]);
+        assert_eq!(notes(&b, "Made room in the scan cache: dropped 1 file (0 MB) the laptop holds; their stations stay registered"), 1);
+        // Still over, with nothing more it may drop: the note says so.
+        assert_eq!(make_room(&b.st, "a5", 100 * KB, 250 * KB).await, 0);
+        assert_eq!(notes(&b, "The scan cache needs"), 1);
+        // Once read, a1 may go too.
+        drop(_r);
+        assert!(b.st.inner.lock().unwrap().reading.is_empty());
+        assert_eq!(make_room(&b.st, "a5", 100 * KB, 250 * KB).await, 100 * KB);
+        assert_eq!(left(&b), ["a3", "a4"]);
+    }
+
+    #[tokio::test]
+    async fn a_file_being_read_stays_even_in_the_first_tier() {
+        let b = crate::testkit::Bridge::new().await;
+        b.st.inner.lock().unwrap().registrations.insert("B".into(), reg("B", &["b1", "b2"]));
+        b.st.inner.lock().unwrap().registrations.insert("A".into(), reg("A", &["a1"]));
+        put(&b, "b1", 100, 500);
+        put(&b, "b2", 100, 400);
+        let r1 = reading(&b.st, ["b1".to_string()]);
+        let r2 = reading(&b.st, ["b1".to_string()]);
+        assert_eq!(make_room(&b.st, "a1", 100 * KB, 150 * KB).await, 100 * KB);
+        assert_eq!(left(&b), ["b1"]);
+        drop(r1);
+        assert_eq!(b.st.inner.lock().unwrap().reading.get("b1"), Some(&1), "two readers, one left");
+        drop(r2);
+        assert_eq!(make_room(&b.st, "a1", 100 * KB, 50 * KB).await, 100 * KB);
     }
 
     #[test]

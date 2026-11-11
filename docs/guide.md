@@ -1074,7 +1074,7 @@ current after each station; the web UI shows it at the top of Now and
 redraws it as stations land and register, and the agent shows it in the chat
 (`scanner_minimap`).
 
-#### Workers: registration on a faster computer
+#### Workers: the laptop does the heavy work and keeps the data
 
 The Pi registers on its own, keeping prepared stations and pair checks in
 memory so each new station costs about one station's work. A faster
@@ -1091,17 +1091,48 @@ uploads the merged points and posts the result. The bridge stays the record:
 it stores the result, logs it ("registered on <worker>") and re-judges the
 mission as when it works alone. It takes the job back when no worker has
 been seen for 15 s, none claims within 10 s, or the worker fails or takes
-longer than 10 minutes. `GET /v1/workers` lists the workers seen recently. The
-release has macOS builds for laptops; the agent asks the person once per
+longer than 10 minutes. It also fits question checks (`check` jobs: 120 s
+for a re-check, 60 s for one ask, then the Pi fits them itself). `GET
+/v1/workers` lists the workers seen recently and the kind of job each holds.
+The release has macOS builds for laptops; the agent asks the person once per
 laptop whether to use it (`scanner_processing`).
+
+The laptop is where the data lands. The worker keeps every scan file it
+fetches (`--cache`, within `--cache-gb`, default 20) and each claim says
+which it holds, so when the Pi's own cache is full it drops the files the
+laptop holds once their stations are prepared; the scanner keeps every scan,
+so nothing is lost. When the mission is signed off, and whenever asked
+(`POST /v1/projects/{id}/save`), the bridge offers a `save` job. The worker
+writes the project to a folder under `--save-dir` (default `~/X9 Projects`),
+one per project:
+
+```
+Yard-5b5314cf/
+  manifest.json            what is here: stations, poses, every file with its size and sha256
+  registration.json        the registration as the bridge keeps it
+  mission.json             the mission and its ledger, when there is one
+  scans/station-01-<scan id>.tzf   each station's scan file, as the scanner made it
+  scans/station-01-<scan id>.jpg   and its preview
+  stations/station-01.copc.laz     each placed station's points in the project frame (COPC)
+```
+
+A station not yet confirmed by the registration's checks gets
+`-unconfirmed` in its cloud's name; one not placed is saved as its scan file
+only. Saving again rewrites only stations whose scan or pose changed. A save
+waits for a laptop however long it takes, goes back on offer if the laptop
+taking it says nothing for 5 minutes, and is never done on the Pi. The field
+log names the folder; `GET /v1/projects/{id}/save` gives the latest save and
+any save still running.
 
 | Route | Who | What |
 | --- | --- | --- |
-| `POST /v1/work/claim` `{worker}` | agent, operator | 200 with a job (`job_id`, `project_id`, `stations`, `pairs` already matched), or 204 |
+| `POST /v1/work/claim` `{worker, holds}` | agent, operator | 200 with a job (`kind`: `register`, `check` or `save`), or 204; `holds` lists the scan files the worker keeps |
 | `POST /v1/work/{job}/progress` `{phase, progress}` | the claimer | Shown on the job |
 | `PUT /v1/work/{job}/merged` | the claimer | The merged points (binary, as the bridge stores them) |
-| `POST /v1/work/{job}/result` | the claimer | `{pairs, poses, audits, walls, skipped}`, poses and audits in the offered stations' order less the skipped |
-| `POST /v1/work/{job}/fail` `{error}` | the claimer | The bridge registers it itself |
+| `POST /v1/work/{job}/result` | the claimer | A registration: `{pairs, poses, audits, walls, skipped}`, poses and audits in the offered stations' order less the skipped. A check: `{checks}`. A save: `{folder, files, stations}` |
+| `POST /v1/work/{job}/fail` `{error}` | the claimer | The bridge does a registration or check itself; a failed save is logged |
+| `POST /v1/projects/{id}/save` | agent, operator | 202 with the save job |
+| `GET /v1/projects/{id}/save` | anyone | `{last, job}`: the latest save and any save running |
 
 ### Plan the next station
 

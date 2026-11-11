@@ -8,13 +8,19 @@
 //! station's decoded 5 cm cloud, so a check needs no transfer for a station
 //! already registered here; the cache drops the least recently used project's
 //! files first past `--cache-gb`. Prepared stations and pair checks are kept
-//! in memory, so each new station costs about one station's work.
+//! in memory, so each new station costs about one station's work. Each claim
+//! tells the bridge which scan files are kept here, so the Pi can drop its
+//! copies when its own cache is full.
 //!
-//!   x9-bridge worker [--bridge URL] [--token-file FILE] [--name NAME] [--cache DIR] [--cache-gb N]
+//! The laptop is where the data lands: a save job writes the project to a
+//! folder under `--save-dir`, one per project (`save`).
+//!
+//!   x9-bridge worker [--bridge URL] [--token-file FILE] [--name NAME] [--cache DIR] [--cache-gb N] [--save-dir DIR]
 //!
 //! Defaults: the bridge over the laptop cable (http://10.55.0.1:8795), the
 //! token from `X9_WORKER_TOKEN` or ~/.config/x9-worker/token (an agent or
-//! operator token), this computer's name, ~/.cache/x9-worker, and 20 GB.
+//! operator token), this computer's name, ~/.cache/x9-worker, 20 GB, and
+//! "~/X9 Projects".
 
 use crate::register::{audit, prepare, register_all, walls, AuditCache, Cloud, Merged, Pair, Prepared};
 use crate::work::WorkResult;
@@ -35,6 +41,8 @@ struct Worker {
     cache_bytes: u64,
     prepared: HashMap<String, Arc<Prepared>>,
     checks: AuditCache,
+    /// Where saved projects go, one folder each.
+    save_dir: PathBuf,
 }
 
 pub async fn run(args: &[String]) -> anyhow::Result<()> {
@@ -44,6 +52,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     let mut name = hostname();
     let mut cache = PathBuf::from(&home).join(".cache/x9-worker");
     let mut cache_gb: f64 = 20.0;
+    let mut save_dir = PathBuf::from(&home).join("X9 Projects");
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().with_context(|| format!("{a} needs a value"));
@@ -53,7 +62,8 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
             "--name" => name = val()?.clone(),
             "--cache" => cache = PathBuf::from(val()?),
             "--cache-gb" => cache_gb = val()?.parse().ok().filter(|g: &f64| *g > 0.0).context("--cache-gb: a number of gigabytes")?,
-            _ => bail!("usage: x9-bridge worker [--bridge URL] [--token-file FILE] [--name NAME] [--cache DIR] [--cache-gb N]"),
+            "--save-dir" => save_dir = PathBuf::from(val()?),
+            _ => bail!("usage: x9-bridge worker [--bridge URL] [--token-file FILE] [--name NAME] [--cache DIR] [--cache-gb N] [--save-dir DIR]"),
         }
     }
     let token = match std::env::var("X9_WORKER_TOKEN") {
@@ -62,8 +72,8 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     };
     std::fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
     let http = reqwest::Client::builder().connect_timeout(Duration::from_secs(5)).build()?;
-    let mut w = Worker { http, base, token, name, cache, cache_bytes: (cache_gb * 1e9) as u64, prepared: HashMap::new(), checks: AuditCache::new() };
-    eprintln!("x9-bridge worker {}: {} as {}, cache {}", crate::routes::VERSION, w.base, w.name, w.cache.display());
+    let mut w = Worker { http, base, token, name, cache, cache_bytes: (cache_gb * 1e9) as u64, prepared: HashMap::new(), checks: AuditCache::new(), save_dir };
+    eprintln!("x9-bridge worker {}: {} as {}, cache {}, saves to {}", crate::routes::VERSION, w.base, w.name, w.cache.display(), w.save_dir.display());
     let mut said_down = false;
     loop {
         match w.claim().await {
@@ -71,7 +81,11 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
                 said_down = false;
                 let id = job["job_id"].as_str().unwrap_or("").to_string();
                 let t0 = std::time::Instant::now();
-                let done = if job["kind"] == "check" { w.check(&job).await } else { w.register(&job).await };
+                let done = match job["kind"].as_str() {
+                    Some("check") => w.check(&job).await,
+                    Some("save") => w.save(&job).await,
+                    _ => w.register(&job).await,
+                };
                 match done {
                     Ok(summary) => eprintln!("{id}: done in {:.1} s: {summary}", t0.elapsed().as_secs_f64()),
                     Err(e) => {
@@ -110,7 +124,7 @@ impl Worker {
     }
 
     async fn claim(&self) -> anyhow::Result<Option<Value>> {
-        let r = self.post("/v1/work/claim", &json!({"worker": self.name})).await?;
+        let r = self.post("/v1/work/claim", &json!({"worker": self.name, "holds": self.holds()})).await?;
         if r.status() == reqwest::StatusCode::NO_CONTENT {
             return Ok(None);
         }
@@ -119,6 +133,24 @@ impl Worker {
 
     async fn progress(&self, job: &str, phase: &str, progress: Option<f64>) {
         let _ = self.post(&format!("/v1/work/{job}/progress"), &json!({"phase": phase, "progress": progress})).await;
+    }
+
+    /// Report progress, and stop if the bridge took the job back (a save
+    /// should not go on writing for nobody). A bridge out of reach is not a
+    /// reason to stop.
+    async fn progress_or_stop(&self, job: &str, phase: &str, progress: Option<f64>) -> anyhow::Result<()> {
+        match self.post(&format!("/v1/work/{job}/progress"), &json!({"phase": phase, "progress": progress})).await {
+            Err(e) if e.to_string().contains(": 409") => bail!("the bridge took the job back"),
+            _ => Ok(()),
+        }
+    }
+
+    /// The scan files kept here, by scan id.
+    fn holds(&self) -> Vec<String> {
+        let Ok(dir) = std::fs::read_dir(&self.cache) else { return vec![] };
+        let mut ids: Vec<String> = dir.flatten().filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".tzf").map(str::to_string)).collect();
+        ids.sort();
+        ids
     }
 
     /// The station's scan file: from the cache, or fetched over the bridge and
@@ -274,6 +306,147 @@ impl Worker {
         Ok(format!("{n} faces checked, {answered} with a reading"))
     }
 
+    /// The station's preview from the bridge, for grey levels; none if it has none.
+    async fn preview(&self, scan_id: &str) -> Option<Vec<u8>> {
+        let r = self.http.get(format!("{}/v1/scans/{scan_id}/preview", self.base)).bearer_auth(&self.token).timeout(Duration::from_secs(60)).send().await.ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        r.bytes().await.ok().map(|b| b.to_vec())
+    }
+
+    /// A save: write the project to its folder under the save directory
+    /// (`specs/laptop-offload.md`, part D). Every station's scan file (linked
+    /// from the cache when it can be, else copied) and preview, each placed
+    /// station's points in the project frame as COPC, the registration and
+    /// mission, and last the manifest, listing every file with its checksum.
+    /// A station whose scan and pose are as at the last save keeps its cloud.
+    /// A station that can't be saved is noted, and the rest are saved.
+    async fn save(&mut self, job: &Value) -> anyhow::Result<String> {
+        let id = job["job_id"].as_str().context("job_id")?.to_string();
+        let project = job["project_id"].as_str().unwrap_or("").to_string();
+        let folder = job["folder"].as_str().context("folder")?;
+        if folder.is_empty() || folder.len() > 120 || folder.contains(['/', '\\']) || folder.starts_with('.') {
+            bail!("not a folder name: {folder:?}");
+        }
+        let stations: Vec<SaveStation> = serde_json::from_value(job["stations"].clone()).context("stations")?;
+        let frame = job["frame_station"].as_u64().unwrap_or(1) as u16;
+        let wkt = crate::export::project_wkt(frame);
+        let dir = self.save_dir.join(folder);
+        for sub in ["scans", "stations"] {
+            std::fs::create_dir_all(dir.join(sub)).with_context(|| format!("creating {}", dir.join(sub).display()))?;
+        }
+        let before: Value = std::fs::read(dir.join("manifest.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+        // (path in the folder, whether the last manifest's checksum still holds)
+        let mut written: Vec<(String, bool)> = Vec::new();
+        let (mut out, mut listed) = (Vec::new(), Vec::new());
+        for (k, s) in stations.iter().enumerate() {
+            self.progress_or_stop(&id, &format!("saving station {} on {}", s.station, self.name), Some(k as f64 / stations.len().max(1) as f64 * 0.9)).await?;
+            let mut done = crate::work::SavedStation { station: s.station, scan_id: s.scan_id.clone(), copc: None, point_count: None, kept: false, note: None };
+            let tzf = match self.tzf(&s.scan_id, &project).await {
+                Ok(p) => p,
+                Err(e) => {
+                    done.note = Some(format!("scan file not saved: {e:#}"));
+                    listed.push(json!({"station": s.station, "scan_id": s.scan_id, "pose": s.pose, "trusted": s.trusted, "note": done.note}));
+                    out.push(done);
+                    continue;
+                }
+            };
+            let raw = format!("scans/station-{:02}-{}.tzf", s.station, s.scan_id);
+            let fresh = place(&tzf, &dir.join(&raw))?;
+            written.push((raw.clone(), !fresh));
+            let preview = self.preview(&s.scan_id).await;
+            let jpg = format!("scans/station-{:02}-{}.jpg", s.station, s.scan_id);
+            if let Some(b) = &preview {
+                write_atomic(&dir.join(&jpg), b)?;
+                written.push((jpg.clone(), false));
+            }
+            match s.pose {
+                None => done.note = Some("not placed: saved as its scan file only".into()),
+                Some(pose) => {
+                    let name = format!("stations/station-{:02}{}.copc.laz", s.station, if s.trusted { "" } else { "-unconfirmed" });
+                    let last = before["stations"].as_array().and_then(|a| a.iter().find(|e| e["station"] == s.station)).cloned().unwrap_or(Value::Null);
+                    let unchanged = last["scan_id"] == s.scan_id.as_str() && last["copc"] == name.as_str() && last["pose"] == serde_json::to_value(pose)? && dir.join(&name).exists();
+                    if unchanged {
+                        done.kept = true;
+                        done.point_count = last["point_count"].as_u64();
+                    } else {
+                        let (t, w, pv, part) = (tzf.clone(), wkt.clone(), preview.clone(), dir.join(format!("{name}.part")));
+                        let p2 = part.clone();
+                        match tokio::task::spawn_blocking(move || crate::export::save_station(&t, pv.as_deref(), &pose, &w, &p2, &|| false)).await? {
+                            Ok(v) => {
+                                std::fs::rename(&part, dir.join(&name))?;
+                                done.point_count = v["point_count"].as_u64();
+                            }
+                            Err(e) => {
+                                let _ = std::fs::remove_file(&part);
+                                let _ = std::fs::remove_file(dir.join(&name));
+                                done.note = Some(format!("cloud not written: {}", failure(&e)));
+                            }
+                        }
+                    }
+                    if dir.join(&name).exists() {
+                        done.copc = Some(name.clone());
+                        written.push((name, done.kept));
+                    }
+                }
+            }
+            listed.push(json!({"station": s.station, "scan_id": s.scan_id, "pose": s.pose, "trusted": s.trusted, "copc": done.copc, "point_count": done.point_count, "scan_file": raw, "preview": preview.is_some().then_some(jpg), "note": done.note}));
+            out.push(done);
+        }
+        // A cloud from an earlier save that this one didn't write (the station
+        // was confirmed since, or left the registration) would mislead.
+        let keep: std::collections::HashSet<&str> = written.iter().map(|w| w.0.as_str()).collect();
+        for e in std::fs::read_dir(dir.join("stations"))?.flatten() {
+            let rel = format!("stations/{}", e.file_name().to_string_lossy());
+            if rel.ends_with(".copc.laz") && !keep.contains(rel.as_str()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        self.progress_or_stop(&id, &format!("checksums on {}", self.name), Some(0.9)).await?;
+        write_atomic(&dir.join("registration.json"), &serde_json::to_vec_pretty(&job["registration"])?)?;
+        written.push(("registration.json".into(), false));
+        if !job["mission"].is_null() {
+            write_atomic(&dir.join("mission.json"), &serde_json::to_vec_pretty(&job["mission"])?)?;
+            written.push(("mission.json".into(), false));
+        }
+        let (d, last) = (dir.clone(), before["files"].clone());
+        let files = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<crate::work::SavedFile>> {
+            written
+                .into_iter()
+                .map(|(path, reuse)| {
+                    let bytes = std::fs::metadata(d.join(&path))?.len();
+                    let known = last.as_array().and_then(|a| a.iter().find(|f| f["path"] == path.as_str() && f["bytes"] == bytes)).and_then(|f| f["sha256"].as_str().map(str::to_string));
+                    let sha256 = match known.filter(|_| reuse) {
+                        Some(h) => h,
+                        None => sha256_of(&d.join(&path))?,
+                    };
+                    Ok(crate::work::SavedFile { path, bytes, sha256 })
+                })
+                .collect()
+        })
+        .await??;
+        let manifest = json!({
+            "format": "x9-bridge project folder, version 1",
+            "project_id": project,
+            "project_name": job["project_name"],
+            "saved_at": crate::util::now_rfc3339(),
+            "saved_by": self.name,
+            "worker_version": crate::routes::VERSION,
+            "bridge_version": job["bridge_version"],
+            "frame_station": frame,
+            "crs_wkt": wkt,
+            "stations": listed,
+            "files": files,
+        });
+        write_atomic(&dir.join("manifest.json"), &serde_json::to_vec_pretty(&manifest)?)?;
+        let gb = files.iter().map(|f| f.bytes).sum::<u64>() as f64 / 1e9;
+        let placed = out.iter().filter(|s| s.copc.is_some()).count();
+        let res = crate::work::SaveResult { folder: dir.display().to_string(), files, stations: out };
+        self.post(&format!("/v1/work/{id}/result"), &serde_json::to_value(&res)?).await?;
+        Ok(format!("saved to {}: {placed} of {} stations in the project frame, {gb:.1} GB", res.folder, res.stations.len()))
+    }
+
     async fn register(&mut self, job: &Value) -> anyhow::Result<String> {
         let id = job["job_id"].as_str().context("job_id")?.to_string();
         let stations: Vec<(u16, String)> = job["stations"]
@@ -335,6 +508,65 @@ impl Worker {
     }
 }
 
+/// A station as a save job lists it.
+#[derive(serde::Deserialize)]
+struct SaveStation {
+    station: u16,
+    scan_id: String,
+    pose: Option<crate::register::Pose>,
+    #[serde(default)]
+    trusted: bool,
+}
+
+/// Put a scan file in the folder: a hard link to the cached file when they
+/// share a disk (no second copy, and it outlives the cache's trimming), a
+/// copy otherwise. A file already there at the same size is left. Returns
+/// whether it wrote.
+fn place(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<bool> {
+    let len = std::fs::metadata(src)?.len();
+    if std::fs::metadata(dst).is_ok_and(|m| m.len() == len) {
+        return Ok(false);
+    }
+    let part = dst.with_extension("tzf.part");
+    let _ = std::fs::remove_file(&part);
+    if std::fs::hard_link(src, &part).is_err() {
+        std::fs::copy(src, &part)?;
+    }
+    std::fs::rename(&part, dst)?;
+    Ok(true)
+}
+
+/// Write a file whole or not at all.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let part = std::path::PathBuf::from(format!("{}.part", path.display()));
+    std::fs::write(&part, bytes)?;
+    std::fs::rename(&part, path)
+}
+
+fn sha256_of(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut h = sha2::Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn failure(e: &crate::export::Failure) -> String {
+    match e {
+        crate::export::Failure::Decode(m) => format!("the scan did not decode ({m})"),
+        crate::export::Failure::Write(e) => format!("writing it failed ({e})"),
+        crate::export::Failure::Cancelled => "stopped".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,7 +589,7 @@ mod tests {
     }
 
     fn worker(base: &str, token: &str) -> Worker {
-        Worker { http: reqwest::Client::new(), base: base.into(), token: token.into(), name: "laptop".into(), cache: cache_dir(), cache_bytes: 20_000_000_000, prepared: HashMap::new(), checks: AuditCache::new() }
+        Worker { http: reqwest::Client::new(), base: base.into(), token: token.into(), name: "laptop".into(), cache: cache_dir(), cache_bytes: 20_000_000_000, prepared: HashMap::new(), checks: AuditCache::new(), save_dir: cache_dir().join("saved") }
     }
 
     /// Have the bridge offer the project's registration and claim it.
@@ -488,6 +720,123 @@ mod tests {
         std::fs::remove_dir_all(&w.cache).unwrap();
         std::fs::remove_dir_all(fx).unwrap();
         std::fs::remove_dir_all(fx_pi).unwrap();
+    }
+
+    /// Have the bridge offer a save of the project and take it.
+    async fn claim_save(b: &Bridge, w: &Worker, project: &str) -> (String, Value) {
+        assert!(w.claim().await.unwrap().is_none(), "seen first");
+        let (code, job) = b.call("POST", &format!("/v1/projects/{project}/save"), Some(AGENT), None).await;
+        assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{job}");
+        let j = w.claim().await.unwrap().expect("the save is on offer");
+        assert_eq!((j["job_id"].as_str(), j["kind"].as_str()), (job["job_id"].as_str(), Some("save")));
+        (job["job_id"].as_str().unwrap().to_string(), j)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_writes_the_project_folder_on_the_laptop_and_keeps_what_is_unchanged() {
+        use crate::ask::tests::{yard_bridge, PROJECT};
+        use crate::register::Pose;
+        let (b, fx) = yard_bridge().await;
+        let pose = Pose { turn_deg: 90.0, xyz_m: [10.0, 0.0, 1.0] };
+        let scan = {
+            let mut inner = b.st.inner.lock().unwrap();
+            let s = &mut inner.registrations.get_mut(PROJECT).unwrap().stations[0];
+            s.pose = Some(pose);
+            s.scan_id.clone()
+        };
+        let w = &mut worker(&serve(&b).await, AGENT);
+        let (id, job) = claim_save(&b, w, PROJECT).await;
+        let summary = w.save(&job).await.unwrap();
+        assert!(summary.contains(": 1 of 1 stations in the project frame"), "{summary}");
+        let done = wait_job(&b, &id, 5.0).await;
+        assert_eq!(done["state"], "succeeded", "{done}");
+        let folder = PathBuf::from(done["result"]["folder"].as_str().unwrap());
+        assert!(folder.starts_with(&w.save_dir), "{folder:?}");
+
+        // Every file is listed with its size and checksum.
+        let manifest: Value = serde_json::from_slice(&std::fs::read(folder.join("manifest.json")).unwrap()).unwrap();
+        let mut paths = Vec::new();
+        for f in manifest["files"].as_array().unwrap() {
+            let p = folder.join(f["path"].as_str().unwrap());
+            assert_eq!(std::fs::metadata(&p).unwrap().len(), f["bytes"].as_u64().unwrap(), "{f}");
+            assert_eq!(sha256_of(&p).unwrap(), f["sha256"].as_str().unwrap(), "{f}");
+            paths.push(f["path"].as_str().unwrap().to_string());
+        }
+        paths.sort();
+        let raw = format!("scans/station-01-{scan}.tzf");
+        assert_eq!(paths, ["mission.json", "registration.json", &format!("scans/station-01-{scan}.jpg"), &raw, "stations/station-01.copc.laz"]);
+        assert_eq!(std::fs::read(folder.join(&raw)).unwrap(), std::fs::read(fx.join("dome.tzf")).unwrap(), "the scan file as the scanner made it");
+        assert_eq!(manifest["frame_station"], 1);
+        assert!(manifest["crs_wkt"].as_str().unwrap().contains("X9 project frame (station 1, levelled)"));
+
+        // The cloud is the station's points, moved by its pose into the project frame.
+        let copc = folder.join("stations/station-01.copc.laz");
+        let mut r = copc_rs::CopcReader::from_path(&copc).unwrap();
+        let got: Vec<las::Point> = r.points(copc_rs::LodSelection::All, copc_rs::BoundsSelection::All).unwrap().collect();
+        let t = trimble_tzf::Tzf::open(&fx.join("dome.tzf")).unwrap();
+        let pts = t.grid_points().unwrap();
+        assert_eq!(got.len(), pts.len());
+        assert_eq!(manifest["stations"][0]["point_count"].as_u64(), Some(pts.len() as u64));
+        let moved: Vec<[f32; 3]> = pts.iter().map(|p| pose.apply([p.point.x, p.point.y, p.point.z])).collect();
+        for k in 0..3 {
+            let (lo, hi) = got.iter().map(|q| [q.x, q.y, q.z][k]).fold((f64::MAX, f64::MIN), |(a, b), v| (a.min(v), b.max(v)));
+            let (elo, ehi) = moved.iter().map(|q| q[k] as f64).fold((f64::MAX, f64::MIN), |(a, b), v| (a.min(v), b.max(v)));
+            assert!((lo - elo).abs() < 1e-3 && (hi - ehi).abs() < 1e-3, "axis {k}: {lo}..{hi} against {elo}..{ehi}");
+        }
+
+        // The bridge has the record, and the Pi may drop its copy: the laptop holds it.
+        assert_eq!(b.call("GET", &format!("/v1/projects/{PROJECT}/save"), Some(VIEWER), None).await.1["last"]["folder"], folder.to_str().unwrap());
+        assert!(log_has(&b, &format!("Saved the project on laptop: {} (1 of 1 stations in the project frame", folder.display())));
+        assert!(w.claim().await.unwrap().is_none());
+        assert!(b.st.work.lock().unwrap().held().contains(&scan));
+
+        // Saved again unchanged: the cloud is kept, not written again.
+        let when = std::fs::metadata(&copc).unwrap().modified().unwrap();
+        let (id, job) = claim_save(&b, w, PROJECT).await;
+        w.save(&job).await.unwrap();
+        let again = wait_job(&b, &id, 5.0).await;
+        assert_eq!(again["result"]["stations"][0]["kept"], true, "{again}");
+        assert_eq!(std::fs::metadata(&copc).unwrap().modified().unwrap(), when);
+        assert!(log_has(&b, "1 unchanged since the last save"));
+
+        // No longer confirmed: written again under a name that says so, and the old one goes.
+        b.st.inner.lock().unwrap().registrations.get_mut(PROJECT).unwrap().stations[0].audit = Some(crate::register::Audit { verdict: "doubtful".into(), ..Default::default() });
+        let (id, job) = claim_save(&b, w, PROJECT).await;
+        w.save(&job).await.unwrap();
+        let third = wait_job(&b, &id, 5.0).await;
+        assert_eq!(third["result"]["stations"][0]["copc"], "stations/station-01-unconfirmed.copc.laz", "{third}");
+        assert!(!copc.exists());
+        std::fs::remove_dir_all(&w.cache).unwrap();
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_station_that_cannot_be_saved_is_noted_and_the_rest_are_saved() {
+        use crate::register::{Registration, StationPose};
+        let b = Bridge::new().await;
+        let reg = Registration { project_id: PID.into(), frame_scan_id: None, pairs: vec![], walls: vec![], summary: String::new(), updated_at: String::new(),
+                                 stations: vec![StationPose { scan_id: SCAN0.into(), station: 1, pose: None, audit: None }] };
+        b.st.inner.lock().unwrap().registrations.insert(PID.into(), reg);
+        let w = &mut worker(&serve(&b).await, AGENT);
+        let (id, job) = claim_save(&b, w, PID).await;
+        // The mock has no scan file to give: the station is noted, the registration still saved.
+        w.save(&job).await.unwrap();
+        let done = wait_job(&b, &id, 5.0).await;
+        assert_eq!(done["state"], "succeeded", "{done}");
+        let note = done["result"]["stations"][0]["note"].as_str().unwrap();
+        assert!(note.starts_with("scan file not saved: fetching the scan: 502"), "{note}");
+        assert!(log_has(&b, "; station 1: scan file not saved"));
+        let folder = PathBuf::from(done["result"]["folder"].as_str().unwrap());
+        let m: Value = serde_json::from_slice(&std::fs::read(folder.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(m["stations"][0]["note"].as_str(), Some(note));
+        assert_eq!(m["files"][0]["path"], "registration.json");
+        assert!(!folder.join("mission.json").exists(), "no mission, no file");
+        // A folder name that would leave the save directory is refused.
+        for bad in ["../out", "a/b", ".hidden", ""] {
+            let e = w.save(&json!({"job_id": "job_x", "folder": bad, "stations": []})).await.unwrap_err().to_string();
+            assert!(e.starts_with("not a folder name"), "{bad}: {e}");
+        }
+        std::fs::remove_dir_all(&w.cache).unwrap();
     }
 
     #[test]

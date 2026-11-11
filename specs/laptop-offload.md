@@ -1,6 +1,6 @@
 # Spec: Question checks on the laptop, and only the checks that changed
 
-Owner: Jim · Date: 2026-10-28, revised 2026-11-11 · Status: parts A, B and C approved and built (2026-11-11); D draft
+Owner: Jim · Date: 2026-10-28, revised 2026-11-11 · Status: all four parts approved and built (A, B and C 2026-11-11; D 2026-11-11)
 
 ## Problem
 
@@ -152,8 +152,11 @@ and suggests connecting the laptop.
 
 Built 2026-11-11, the first tier: other projects' files, oldest first, never
 one of a project with a job running or a registration in progress, and none
-of no known project while any job runs. The second tier, this project's
-files the laptop holds, comes with part D.
+of no known project while any job runs. The second tier came with part D:
+any project's files that a worker seen in the last 15 s holds and whose 5 cm
+cloud is prepared, oldest first. Neither tier drops a file being read on the
+Pi (a fit, an export, a measurement, a viewer build) from before it is
+fetched until the reading ends.
 
 ### D. The laptop is where the data lands
 
@@ -170,9 +173,42 @@ saved from there to its permanent destination (Jim, 2026-11-11). So:
   one per project. Later it moves to the cloud; the folder is where that
   upload will start from.
 
-Open: the format (LAS, LAZ, COPC, E57). COPC is the likely one: the bridge
-already exports it, and it reads well from the cloud. Also open: who
-confirms the cloud copy arrived, once there is one.
+Built 2026-11-11:
+
+- Each claim (`POST /v1/work/claim`) carries `holds`: the scan files in the
+  worker's cache. The bridge keeps them per worker and counts them only
+  while the worker is seen.
+- A `save` job is offered after the mission's sign-off and on
+  `POST /v1/projects/{id}/save` (agent or operator). It is a bridge job
+  (`kind: save`), running from the start with the phase "waiting for the
+  laptop", then "saving on <worker>". One waits per project; asking again
+  while it waits returns it. Its body is built when a worker claims it, so
+  it carries the registration as it then stands, and it isn't handed out
+  while the project registers or while another save of it runs.
+- There is no fallback on the Pi. A save waits for a worker however long it
+  takes; a worker that says nothing for 5 minutes loses it and it goes back
+  on offer. A failed save is logged with the reason, and nothing on the Pi
+  was dropped for it. A cancel takes it back.
+- The worker writes the folder under `--save-dir` (default `~/X9 Projects`),
+  named after the project and the start of its id: every station's scan
+  file, as the scanner made it (a hard link to the cached file when they
+  share a disk) and preview; each placed station's points moved by its pose
+  into the project frame as COPC (`stations/station-NN.copc.laz`,
+  `-unconfirmed` when the registration's checks don't trust it); the
+  registration and mission as JSON; and last `manifest.json`, which lists
+  every station and every file with its size and sha256. A station whose
+  scan and pose are as at the last save keeps its cloud. A station that
+  can't be saved is noted in the manifest and the log, and the rest are
+  saved.
+- The bridge logs "Saved the project on <worker>: <folder> (…)", keeps the
+  latest save of each project (`saves.json`, across restarts), and gives it
+  with any save running on `GET /v1/projects/{id}/save`.
+
+The format is COPC, one file per station in the project frame, in the
+project frame's own local CRS (the frame station's levelled scanner frame).
+One merged cloud is left to the cloud copy, where memory isn't the Pi's or
+the laptop's. Still open: who confirms the cloud copy arrived, once there is
+one.
 
 **What it opens up (a follow-on, its own spec):** with every station's file
 and the merged cloud on the laptop, the agent can ask about the whole cloud,
@@ -220,6 +256,21 @@ Every criterion is a ship gate.
 7. test: With `BRIDGE_CACHE_MB` set to 300 and the admin survey replayed
    station by station, the cache never passes 300 MB, every station still
    registers, and the log carries the budget note once.
+8. test: A save writes every station's scan file byte for byte, each placed
+   station's cloud with its decoded points moved by its pose (bounds to
+   1 mm), and a manifest whose sizes and checksums match the files. Saved
+   again unchanged, no cloud is written again; a station no longer
+   confirmed is written again under its `-unconfirmed` name and the old
+   cloud goes. A station that can't be fetched is noted and the save
+   finishes.
+9. test: With a worker seen holding a station's file and the station's
+   cloud prepared, the Pi drops that file when a fetch would pass the
+   budget, and not before; never a file being read, and none at all with
+   no worker seen.
+10. metric: Jim, once: the held-out survey saved on the laptop after its
+    sign-off. The time from sign-off to "Saved the project", the folder's
+    size, and the twelve station clouds opened together in a viewer line up
+    by eye at the walls.
 
 ## Kill-if
 
@@ -252,7 +303,9 @@ From the field log, on every visit after this ships:
 - Per re-check: targets judged, skipped, and fitted on the laptop or the
   Pi, and the seconds from the registration's end to the verdicts.
 - Checks taken back from a worker, and why.
-- Cache drops on the Pi, and the free space at sign-off.
+- Cache drops on the Pi (and which tier), and the free space at sign-off.
+- Per save: seconds from the sign-off to "Saved the project", stations
+  written and kept, and the folder's size.
 
 Jim reads them after the fifth visit with questions or on 2027-03-31,
 whichever comes first. If the laptop fitted fewer than a quarter of the
@@ -268,3 +321,5 @@ checks on those visits, Part B is reviewed for removal.
 | What first? | Parts A and C, which help every visit with or without the laptop. | Jim, 2026-11-11 |
 | Where does the scan data end up? | On the laptop, and from there the point cloud goes to its permanent destination (part D). | Jim, 2026-11-11 |
 | Where is the permanent destination? | A folder on the laptop for now; the cloud later. | Jim, 2026-11-11 |
+| What format is the saved cloud? | COPC, one file per station in the project frame, beside the scan files; a merged cloud waits for the cloud copy. | Spec, 2026-11-11 |
+| Does a save ever run on the Pi? | No: the Pi has neither the disk nor the place to keep it. It waits for the laptop and says so. | Spec, 2026-11-11 |

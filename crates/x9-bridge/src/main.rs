@@ -30,6 +30,7 @@ mod register;
 mod routes;
 mod rules;
 mod runs;
+mod save;
 mod state;
 mod station;
 mod ui;
@@ -108,6 +109,10 @@ async fn main() -> anyhow::Result<()> {
     let regs = st.load_registrations();
     if regs > 0 {
         st.log("note", format!("{regs} project registration{} kept from before the restart", if regs == 1 { "" } else { "s" }), "bridge", None, &[]);
+    }
+    let saves = st.load_saves();
+    if saves > 0 {
+        st.log("note", format!("The last save of {saves} project{} kept from before the restart", if saves == 1 { "" } else { "s" }), "bridge", None, &[]);
     }
     let kept = st.load_grants();
     if kept > 0 {
