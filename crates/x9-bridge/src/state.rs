@@ -57,6 +57,10 @@ pub struct Inner {
     /// A question's reading waiting for its second pass, by (project, target):
     /// kept here, out of the mission, so no client can quote it.
     pub settling: HashMap<(String, String), (crate::register::Face, crate::ask::Reading)>,
+    /// What each question target was last judged on (`ask::Basis`): a re-check
+    /// skips a target whose basis hasn't changed. Not saved: after a restart
+    /// every target is judged again once.
+    pub basis: HashMap<(String, String), crate::ask::Basis>,
     /// One look at a question target at a time, by (project, target).
     pub asking: HashMap<(String, String), std::sync::Arc<tokio::sync::Mutex<()>>>,
     /// A question's latest evidence image, by (project, target).
@@ -68,6 +72,9 @@ pub struct Inner {
     /// Projects with a registration job running (its job id), and those whose
     /// job should run once more when it ends (a station landed meanwhile).
     pub registering: HashMap<String, String>,
+    /// The scan cache is over its budget with nothing it may drop, and the
+    /// field log has said so (once, until it gets back under).
+    pub cache_noted: bool,
     pub register_again: HashSet<String>,
     pub runs: HashMap<String, crate::runs::RunRecord>,
     /// Scanner tasks the bridge cancelled that may still be listed in `/tasks`.

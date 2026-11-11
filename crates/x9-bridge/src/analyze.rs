@@ -1292,8 +1292,13 @@ impl FaceFit {
 
 /// Walls measured from the full-resolution points of the stations that saw
 /// them (`files`: station number, pose, file), without the ground. Each file
-/// is read once, and only if one of the walls lists its station.
-pub fn measure_faces(walls: &[Wall], files: &[(u16, Pose, std::path::PathBuf)], opts: &Opts) -> anyhow::Result<Vec<FaceFit>> {
+/// is read once, one at a time (decoding is what needs the memory), and only
+/// if one of the walls lists its station; its points go to every wall whose
+/// `seen_by` holds that station. Then up to `threads` walls are fitted at once
+/// (fitting is what needs the cores). A wall's fit doesn't depend on the
+/// others: it takes points only from its own stations, in the order of
+/// `files`, so fitting several together gives each the fit it gets alone.
+pub fn measure_faces_with(walls: &[Wall], files: &[(u16, Pose, std::path::PathBuf)], opts: &Opts, threads: usize) -> anyhow::Result<Vec<FaceFit>> {
     let xy: HashMap<u16, [f64; 2]> = files.iter().map(|(n, p, _)| (*n, [p.xyz_m[0], p.xyz_m[1]])).collect();
     let mut grids: Vec<WallGrid> = walls.iter().map(|w| WallGrid::new(w, &w.seen_by.iter().filter_map(|s| xy.get(s).copied()).collect::<Vec<_>>())).collect();
     for (n, pose, f) in files {
@@ -1309,10 +1314,34 @@ pub fn measure_faces(walls: &[Wall], files: &[(u16, Pose, std::path::PathBuf)], 
             }
         })?;
     }
+    let fit = |grid: &WallGrid| measure_wall(grid, None, opts, &format!("wall-{}.png", grid.wall.wall_id));
+    let threads = threads.clamp(1, grids.len().max(1));
+    if threads == 1 {
+        return Ok(grids
+            .into_iter()
+            .map(|grid| {
+                let (result, plane) = fit(&grid);
+                FaceFit { result, grid, plane }
+            })
+            .collect());
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    type Fitted = std::sync::Mutex<Option<(WallResult, Option<[f64; 3]>)>>;
+    let done: Vec<Fitted> = grids.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(grid) = grids.get(k) else { break };
+                *done[k].lock().unwrap() = Some(fit(grid));
+            });
+        }
+    });
     Ok(grids
         .into_iter()
-        .map(|grid| {
-            let (result, plane) = measure_wall(&grid, None, opts, &format!("wall-{}.png", grid.wall.wall_id));
+        .zip(done)
+        .map(|(grid, d)| {
+            let (result, plane) = d.into_inner().unwrap().expect("every wall is fitted");
             FaceFit { result, grid, plane }
         })
         .collect())
@@ -2017,13 +2046,13 @@ mod tests {
     fn a_station_that_saw_none_of_the_walls_is_not_read() {
         let w = wall_def("w1", [5.0, -4.0], [5.0, 6.0], "building");
         let pose = Pose { turn_deg: 0.0, xyz_m: [0.0, 0.0, 0.0] };
-        let fits = measure_faces(&[w], &[(2, pose, "/nonexistent/station_02.tzf".into())], &Opts::default()).unwrap();
+        let fits = measure_faces_with(&[w], &[(2, pose, "/nonexistent/station_02.tzf".into())], &Opts::default(), 1).unwrap();
         assert_eq!(fits.len(), 1);
         assert!(fits[0].result.lean_mm_per_m.is_none() && fits[0].result.covered_pct == 0.0);
         assert!(!fits[0].png(&Opts::default()).is_empty());
         // One that did see it, but whose file isn't a scan, is an error.
         let w = wall_def("w1", [5.0, -4.0], [5.0, 6.0], "building");
-        assert!(measure_faces(&[w], &[(1, pose, "/nonexistent/station_01.tzf".into())], &Opts::default()).is_err());
+        assert!(measure_faces_with(&[w], &[(1, pose, "/nonexistent/station_01.tzf".into())], &Opts::default(), 1).is_err());
     }
 
     #[test]

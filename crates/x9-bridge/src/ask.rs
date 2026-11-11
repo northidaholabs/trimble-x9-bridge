@@ -17,11 +17,12 @@
 //! Only `answer` carries plumb or flatness numbers. A reading waiting for its
 //! second pass is never shown: the model could quote it.
 
-use crate::analyze::{esc, measure_faces, withhold, FaceFit, Opts};
+use crate::analyze::{esc, measure_faces_with, withhold, FaceFit, Opts};
 use crate::register::{face_coverage, Face, Merged, Pose, FACE_COVERED};
 use crate::problem::ApiError;
 use crate::state::AppState;
 use anyhow::Context;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -509,30 +510,109 @@ pub fn questions_html(asked: &[Asked]) -> String {
 /// full-resolution points of the stations that saw it (`files`: station,
 /// pose, file). The fit is kept for drawing the evidence.
 pub fn look(target_id: &str, f: &Face, coverage: &Value, files: &[(u16, Pose, PathBuf)], opts: &Opts) -> anyhow::Result<(Check, Option<FaceFit>)> {
-    let mut stations: Vec<u16> = coverage["stations"].as_array().map(|a| a.iter().filter_map(|s| s["station"].as_u64().map(|n| n as u16)).collect()).unwrap_or_default();
-    stations.sort_unstable();
-    let mut c = Check { seen_share: coverage["seen_share"].as_f64().unwrap_or(0.0), length_m: coverage["length_m"].as_f64().unwrap_or(0.0), stations, fit: None };
-    let z = (coverage["height_m"][0].as_f64(), coverage["height_m"][1].as_f64());
-    let (Some(lo), Some(hi)) = z else { return Ok((c, None)) };
-    if c.seen_share < FACE_COVERED || c.length_m < MIN_LENGTH_M || hi <= lo {
-        return Ok((c, None));
+    Ok(look_many(&[(target_id.to_string(), *f, coverage.clone())], files, opts, 1)?.pop().expect("one look"))
+}
+
+/// Several looks at once, as `look` gives each alone: the faces that could
+/// pass the gate are fitted together, so each station's file is decoded once
+/// however many of them it saw, and up to `threads` fits run at a time.
+pub fn look_many(targets: &[(String, Face, Value)], files: &[(u16, Pose, PathBuf)], opts: &Opts, threads: usize) -> anyhow::Result<Vec<(Check, Option<FaceFit>)>> {
+    let mut checks = Vec::new();
+    let mut walls = Vec::new();
+    let mut fitted = Vec::new(); // index into `checks` of each wall
+    for (target_id, f, coverage) in targets {
+        let mut stations: Vec<u16> = coverage["stations"].as_array().map(|a| a.iter().filter_map(|s| s["station"].as_u64().map(|n| n as u16)).collect()).unwrap_or_default();
+        stations.sort_unstable();
+        let c = Check { seen_share: coverage["seen_share"].as_f64().unwrap_or(0.0), length_m: coverage["length_m"].as_f64().unwrap_or(0.0), stations, fit: None };
+        if let (Some(lo), Some(hi)) = (coverage["height_m"][0].as_f64(), coverage["height_m"][1].as_f64()) {
+            if c.seen_share >= FACE_COVERED && c.length_m >= MIN_LENGTH_M && hi > lo {
+                walls.push(face_wall(target_id, f, [lo, hi], c.stations.clone()));
+                fitted.push(checks.len());
+            }
+        }
+        checks.push(c);
     }
-    let mine: Vec<(u16, Pose, PathBuf)> = files.iter().filter(|(n, _, _)| c.stations.contains(n)).cloned().collect();
-    let fit = measure_faces(&[face_wall(target_id, f, [lo, hi], c.stations.clone())], &mine, opts)?.pop();
-    c.fit = fit.as_ref().and_then(|ff| {
+    let mut out: Vec<(Check, Option<FaceFit>)> = checks.into_iter().map(|c| (c, None)).collect();
+    if walls.is_empty() {
+        return Ok(out);
+    }
+    let needed: Vec<(u16, Pose, PathBuf)> = files.iter().filter(|(n, _, _)| walls.iter().any(|w| w.seen_by.contains(n))).cloned().collect();
+    for (k, ff) in fitted.into_iter().zip(measure_faces_with(&walls, &needed, opts, threads)?) {
+        let (c, fit) = &mut out[k];
         let r = &ff.result;
-        Some(Reading {
-            out_of_plumb_mm: r.out_of_plumb_mm?,
-            lean_mm_per_m: r.lean_mm_per_m?,
-            flat_rms_mm: r.flat_rms_mm?,
-            flat_p95_mm: r.flat_p95_mm,
-            straightedge_ok_pct: r.straightedge_ok_pct,
-            worst_strip_mm_per_m: r.worst_strip_mm_per_m,
-            over_m: r.plumb_over_m,
-            stations: c.stations.clone(),
-        })
-    });
-    Ok((c, fit))
+        c.fit = (|| {
+            Some(Reading {
+                out_of_plumb_mm: r.out_of_plumb_mm?,
+                lean_mm_per_m: r.lean_mm_per_m?,
+                flat_rms_mm: r.flat_rms_mm?,
+                flat_p95_mm: r.flat_p95_mm,
+                straightedge_ok_pct: r.straightedge_ok_pct,
+                worst_strip_mm_per_m: r.worst_strip_mm_per_m,
+                over_m: r.plumb_over_m,
+                stations: c.stations.clone(),
+            })
+        })();
+        *fit = Some(ff);
+    }
+    Ok(out)
+}
+
+/// What a target's last judgement stood on. When none of it has changed, a
+/// re-check after a registration can skip the target: `decide` would give it
+/// the same verdict and keep the same settling reading, because no new
+/// station saw the face and the ones that did haven't moved
+/// (`specs/laptop-offload.md`, part A).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Basis {
+    pub face: Face,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tolerance: Option<Tolerance>,
+    /// The stations that saw the face, with their poses then.
+    pub poses: Vec<(u16, Pose)>,
+}
+
+/// A station that moved less than this between registrations hasn't moved.
+pub const MOVED_M: f64 = 0.001;
+pub const TURNED_DEG: f64 = 0.001;
+
+impl Basis {
+    /// The basis of a judgement on `stations` (those that saw the face).
+    pub fn of(face: &Face, kind: &str, tolerance: Option<&Tolerance>, stations: &[u16], poses: &HashMap<u16, Pose>) -> Basis {
+        let mut p: Vec<(u16, Pose)> = stations.iter().filter_map(|n| poses.get(n).map(|pose| (*n, *pose))).collect();
+        p.sort_by_key(|(n, _)| *n);
+        Basis { face: *face, kind: kind.to_string(), tolerance: tolerance.cloned(), poses: p }
+    }
+
+    /// Why the target has to be judged again, or `None` when it can be
+    /// skipped. `stations` are those that see the face now.
+    pub fn changed(&self, face: &Face, kind: &str, tolerance: Option<&Tolerance>, stations: &[u16], poses: &HashMap<u16, Pose>) -> Option<String> {
+        if self.face != *face {
+            return Some("its face changed".into());
+        }
+        if self.kind != kind || self.tolerance.as_ref() != tolerance {
+            return Some("its question changed".into());
+        }
+        let list = |v: Vec<u16>| v.iter().map(u16::to_string).collect::<Vec<_>>().join(", ");
+        let then: Vec<u16> = self.poses.iter().map(|(n, _)| *n).collect();
+        let new: Vec<u16> = stations.iter().copied().filter(|n| !then.contains(n)).collect();
+        if !new.is_empty() {
+            return Some(format!("station {} saw it", list(new)));
+        }
+        let gone: Vec<u16> = then.iter().copied().filter(|n| !stations.contains(n)).collect();
+        if !gone.is_empty() {
+            return Some(format!("station {} no longer counts", list(gone)));
+        }
+        for (n, was) in &self.poses {
+            let Some(now) = poses.get(n) else { return Some(format!("station {n} has no place now")) };
+            let moved = (0..3).map(|k| (now.xyz_m[k] - was.xyz_m[k]).powi(2)).sum::<f64>().sqrt();
+            let turned = ((now.turn_deg - was.turn_deg + 180.0).rem_euclid(360.0) - 180.0).abs();
+            if moved > MOVED_M || turned > TURNED_DEG {
+                return Some(format!("station {n} moved"));
+            }
+        }
+        None
+    }
 }
 
 /// The evidence image for a verdict: the face's heat map, its title carrying
@@ -558,16 +638,21 @@ pub(crate) fn mark(r: &mut crate::analyze::WallResult, q: &Question) {
 pub struct Kept {
     pub question: Option<Question>,
     pub settling: Option<Reading>,
+    /// What the question was last judged on, for `--skip`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<Basis>,
 }
 
-const USAGE: &str = "usage: x9-bridge ask [--state STATE.json | --reference] [--png OUT.png] [--id ID] REGISTER_DIR x0,y0,x1,y1\n\
+const USAGE: &str = "usage: x9-bridge ask [--state STATE.json [--skip] | --reference] [--png OUT.png] [--id ID] REGISTER_DIR x0,y0,x1,y1\n\
   REGISTER_DIR is a `x9-bridge register` output (merged.bin, stations.json). Asks whether the face\n\
   x0,y0 to x1,y1 (project frame, m) is plumb, as the bridge does on site; --state carries the last\n\
   verdict and the settling reading from one count of stations to the next. --reference judges this\n\
-  registration alone (the gate and the fit, no settling) and prints the reading whenever it passes.";
+  registration alone (the gate and the fit, no settling) and prints the reading whenever it passes.\n\
+  --skip keeps the last verdict without fitting when no new station saw the face and none of the\n\
+  stations that did has moved, as the bridge's re-check after a registration does.";
 
 pub fn cli(args: &[String]) -> anyhow::Result<()> {
-    let (mut state, mut png, mut id, mut rest, mut reference) = (None, None, "face".to_string(), Vec::new(), false);
+    let (mut state, mut png, mut id, mut rest, mut reference, mut skip) = (None, None, "face".to_string(), Vec::new(), false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -575,6 +660,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
             "--png" => png = Some(it.next().context(USAGE)?.clone()),
             "--id" => id = it.next().context(USAGE)?.clone(),
             "--reference" => reference = true,
+            "--skip" => skip = true,
             "-h" | "--help" => {
                 eprintln!("{USAGE}");
                 return Ok(());
@@ -603,6 +689,18 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     };
     let coverage = face_coverage(&merged, &face, &scans);
     anyhow::ensure!(coverage["error"].is_null(), "{}", coverage["error"]);
+    let poses: HashMap<u16, Pose> = files.iter().map(|(n, p, _)| (*n, *p)).collect();
+    let mut now: Vec<u16> = coverage["stations"].as_array().map(|a| a.iter().filter_map(|s| s["station"].as_u64().map(|n| n as u16)).collect()).unwrap_or_default();
+    now.sort_unstable();
+    if let (true, false, Some(q), Some(b)) = (skip, reference, &kept.question, &kept.basis) {
+        if b.changed(&face, &q.kind, None, &now, &poses).is_none() {
+            let mut out = public(&id, q, None);
+            out["skipped"] = json!(true);
+            out["seconds"] = json!((t0.elapsed().as_secs_f64() * 10.0).round() / 10.0);
+            println!("{}", serde_json::to_string(&out)?);
+            return Ok(());
+        }
+    }
     let (c, fit) = look(&id, &face, &coverage, &files, &Opts::default())?;
     if reference {
         let q = judged(&gate(c.seen_share, c.length_m, c.fit.as_ref().map(|r| r.flat_rms_mm)), KINDS[0]);
@@ -624,24 +722,41 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
     out["unseen"] = coverage["unseen"].clone();
     println!("{}", serde_json::to_string(&out)?);
     if let Some(p) = &state {
-        std::fs::write(p, serde_json::to_vec_pretty(&Kept { question: Some(q), settling })?)?;
+        let basis = Some(Basis::of(&face, &q.kind, None, &c.stations, &poses));
+        std::fs::write(p, serde_json::to_vec_pretty(&Kept { question: Some(q), settling, basis })?)?;
     }
     Ok(())
 }
 
 // ------------------------------------------------------------- on the bridge ---
 
-/// Ask (`by` a caller) or re-check (`by` "bridge") one question target on the
-/// project's registration: its fixed face's coverage, a fit from the files of
-/// the trusted stations that saw it, the verdict recorded in the mission and
-/// logged. Returns what the caller may see.
-pub async fn on_bridge(st: &std::sync::Arc<AppState>, project_id: &str, target_id: &str, by: &str) -> Result<Value, ApiError> {
-    let t0 = std::time::Instant::now();
+/// What one look at a question target needs, gathered from the bridge's state.
+struct Prepared {
+    target_id: String,
+    key: (String, String),
+    face: Face,
+    name: String,
+    prev: Question,
+    settling: Option<Reading>,
+    tolerance: Option<Tolerance>,
+    reg: Option<crate::register::Registration>,
+    scans: HashMap<u16, String>,
+    coverage: Value,
+    walls: Vec<crate::register::Wall>,
+    /// The stations that see the face now, and every trusted station's pose.
+    stations: Vec<u16>,
+    poses: HashMap<u16, Pose>,
+}
+
+impl Prepared {
+    /// Whether a fit could pass the gate, so the stations' files are worth fetching.
+    fn could_fit(&self) -> bool {
+        self.coverage["seen_share"].as_f64().unwrap_or(0.0) >= FACE_COVERED && self.coverage["length_m"].as_f64().unwrap_or(0.0) >= MIN_LENGTH_M
+    }
+}
+
+async fn prepare(st: &std::sync::Arc<AppState>, project_id: &str, target_id: &str) -> Result<Prepared, ApiError> {
     let key = (project_id.to_string(), target_id.to_string());
-    // One look at a target at a time: an ask and the re-check after a station
-    // would otherwise each write over the other's verdict.
-    let lock = st.inner.lock().unwrap().asking.entry(key.clone()).or_default().clone();
-    let _one = lock.lock().await;
     let (face, name, prev, settling, reg, tolerance) = {
         let inner = st.inner.lock().unwrap();
         let m = inner.missions.get(project_id).ok_or_else(|| ApiError::not_found("mission"))?;
@@ -657,21 +772,30 @@ pub async fn on_bridge(st: &std::sync::Arc<AppState>, project_id: &str, target_i
     if let Some(e) = coverage["error"].as_str() {
         return Err(ApiError::invalid(format!("target {target_id}: {e}")));
     }
-    // Only the files of the stations that saw it, and only if a fit could pass.
-    let saw: Vec<u16> = coverage["stations"].as_array().map(|a| a.iter().filter_map(|s| s["station"].as_u64().map(|n| n as u16)).collect()).unwrap_or_default();
-    let could = coverage["seen_share"].as_f64().unwrap_or(0.0) >= FACE_COVERED && coverage["length_m"].as_f64().unwrap_or(0.0) >= MIN_LENGTH_M;
+    let mut stations: Vec<u16> = coverage["stations"].as_array().map(|a| a.iter().filter_map(|s| s["station"].as_u64().map(|n| n as u16)).collect()).unwrap_or_default();
+    stations.sort_unstable();
+    let poses: HashMap<u16, Pose> = reg.iter().flat_map(|r| r.stations.iter()).filter(|s| scans.contains_key(&s.station)).filter_map(|s| s.pose.map(|p| (s.station, p))).collect();
+    Ok(Prepared { target_id: target_id.to_string(), key, face, name, prev, settling, tolerance, reg, scans, coverage, walls: geo.walls.clone(), stations, poses })
+}
+
+/// The files of the stations that saw any of these faces, in the
+/// registration's order, fetched once each.
+async fn files_for(st: &std::sync::Arc<AppState>, items: &[&Prepared]) -> Result<Vec<(u16, Pose, PathBuf)>, ApiError> {
     let mut files = Vec::new();
-    if could {
-        for s in reg.iter().flat_map(|r| r.stations.iter()).filter(|s| saw.contains(&s.station) && scans.contains_key(&s.station)) {
-            let Some(pose) = s.pose else { continue };
-            files.push((s.station, pose, crate::files::scan_file(st, &s.scan_id, crate::files::FileKind::Tzf).await?));
-        }
+    let Some(reg) = items.iter().find_map(|p| p.reg.as_ref()) else { return Ok(files) };
+    for s in &reg.stations {
+        let wanted = items.iter().any(|p| p.could_fit() && p.stations.contains(&s.station) && p.scans.contains_key(&s.station));
+        let Some(pose) = s.pose.filter(|_| wanted) else { continue };
+        files.push((s.station, pose, crate::files::scan_file(st, &s.scan_id, crate::files::FileKind::Tzf).await?));
     }
-    let (tid, cov) = (target_id.to_string(), coverage.clone());
-    let (check, fit) = tokio::task::spawn_blocking(move || look(&tid, &face, &cov, &files, &Opts::default()))
-        .await
-        .map_err(|e| ApiError::cache(format!("asking: {e}")))?
-        .map_err(|e| ApiError::cache(format!("asking: {e:#}")))?;
+    Ok(files)
+}
+
+/// Record a look: the verdict in the mission, the settling reading, the
+/// evidence, the basis, and the log line. Returns what the caller may see.
+async fn finish(st: &std::sync::Arc<AppState>, project_id: &str, p: Prepared, check: Check, fit: Option<FaceFit>, by: &str, t0: std::time::Instant) -> Result<Value, ApiError> {
+    let Prepared { target_id, key, face, name, prev, settling, tolerance, reg, scans, coverage, walls, poses, .. } = p;
+    let target_id = target_id.as_str();
     let (mut q, keep) = decide(Some(&prev), settling.as_ref(), &check);
     q.asked = prev.asked || by != "bridge";
     let png = fit.filter(|_| shows_evidence(q.verdict)).map(|mut f| evidence(&mut f, &q, &Opts::default()));
@@ -690,11 +814,12 @@ pub async fn on_bridge(st: &std::sync::Arc<AppState>, project_id: &str, target_i
             Some(p) => inner.evidence.insert(key.clone(), p.clone()),
             None => inner.evidence.remove(&key),
         };
+        inner.basis.insert(key.clone(), Basis::of(&face, &q.kind, tolerance.as_ref(), &check.stations, &poses));
         inner.missions.get_mut(project_id).map(|m| (m.record_question(target_id, q.clone(), &scans), m.clone()))
     };
     let secs = t0.elapsed().as_secs_f64();
     let mut out = public(target_id, &q, tolerance.as_ref());
-    out["face"] = face_said(&face, check.length_m, &geo.walls);
+    out["face"] = face_said(&face, check.length_m, &walls);
     out["seconds"] = json!((secs * 10.0).round() / 10.0);
     if q.verdict == Some(Verdict::NotYet) && q.reason != "settling" {
         out["unseen"] = unseen_with_subjects(st, reg.as_ref(), &coverage).await;
@@ -718,6 +843,28 @@ pub async fn on_bridge(st: &std::sync::Arc<AppState>, project_id: &str, target_i
         }
     }
     Ok(out)
+}
+
+/// Ask (`by` a caller) or re-check (`by` "bridge") one question target on the
+/// project's registration: its fixed face's coverage, a fit from the files of
+/// the trusted stations that saw it, the verdict recorded in the mission and
+/// logged. Returns what the caller may see.
+pub async fn on_bridge(st: &std::sync::Arc<AppState>, project_id: &str, target_id: &str, by: &str) -> Result<Value, ApiError> {
+    let t0 = std::time::Instant::now();
+    // One look at a target at a time: an ask and the re-check after a station
+    // would otherwise each write over the other's verdict.
+    let lock = st.inner.lock().unwrap().asking.entry((project_id.to_string(), target_id.to_string())).or_default().clone();
+    let _one = lock.lock().await;
+    let p = prepare(st, project_id, target_id).await?;
+    let files = files_for(st, &[&p]).await?;
+    let one = vec![(p.target_id.clone(), p.face, p.coverage.clone())];
+    let (check, fit) = tokio::task::spawn_blocking(move || look_many(&one, &files, &Opts::default(), 1))
+        .await
+        .map_err(|e| ApiError::cache(format!("asking: {e}")))?
+        .map_err(|e| ApiError::cache(format!("asking: {e:#}")))?
+        .pop()
+        .expect("one look");
+    finish(st, project_id, p, check, fit, by, t0).await
 }
 
 /// The unseen stretches, each with the preview columns that frame it from the
@@ -761,21 +908,98 @@ fn column_azimuths(tzf: &std::path::Path) -> Option<Vec<f64>> {
     Some(az)
 }
 
+/// How many faces a re-check fits at once (`BRIDGE_CHECK_PARALLEL`, default 2).
+/// Decoding a station needs about 0.9 GB on the Pi, so the files are decoded
+/// one at a time and only the fits run side by side.
+fn check_parallel() -> usize {
+    std::env::var("BRIDGE_CHECK_PARALLEL").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| *n >= 1).unwrap_or(2)
+}
+
 /// After a registration: every question target judged again, whether or not
-/// it was asked. Returns how long it took (s).
+/// it was asked, except those whose basis hasn't changed (no new station saw
+/// the face and its stations didn't move): those keep their verdict and
+/// settling reading, as `decide` would. The rest are fitted together, each
+/// station's file decoded once. Returns how long it took (s).
 pub async fn recheck(st: &std::sync::Arc<AppState>, project_id: &str) -> f64 {
     let t0 = std::time::Instant::now();
-    let ids: Vec<String> = st.inner.lock().unwrap().missions.get(project_id).map(|m| m.targets.iter().filter(|t| t.question.is_some() && t.face.is_some()).map(|t| t.target_id.clone()).collect()).unwrap_or_default();
+    let mut ids: Vec<String> = st.inner.lock().unwrap().missions.get(project_id).map(|m| m.targets.iter().filter(|t| t.question.is_some() && t.face.is_some()).map(|t| t.target_id.clone()).collect()).unwrap_or_default();
     if ids.is_empty() {
         return 0.0;
     }
+    ids.sort();
+    // Hold every target's lock, in one order, so an ask waits for the re-check.
+    let locks: Vec<_> = ids.iter().map(|id| st.inner.lock().unwrap().asking.entry((project_id.to_string(), id.clone())).or_default().clone()).collect();
+    let mut held = Vec::new();
+    for l in &locks {
+        held.push(l.lock().await);
+    }
+    let fail = |id: &str, e: &ApiError| st.log("check", format!("Could not re-check target {id}: {}", e.detail.as_deref().unwrap_or(&e.title)), "bridge", Some(project_id), &[("target_id", id)]);
+    let (mut judge, mut skipped, mut why) = (Vec::new(), 0usize, std::collections::BTreeMap::<String, usize>::new());
     for id in &ids {
-        if let Err(e) = on_bridge(st, project_id, id, "bridge").await {
-            st.log("check", format!("Could not re-check target {id}: {}", e.detail.as_deref().unwrap_or(&e.title)), "bridge", Some(project_id), &[("target_id", id)]);
+        let p = match prepare(st, project_id, id).await {
+            Ok(p) => p,
+            Err(e) => {
+                fail(id, &e);
+                continue;
+            }
+        };
+        let basis = st.inner.lock().unwrap().basis.get(&p.key).cloned();
+        match basis.map(|b| b.changed(&p.face, &p.prev.kind, p.tolerance.as_ref(), &p.stations, &p.poses)) {
+            Some(None) => skipped += 1,
+            reason => {
+                let reason = reason.flatten().unwrap_or_else(|| "first look since the bridge started".into());
+                // Station numbers vary; group the reasons by kind.
+                let kind = if reason.contains(" saw it") { "a new station saw it".to_string() } else if reason.contains(" moved") { "a station moved".to_string() } else { reason };
+                *why.entry(kind).or_default() += 1;
+                judge.push(p);
+            }
         }
     }
+    let judged = judge.len();
+    if !judge.is_empty() {
+        let refs: Vec<&Prepared> = judge.iter().collect();
+        let looks = match files_for(st, &refs).await {
+            Ok(files) => {
+                let targets: Vec<(String, Face, Value)> = judge.iter().map(|p| (p.target_id.clone(), p.face, p.coverage.clone())).collect();
+                let threads = check_parallel();
+                tokio::task::spawn_blocking(move || look_many(&targets, &files, &Opts::default(), threads)).await.map_err(|e| anyhow::anyhow!("{e}")).and_then(|r| r)
+            }
+            Err(e) => Err(anyhow::anyhow!("{}", e.detail.as_deref().unwrap_or(&e.title))),
+        };
+        match looks {
+            Ok(looks) => {
+                for (p, (check, fit)) in judge.into_iter().zip(looks) {
+                    let id = p.target_id.clone();
+                    if let Err(e) = finish(st, project_id, p, check, fit, "bridge", t0).await {
+                        fail(&id, &e);
+                    }
+                }
+            }
+            Err(e) => {
+                // One bad file shouldn't cost every target its check: judge them one by one.
+                st.log("check", format!("Re-check of {judged} targets together failed ({e:#}); checking them one at a time"), "bridge", Some(project_id), &[]);
+                drop(held);
+                for p in judge {
+                    if let Err(e) = on_bridge(st, project_id, &p.target_id, "bridge").await {
+                        fail(&p.target_id, &e);
+                    }
+                }
+                held = Vec::new();
+            }
+        }
+    }
+    drop(held);
     let secs = t0.elapsed().as_secs_f64();
-    st.log("note", format!("Re-checked {} question{} after the registration in {secs:.1} s", ids.len(), if ids.len() == 1 { "" } else { "s" }), "bridge", Some(project_id), &[]);
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let reasons = why.iter().map(|(k, n)| format!("{n} because {k}")).collect::<Vec<_>>().join(", ");
+    st.log(
+        "note",
+        format!(
+            "Re-checked {} question{} after the registration in {secs:.1} s: {judged} judged{}, {skipped} kept as they were (no new station saw them and theirs didn't move)",
+            ids.len(), plural(ids.len()), if reasons.is_empty() { String::new() } else { format!(" ({reasons})") }
+        ),
+        "bridge", Some(project_id), &[],
+    );
     secs
 }
 
@@ -1350,6 +1574,174 @@ mod tests {
         assert!(log.iter().any(|t| t.starts_with("Re-checked 3 questions after the registration")), "{log:#?}");
         assert_eq!(recheck(st, "elsewhere").await, 0.0);
         std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    // ------------------------- re-checking only what can change (part A) ---
+
+    fn moved(x: f64, turn: f64) -> Pose {
+        Pose { turn_deg: turn, xyz_m: [x, 0.0, 0.0] }
+    }
+
+    fn at(poses: &[(u16, Pose)]) -> HashMap<u16, Pose> {
+        poses.iter().copied().collect()
+    }
+
+    fn basis() -> Basis {
+        Basis::of(&east(), "plumb", None, &[1, 2], &at(&[(1, identity()), (2, moved(3.0, 90.0)), (3, moved(9.0, 0.0))]))
+    }
+
+    #[test]
+    fn a_target_nothing_new_saw_is_skipped() {
+        let b = basis();
+        assert_eq!(b.poses.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec![1, 2], "only the stations that saw it");
+        // Station 3 was added but doesn't see the face; 1 and 2 moved less than the limits.
+        let now = at(&[(1, moved(0.0009, 0.0)), (2, moved(3.0, 90.0009)), (3, moved(9.0, 0.0)), (4, moved(20.0, 0.0))]);
+        assert_eq!(b.changed(&east(), "plumb", None, &[1, 2], &now), None);
+    }
+
+    #[test]
+    fn a_new_station_that_saw_the_face_means_judging_again() {
+        let now = at(&[(1, identity()), (2, moved(3.0, 90.0)), (3, moved(9.0, 0.0))]);
+        assert_eq!(basis().changed(&east(), "plumb", None, &[1, 2, 3], &now).as_deref(), Some("station 3 saw it"));
+    }
+
+    #[test]
+    fn a_station_that_no_longer_counts_means_judging_again() {
+        let now = at(&[(1, identity()), (3, moved(9.0, 0.0))]);
+        assert_eq!(basis().changed(&east(), "plumb", None, &[1], &now).as_deref(), Some("station 2 no longer counts"));
+        // Still in the list but without a pose (the audit dropped it): judged again too.
+        assert_eq!(basis().changed(&east(), "plumb", None, &[1, 2], &at(&[(1, identity())])).as_deref(), Some("station 2 has no place now"));
+    }
+
+    #[test]
+    fn a_station_that_moved_means_judging_again() {
+        for now in [moved(0.0011, 0.0), moved(0.0, 0.0011), moved(0.0, 359.9989)] {
+            let poses = at(&[(1, now), (2, moved(3.0, 90.0))]);
+            assert_eq!(basis().changed(&east(), "plumb", None, &[1, 2], &poses).as_deref(), Some("station 1 moved"), "{now:?}");
+        }
+    }
+
+    #[test]
+    fn a_changed_face_question_or_tolerance_means_judging_again() {
+        let now = at(&[(1, identity()), (2, moved(3.0, 90.0))]);
+        let b = basis();
+        assert_eq!(b.changed(&Face { from: [5.0, -4.0], to: [5.0, 7.0] }, "plumb", None, &[1, 2], &now).as_deref(), Some("its face changed"));
+        assert_eq!(b.changed(&east(), "flatness", None, &[1, 2], &now).as_deref(), Some("its question changed"));
+        let tol = Tolerance { words: "a quarter inch in ten feet".into(), steps: vec![], mm_per_m: Some(2.0), max_mm: None };
+        assert_eq!(b.changed(&east(), "plumb", Some(&tol), &[1, 2], &now).as_deref(), Some("its question changed"));
+        let with = Basis::of(&east(), "plumb", Some(&tol), &[1, 2], &now);
+        assert_eq!(with.changed(&east(), "plumb", Some(&tol), &[1, 2], &now), None);
+    }
+
+    #[test]
+    fn keeping_a_verdict_is_what_decide_gives_when_nothing_new_saw_the_face() {
+        // Every state a question can be in after a look, then the same look again
+        // (the same stations, so the same coverage and the same fit).
+        let looks = [check(0.9, 8.0, 8.0, 5.0, &[1]), check(0.79, 8.0, 8.0, 5.0, &[1]), check(0.9, 3.0, 8.0, 5.0, &[1]), check(0.9, 8.0, 22.0, 5.0, &[1])];
+        for c in &looks {
+            let (q, keep) = decide(None, None, c);
+            let (again, keep_again) = decide(Some(&q), keep.as_ref(), c);
+            assert_eq!(serde_json::to_vec(&again).unwrap(), serde_json::to_vec(&q).unwrap(), "{q:?}");
+            assert_eq!(serde_json::to_vec(&keep_again).unwrap(), serde_json::to_vec(&keep).unwrap());
+        }
+        // An answer, and a reading still settling, as the bridge holds them.
+        let (settling, keep) = decide(None, None, &check(0.9, 8.0, 8.0, 5.0, &[1]));
+        let (answer, none) = decide(Some(&settling), keep.as_ref(), &check(0.9, 8.0, 8.0, 5.5, &[1, 2]));
+        assert_eq!((answer.verdict, none), (Some(Verdict::Answer), None));
+        let (kept, k) = decide(Some(&answer), None, &check(0.9, 8.0, 8.0, 7.0, &[1, 2]));
+        assert_eq!(serde_json::to_vec(&kept).unwrap(), serde_json::to_vec(&answer).unwrap(), "the answer stands, whatever the fit says now");
+        assert!(k.is_none());
+    }
+
+    #[test]
+    fn faces_fitted_together_get_the_fits_they_get_alone() {
+        let dir = scratch("x9-ask-many");
+        let station = dir.join("station_01.tzf");
+        std::fs::write(&station, yard_dome()).unwrap();
+        let files = vec![(1u16, identity(), station)];
+        let coverage = |len: f64| json!({"seen_share": 0.9, "length_m": len, "height_m": [-1.4, 2.9], "stations": [{"station": 1}]});
+        let west = Face { from: [-6.0, -4.0], to: [-6.0, 6.0] };
+        let north = Face { from: [-6.0, 6.0], to: [5.0, 6.0] };
+        let targets = vec![("east".to_string(), east(), coverage(10.0)), ("west".to_string(), west, coverage(10.0)),
+                           ("north".to_string(), north, coverage(11.0)), ("unseen".to_string(), east(), json!({"seen_share": 0.2, "length_m": 10.0, "stations": []}))];
+        let together = look_many(&targets, &files, &Opts::default(), 2).unwrap();
+        assert_eq!(together.len(), 4);
+        for ((id, f, cov), (c, fit)) in targets.iter().zip(&together) {
+            let (alone, alone_fit) = look(id, f, cov, &files, &Opts::default()).unwrap();
+            assert_eq!(serde_json::to_value(&c.fit).unwrap(), serde_json::to_value(&alone.fit).unwrap(), "{id}");
+            assert_eq!((c.seen_share, c.length_m, &c.stations), (alone.seen_share, alone.length_m, &alone.stations), "{id}");
+            assert_eq!(fit.is_some(), alone_fit.is_some(), "{id}");
+        }
+        assert!(together[0].0.fit.is_some() && together[3].0.fit.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_recheck_skips_what_nothing_new_saw_and_says_why_it_judged_the_rest() {
+        let (b, fx) = yard_bridge().await;
+        let st = &b.st;
+        let key = |id: &str| (PROJECT.to_string(), id.to_string());
+        let snapshot = || {
+            let inner = st.inner.lock().unwrap();
+            (serde_json::to_vec(&inner.missions[PROJECT].targets).unwrap(), serde_json::to_vec(&inner.settling.get(&key("east"))).unwrap())
+        };
+        let last_line = || st.inner.lock().unwrap().log.iter().rev().find(|e| e.text.starts_with("Re-checked ") && e.text.contains("after the registration")).map(|e| e.text.clone()).unwrap();
+        // The first re-check since the bridge started judges everything it can.
+        recheck(st, PROJECT).await;
+        assert!(last_line().contains(": 2 judged (2 because first look since the bridge started), 0 kept"), "{}", last_line());
+        assert!(st.inner.lock().unwrap().basis.contains_key(&key("east")));
+        // Nothing new: both are kept exactly as they were, verdict and settling reading.
+        let before = snapshot();
+        recheck(st, PROJECT).await;
+        assert!(last_line().contains(": 0 judged, 2 kept as they were"), "{}", last_line());
+        assert_eq!(snapshot(), before);
+        // Station 1 moves 2 mm in a new registration: both are judged again.
+        st.inner.lock().unwrap().registrations.get_mut(PROJECT).unwrap().stations[0].pose = Some(moved(0.002, 0.0));
+        recheck(st, PROJECT).await;
+        assert!(last_line().contains(": 2 judged (2 because a station moved), 0 kept"), "{}", last_line());
+        // A new tolerance on one: only that one.
+        st.inner.lock().unwrap().missions.get_mut(PROJECT).unwrap().targets[0].tolerance = None;
+        recheck(st, PROJECT).await;
+        assert!(last_line().contains(": 1 judged (1 because its question changed), 1 kept"), "{}", last_line());
+        // An ask always looks, and leaves a basis the re-check can keep.
+        assert!(on_bridge(st, PROJECT, "east", "agent").await.unwrap()["seconds"].is_number());
+        recheck(st, PROJECT).await;
+        assert!(last_line().contains(": 0 judged, 2 kept"), "{}", last_line());
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    #[test]
+    fn the_command_line_skips_when_asked_and_nothing_changed() {
+        let dir = scratch("x9-ask-skip");
+        let station = dir.join("station_01.tzf");
+        std::fs::write(&station, yard_dome()).unwrap();
+        std::fs::write(dir.join("merged.bin"), east_merged().to_bytes()).unwrap();
+        std::fs::write(dir.join("stations.json"), serde_json::to_vec(&json!([{"station": 1, "trusted": true, "pose": identity(), "file": station}])).unwrap()).unwrap();
+        let p = |n: &str| dir.join(n).to_string_lossy().into_owned();
+        let (reg, state) = (p(""), p("state.json"));
+        let ask = |skip: bool| {
+            let mut a = strs(&["--state", state.as_str(), "--id", "east"]);
+            if skip {
+                a.push("--skip".into());
+            }
+            a.extend(strs(&[reg.as_str(), "5,-4,5,6"]));
+            cli(&a).unwrap();
+            std::fs::read(&state).unwrap()
+        };
+        let first = ask(true);
+        let k: Kept = serde_json::from_slice(&first).unwrap();
+        assert_eq!(k.basis.as_ref().map(|b| b.poses.len()), Some(1), "a look leaves its basis");
+        assert_eq!(ask(true), first, "nothing new saw the face: kept as it was, checked_at included");
+        // Looking again finds the same: the same verdict, kept the same way.
+        let again: Kept = serde_json::from_slice(&ask(false)).unwrap();
+        assert_eq!(serde_json::to_value(&again.question).unwrap()["verdict"], "not_yet");
+        // With no basis kept (a state from before --skip), it looks, and keeps one.
+        let mut k: Value = serde_json::from_slice(&first).unwrap();
+        k.as_object_mut().unwrap().remove("basis");
+        std::fs::write(&state, serde_json::to_vec(&k).unwrap()).unwrap();
+        let looked: Kept = serde_json::from_slice(&ask(true)).unwrap();
+        assert!(looked.basis.is_some());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
