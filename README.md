@@ -255,7 +255,11 @@ field kit from a fresh Raspberry Pi, see [ops/README.md](ops/README.md).
 
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg)](LICENSE)
 
-[GNU Affero General Public License v3.0 or later](LICENSE)
-(SPDX `AGPL-3.0-or-later`). Copyright (C) 2026 North Idaho Labs, LLC.
+This project is open source under the [GNU Affero General Public License v3.0 or later](LICENSE) (SPDX `AGPL-3.0-or-later`).
+Copyright (C) 2026 North Idaho Labs, LLC.
 Releases published before this change remain under MIT.
-"Trimble" and "X9" are trademarks of Trimble Inc.; the non-affiliation note is in [NOTICE](NOTICE).
+
+A commercial license is available for companies that want to embed or host it without AGPL obligations.
+Contact contact@northidaholabs.com.
+
+"Trimble" and "X9" are trademarks of Trimble Inc. The note that this project is not affiliated with Trimble is in [NOTICE](NOTICE).
