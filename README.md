@@ -261,9 +261,8 @@ field kit from a fresh Raspberry Pi, see [ops/README.md](ops/README.md).
 
 This project is open source under the [GNU Affero General Public License v3.0 or later](LICENSE) (SPDX `AGPL-3.0-or-later`).
 Copyright (C) 2026 North Idaho Labs, LLC.
-Releases published before this change remain under MIT.
+Releases published before this change keep the license they were published under.
 
-A commercial license is available for companies that want to embed or host it without AGPL obligations.
-Contact contact@northidaholabs.com.
+A commercial license is available for companies that want to embed or host it without AGPL obligations. See [northidaholabs.com/license](https://northidaholabs.com/license/).
 
 "Trimble" and "X9" are trademarks of Trimble Inc. The note that this project is not affiliated with Trimble is in [NOTICE](NOTICE).
