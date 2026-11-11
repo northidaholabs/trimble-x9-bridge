@@ -210,7 +210,7 @@ One merged cloud is left to the cloud copy, where memory isn't the Pi's or
 the laptop's. Still open: who confirms the cloud copy arrived, once there is
 one.
 
-**What it opens up (a follow-on, its own spec):** with every station's file
+**What it opens up (a follow-on, its own spec, [`whole-cloud-questions.md`](whole-cloud-questions.md)):** with every station's file
 and the merged cloud on the laptop, the agent can ask about the whole cloud,
 not only the walls a mission fixed beforehand: a height, a distance, a
 section, whether a floor is level. The laptop measures where the data and
