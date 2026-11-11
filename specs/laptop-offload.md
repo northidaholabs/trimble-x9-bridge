@@ -1,6 +1,6 @@
 # Spec: Question checks on the laptop, and only the checks that changed
 
-Owner: Jim · Date: 2026-10-28 · Status: draft, not approved
+Owner: Jim · Date: 2026-10-28, revised 2026-11-11 · Status: parts A and C approved and built (2026-11-11); B and D draft
 
 ## Problem
 
@@ -48,8 +48,9 @@ station 15. Nothing in the log warns before it does.
 
 ## Ship
 
-Three parts. Part A helps every visit, laptop or not. Part B is the
-laptop. Part C keeps the Pi's disk from filling.
+Four parts. Part A helps every visit, laptop or not. Part B is the
+laptop. Part C keeps the Pi's disk from filling. Part D makes the laptop
+the place the data lands.
 
 ### A. Re-check only what can change (the Pi alone)
 
@@ -68,10 +69,18 @@ which is what `decide` would produce for a station that didn't see the face.
 The field log says how many targets were re-checked and how many skipped,
 and why.
 
-Then the targets that are left are judged at up to two at once on the Pi
-(`BRIDGE_CHECK_PARALLEL`, default 2). Decoding a scan briefly needs about
-0.9 GB, so the cap is memory, not cores. A target's stations are decoded
-once per re-check, not once per target.
+The targets that are left are fitted together: each station's file is
+decoded once per re-check, not once per target, and only if one of the faces
+left needs it. Decoding a scan briefly needs about 0.9 GB, so files are
+decoded one at a time; the fits then run up to two at once
+(`BRIDGE_CHECK_PARALLEL`, default 2). A face's fit takes points only from its
+own stations, so fitting faces together gives each the fit it gets alone.
+
+`x9-bridge ask --skip` applies the same rule from one count to the next, so
+`tests/replay_answers.py --part-a` can show criterion 2 on the recordings.
+
+Built 2026-11-11: the basis of each judgement is kept in memory, so after a
+restart every target is judged once more before skipping starts.
 
 ### B. Checks on the laptop worker
 
@@ -124,6 +133,40 @@ a laptop worker holds. It never drops a file a running job is reading. The
 scanner keeps every scan, so a dropped file is fetched again if it is
 needed. When the cache can't get under budget, the field log says so once
 and suggests connecting the laptop.
+
+Built 2026-11-11, the first tier: other projects' files, oldest first, never
+one of a project with a job running or a registration in progress, and none
+of no known project while any job runs. The second tier, this project's
+files the laptop holds, comes with part D.
+
+### D. The laptop is where the data lands
+
+The scan data goes to the laptop anyway, so the finished point cloud can be
+saved from there to its permanent destination (Jim, 2026-11-11). So:
+
+- The worker keeps the full scan file of every station it registers, as
+  part B already says, and tells the bridge which it holds.
+- The Pi's cache is staging: once the laptop holds a station's file and the
+  station's 5 cm cloud is prepared, the Pi may drop its copy (part C's
+  second tier).
+- At the end of a job, the registered point cloud is exported on the laptop
+  and saved to its permanent destination: for now a folder on the laptop,
+  one per project. Later it moves to the cloud; the folder is where that
+  upload will start from.
+
+Open: the format (LAS, LAZ, COPC, E57). COPC is the likely one: the bridge
+already exports it, and it reads well from the cloud. Also open: who
+confirms the cloud copy arrived, once there is one.
+
+**What it opens up (a follow-on, its own spec):** with every station's file
+and the merged cloud on the laptop, the agent can ask about the whole cloud,
+not only the walls a mission fixed beforehand: a height, a distance, a
+section, whether a floor is level. The laptop measures where the data and
+the cores are; COPC's index lets a question read only its region at the
+detail it needs, on site now and from the cloud copy later. The rules carry
+over: the bridge records and judges each answer with its evidence, every
+kind of question gets its own gate (no figure until the data carries one),
+and nothing is claimed in public until it has been shown.
 
 ## Acceptance criteria
 
@@ -206,3 +249,6 @@ checks on those visits, Part B is reviewed for removal.
 | Is criterion 8 of `on-site-answers.md` for the Pi alone or the kit? | The kit, with the laptop. | Jim, 2026-10-28 |
 | Which laptops go to site? | Apple Silicon and Intel Macs; binaries are built as needed. | Jim, 2026-10-28 |
 | An ask while a registration runs: Pi now, or wait? | Wait, and check on the new registration (Part B). | Spec, 2026-10-28 |
+| What first? | Parts A and C, which help every visit with or without the laptop. | Jim, 2026-11-11 |
+| Where does the scan data end up? | On the laptop, and from there the point cloud goes to its permanent destination (part D). | Jim, 2026-11-11 |
+| Where is the permanent destination? | A folder on the laptop for now; the cloud later. | Jim, 2026-11-11 |
