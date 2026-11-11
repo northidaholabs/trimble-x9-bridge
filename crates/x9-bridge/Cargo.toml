@@ -23,6 +23,7 @@ ab_glyph = "0.2"
 rustfft = "6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 copc-rs = "0.5"
+libc = "0.2"  # statvfs: free space on the data disk, for the scan cache budget
 las = "=0.9.5"  # copc-rs 0.5 needs the laz 0.9 that las 0.9.5 and earlier use
 
 [dev-dependencies]

@@ -2,7 +2,10 @@
 """Criteria 6 and 7 of specs/on-site-answers.md: replay recorded surveys as
 they arrive, ask each target's face at every count, and score the answers.
 
-    replay_answers.py [--bin target/release/x9-bridge] [--work /tmp/answers] [held-out] [admin]
+    replay_answers.py [--bin target/release/x9-bridge] [--work /tmp/answers] [--part-a] [held-out] [admin]
+
+With --part-a each target is also asked with `ask --skip` and every count is
+compared with asking afresh (specs/laptop-offload.md criterion 2).
 
 Targets are set as on site: at each set count, every building wall of 4 m or
 more in that registration gets one, unless an existing target already covers
@@ -79,7 +82,7 @@ def covers(face, wall):
     return near > (steps + 1) / 2
 
 
-def replay(binary, name, work):
+def replay(binary, name, work, part_a=False):
     src, set_at, final, floor = SURVEYS[name]
     work = work / name
     work.mkdir(parents=True, exist_ok=True)
@@ -100,21 +103,47 @@ def replay(binary, name, work):
 
     def ask_all(t):
         tid, face, n0, _ = t
-        state = work / f"{tid}.state.json"
+        state, kept = work / f"{tid}.state.json", work / f"{tid}.skip.state.json"
         state.unlink(missing_ok=True)
-        out = []
+        kept.unlink(missing_ok=True)
+        out, skipping = [], []
         for n in range(n0, final + 1):
             f = ",".join(str(v) for v in (*face[0], *face[1]))
             v = json.loads(run([binary, "ask", "--state", state, "--id", tid, regs[n], f]))
             v["count"] = n
             out.append(v)
+            if part_a:
+                w = json.loads(run([binary, "ask", "--state", kept, "--skip", "--id", tid, regs[n], f]))
+                w["count"] = n
+                skipping.append(w)
         ref = json.loads(run([binary, "ask", "--reference", "--id", tid, regs[final], f]))
-        return tid, (out, ref)
+        return tid, (out, ref, skipping)
 
-    with ThreadPoolExecutor(8) as ex:
+    # Each ask decodes station files (about 0.9 GB each): X9_REPLAY_JOBS limits how many run at once.
+    with ThreadPoolExecutor(int(os.environ.get("X9_REPLAY_JOBS", "8"))) as ex:
         both = dict(ex.map(ask_all, targets))
     asked = {k: v[0] for k, v in both.items()}
     refs = {k: v[1] for k, v in both.items()}
+    part_a_ok = True
+    if part_a:
+        # laptop-offload.md criterion 2: with Part A on, the same verdict at every
+        # count, and the same plumb to 0.1 mm, as judging every face every time.
+        looks = skipped = 0
+        differ = []
+        for tid in asked:
+            for plain, skip in zip(asked[tid], both[tid][2]):
+                looks += 1
+                skipped += bool(skip.get("skipped"))
+                a = (plain.get("answer") or {}).get("out_of_plumb_mm")
+                b = (skip.get("answer") or {}).get("out_of_plumb_mm")
+                same = plain["verdict"] == skip["verdict"] and plain.get("reason") == skip.get("reason") \
+                    and (a is None) == (b is None) and (a is None or abs(a - b) <= 0.1)
+                if not same:
+                    differ.append(f"  {tid} at {plain['count']}: every time {plain['verdict']} {a}, with part A {skip['verdict']} {b}")
+        print("\n".join(differ))
+        part_a_ok = not differ
+        print(f"{name}: part A (laptop-offload criterion 2): {looks} looks, {skipped} fits skipped, {len(differ)} differ: "
+              + ("PASS" if part_a_ok else "FAIL"))
     (work / "asked.json").write_text(json.dumps({"asked": asked, "reference": refs}, indent=1))
 
     scored_faces, misses, scored = set(), [], 0
@@ -149,7 +178,7 @@ def replay(binary, name, work):
     shown = len(scored_faces) >= floor
     print(f"{name}: {scored} scored answers on {len(scored_faces)} faces (floor {floor}), {len(misses)} misses: "
           + ("PASS" if ok else "floor not met: criterion 6 not shown" if not shown else "FAIL"))
-    return ok, shown, regs
+    return ok and part_a_ok, shown, regs
 
 
 def criterion7(binary, work, regs):
@@ -187,12 +216,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", default=str(Path(__file__).resolve().parents[3] / "target/release/x9-bridge"))
     ap.add_argument("--work", default="/tmp/answers")
+    ap.add_argument("--part-a", action="store_true",
+                    help="also replay with `ask --skip` and compare (laptop-offload.md criterion 2)")
     ap.add_argument("surveys", nargs="*", default=["held-out", "admin"])
     a = ap.parse_args()
     work = Path(a.work)
     results = {}
     for s in a.surveys:
-        results[s] = replay(a.bin, s, work)
+        results[s] = replay(a.bin, s, work, a.part_a)
     c7 = criterion7(a.bin, work, results["admin"][2]) if "admin" in results else None
     shown = all(r[1] for r in results.values())
     passed = all(r[0] for r in results.values())

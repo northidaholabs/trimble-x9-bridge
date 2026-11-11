@@ -92,6 +92,126 @@ impl Drop for PartFile {
     }
 }
 
+const MB: u64 = 1 << 20;
+
+/// The scan cache's budget in bytes (`specs/laptop-offload.md`, part C):
+/// `BRIDGE_CACHE_MB`, or else what leaves 1 GB free on the data disk when
+/// first asked (the cache's own files included), at most 4 GB.
+fn budget(st: &AppState) -> u64 {
+    if let Some(mb) = std::env::var("BRIDGE_CACHE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        return mb * MB;
+    }
+    static DEFAULT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *DEFAULT.get_or_init(|| {
+        let held: u64 = cached(&st.data_dir).iter().map(|f| f.bytes).sum();
+        free_bytes(&st.data_dir).map_or(4096 * MB, |free| (free + held).saturating_sub(1024 * MB)).min(4096 * MB)
+    })
+}
+
+#[cfg(unix)]
+fn free_bytes(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid C string and `s` a zeroed statvfs the call fills in.
+    (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_: &Path) -> Option<u64> {
+    None
+}
+
+/// A file in the scan cache.
+#[derive(Debug, Clone)]
+struct Cached {
+    path: PathBuf,
+    scan_id: String,
+    bytes: u64,
+    modified: std::time::SystemTime,
+}
+
+/// The cache's files, partial downloads left out.
+fn cached(data_dir: &Path) -> Vec<Cached> {
+    let Ok(dir) = std::fs::read_dir(data_dir.join("scans")) else { return vec![] };
+    dir.flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let (id, ext) = name.split_once('.')?;
+            if ext.contains("part") {
+                return None;
+            }
+            let m = e.metadata().ok()?;
+            Some(Cached { path: e.path(), scan_id: id.to_string(), bytes: m.len(), modified: m.modified().ok()? })
+        })
+        .collect()
+}
+
+/// Make room for `incoming` bytes of scan `incoming_id` within `budget`: drop
+/// the cached scan files of other projects, oldest first. Never one of the
+/// incoming scan's project, of a project with a job running or registering
+/// (it may be reading them), or of a scan in no registration while any job
+/// runs. A dropped file is fetched again if it is needed: the scanner keeps
+/// every scan. When nothing more may be dropped and the cache is still over,
+/// the field log says so once. Returns the bytes dropped.
+pub async fn make_room(st: &AppState, incoming_id: &str, incoming: u64, budget: u64) -> u64 {
+    let mut files = cached(&st.data_dir);
+    let mut used: u64 = files.iter().map(|f| f.bytes).sum();
+    if used + incoming <= budget {
+        st.inner.lock().unwrap().cache_noted = false;
+        return 0;
+    }
+    let (project_of, busy, any_job) = {
+        let inner = st.inner.lock().unwrap();
+        let project_of: std::collections::HashMap<String, String> = inner
+            .registrations
+            .iter()
+            .flat_map(|(p, r)| r.stations.iter().map(move |s| (s.scan_id.clone(), p.clone())))
+            .collect();
+        let mut busy: std::collections::HashSet<String> = inner.jobs.iter().filter(|j| !j.job.state.is_final()).map(|j| j.project_id.clone()).collect();
+        busy.extend(inner.registering.keys().cloned());
+        let any_job = inner.jobs.iter().any(|j| !j.job.state.is_final()) || !inner.registering.is_empty();
+        (project_of, busy, any_job)
+    };
+    let mine = project_of.get(incoming_id).cloned();
+    let keep = |f: &Cached| {
+        f.scan_id == incoming_id
+            || match project_of.get(&f.scan_id) {
+                Some(p) => Some(p) == mine.as_ref() || busy.contains(p),
+                None => any_job || mine.is_none(),
+            }
+    };
+    files.retain(|f| !keep(f));
+    files.sort_by_key(|f| f.modified);
+    let (mut dropped, mut n) = (0u64, 0usize);
+    for f in files {
+        if used + incoming <= budget {
+            break;
+        }
+        if tokio::fs::remove_file(&f.path).await.is_ok() {
+            used -= f.bytes;
+            dropped += f.bytes;
+            n += 1;
+        }
+    }
+    if n > 0 {
+        st.log("note", format!("Made room in the scan cache: dropped {n} file{} ({} MB) of other projects, oldest first", if n == 1 { "" } else { "s" }, dropped / MB), "bridge", None, &[]);
+    }
+    if used + incoming > budget {
+        let first = !std::mem::replace(&mut st.inner.lock().unwrap().cache_noted, true);
+        if first {
+            st.log(
+                "check",
+                format!("The scan cache needs {} MB, over its {} MB budget, and holds nothing it may drop. Connect the laptop to take scans off the Pi.", (used + incoming) / MB, budget / MB),
+                "bridge", mine.as_deref(), &[],
+            );
+        }
+    } else {
+        st.inner.lock().unwrap().cache_noted = false;
+    }
+    dropped
+}
+
 /// Local path of a scan's file or preview, downloading it on first use. The
 /// scanner must still list the scan, cached or not; if it doesn't, any cached
 /// copy is evicted and the scan is `not_found`.
@@ -113,6 +233,10 @@ pub async fn scan_file(st: &AppState, scan_id: &str, kind: FileKind) -> Result<P
     };
     let dir = st.data_dir.join("scans");
     tokio::fs::create_dir_all(&dir).await.map_err(|e| ApiError::cache(format!("cache directory: {e}")))?;
+    if kind == FileKind::Tzf {
+        let incoming = s.tzf.as_ref().and_then(|t| t.file_size).unwrap_or(0);
+        make_room(st, id, incoming, budget(st)).await;
+    }
     // Dropped (and deleted) if the download fails or its caller gives up.
     let mut part = PartFile(dir.join(format!("{id}.{}.part-{}", kind.ext(), crate::util::new_id("dl"))), false);
     st.scanner.download(&rel, &part.0).await?;
@@ -186,6 +310,107 @@ pub async fn view_file(st: &AppState, scan_id: &str, part: ViewPart) -> Result<P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----------------------------------------- the cache's budget (part C) ---
+
+    fn reg(project: &str, scans: &[&str]) -> crate::register::Registration {
+        crate::register::Registration {
+            project_id: project.into(), frame_scan_id: None, pairs: vec![], walls: vec![], summary: String::new(), updated_at: String::new(),
+            stations: scans.iter().enumerate().map(|(k, id)| crate::register::StationPose { scan_id: id.to_string(), station: k as u16 + 1, pose: None, audit: None }).collect(),
+        }
+    }
+
+    /// A cached scan file of `kb` KB, last modified `age` seconds ago.
+    fn put(b: &crate::testkit::Bridge, id: &str, kb: usize, age: u64) {
+        let dir = b.st.data_dir.join("scans");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.tzf"));
+        std::fs::write(&path, vec![0u8; kb * 1024]).unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
+    }
+
+    fn left(b: &crate::testkit::Bridge) -> Vec<String> {
+        let mut v: Vec<String> = cached(&b.st.data_dir).into_iter().map(|f| f.scan_id).collect();
+        v.sort();
+        v
+    }
+
+    fn notes(b: &crate::testkit::Bridge, start: &str) -> usize {
+        b.st.inner.lock().unwrap().log.iter().filter(|e| e.text.starts_with(start)).count()
+    }
+
+    const KB: u64 = 1024;
+
+    #[tokio::test]
+    async fn under_budget_nothing_is_dropped() {
+        let b = crate::testkit::Bridge::new().await;
+        put(&b, "a1", 100, 50);
+        put(&b, "b1", 100, 90);
+        assert_eq!(make_room(&b.st, "a2", 100 * KB, 300 * KB).await, 0);
+        assert_eq!(left(&b), ["a1", "b1"]);
+    }
+
+    #[tokio::test]
+    async fn other_projects_go_first_oldest_first_and_this_project_stays() {
+        let b = crate::testkit::Bridge::new().await;
+        {
+            let mut inner = b.st.inner.lock().unwrap();
+            inner.registrations.insert("A".into(), reg("A", &["a1", "a2", "a3"]));
+            inner.registrations.insert("B".into(), reg("B", &["b1", "b2", "b3"]));
+        }
+        put(&b, "a1", 100, 500); // the oldest of all, but this project's
+        put(&b, "a2", 100, 10);
+        put(&b, "b1", 100, 300);
+        put(&b, "b2", 100, 200);
+        put(&b, "b3", 100, 100);
+        // 500 KB held, 100 KB coming for a3, 400 KB allowed: two of B's go, the oldest two.
+        assert_eq!(make_room(&b.st, "a3", 100 * KB, 400 * KB).await, 200 * KB);
+        assert_eq!(left(&b), ["a1", "a2", "b3"]);
+        assert_eq!(notes(&b, "Made room in the scan cache: dropped 2 files"), 1);
+        assert_eq!(notes(&b, "The scan cache needs"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_busy_project_keeps_its_files_and_the_log_says_so_once() {
+        let b = crate::testkit::Bridge::new().await;
+        {
+            let mut inner = b.st.inner.lock().unwrap();
+            inner.registrations.insert("A".into(), reg("A", &["a1", "a2"]));
+            inner.registrations.insert("B".into(), reg("B", &["b1"]));
+            inner.registering.insert("B".into(), "job_1".into()); // B is being registered: it may be reading b1
+        }
+        put(&b, "a1", 100, 50);
+        put(&b, "b1", 100, 500);
+        assert_eq!(make_room(&b.st, "a2", 100 * KB, 150 * KB).await, 0);
+        assert_eq!(left(&b), ["a1", "b1"]);
+        assert_eq!(notes(&b, "The scan cache needs 0 MB, over its 0 MB budget, and holds nothing it may drop. Connect the laptop"), 1);
+        // Said once, not on every fetch.
+        make_room(&b.st, "a2", 100 * KB, 150 * KB).await;
+        assert_eq!(notes(&b, "The scan cache needs"), 1);
+        // Once B is done, its file may go; back under budget, the note may come again later.
+        b.st.inner.lock().unwrap().registering.clear();
+        assert_eq!(make_room(&b.st, "a2", 100 * KB, 250 * KB).await, 100 * KB);
+        assert!(!b.st.inner.lock().unwrap().cache_noted);
+    }
+
+    #[tokio::test]
+    async fn a_file_of_no_known_project_stays_while_any_job_runs() {
+        let b = crate::testkit::Bridge::new().await;
+        b.st.inner.lock().unwrap().registrations.insert("A".into(), reg("A", &["a1", "a2"]));
+        put(&b, "loose", 100, 500);
+        put(&b, "a1", 100, 50);
+        b.st.inner.lock().unwrap().registering.insert("A".into(), "job_1".into());
+        assert_eq!(make_room(&b.st, "a2", 100 * KB, 150 * KB).await, 0, "a job is running: the loose file may be its");
+        b.st.inner.lock().unwrap().registering.clear();
+        assert_eq!(make_room(&b.st, "a2", 100 * KB, 150 * KB).await, 100 * KB);
+        assert_eq!(left(&b), ["a1"]);
+        // A scan of no known project keeps every file of no known project (they may be its
+        // siblings); another project's file may still go.
+        put(&b, "loose", 100, 500);
+        assert_eq!(make_room(&b.st, "stray", 100 * KB, 150 * KB).await, 100 * KB);
+        assert_eq!(left(&b), ["loose"]);
+    }
 
     #[test]
     fn ids_cannot_escape_the_cache() {
