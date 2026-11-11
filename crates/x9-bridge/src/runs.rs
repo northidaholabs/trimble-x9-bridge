@@ -701,9 +701,15 @@ mod tests {
         json!({"id": id, "kind": "person", "instructions": format!("Answer {id}."), "needs": needs})
     }
 
-    /// Wait (up to `secs`) for the run to satisfy `pred`.
+    /// How much longer than its stated time a wait may take before it fails.
+    /// The times are what an ordinary build needs; an instrumented build on CI
+    /// (the coverage job) runs the measurement many times slower. A passing
+    /// test never waits this out, so the slack only delays a real failure.
+    const SLACK: f64 = 12.0;
+
+    /// Wait (up to `secs`, times `SLACK`) for the run to satisfy `pred`.
     async fn until(st: &AppState, run_id: &str, secs: f64, pred: impl Fn(&Run) -> bool) -> Run {
-        let end = std::time::Instant::now() + Duration::from_secs_f64(secs);
+        let end = std::time::Instant::now() + Duration::from_secs_f64(secs * SLACK);
         loop {
             let r = snapshot(st, run_id).expect("run");
             if pred(&r) {
