@@ -1,6 +1,6 @@
 # Spec: Question checks on the laptop, and only the checks that changed
 
-Owner: Jim · Date: 2026-10-28, revised 2026-11-11 · Status: parts A and C approved and built (2026-11-11); B and D draft
+Owner: Jim · Date: 2026-10-28, revised 2026-11-11 · Status: parts A, B and C approved and built (2026-11-11); D draft
 
 ## Problem
 
@@ -122,6 +122,22 @@ on a kit.
 
 `scanner_ask` and `scanner_processing` say when a check ran on the laptop.
 Nothing else about the tools changes.
+
+Built 2026-11-11:
+
+- The worker sends back each face's reading and, for a face it fitted, the
+  fit itself (its grid, compressed, uploaded with `PUT …/merged` before the
+  result). The bridge draws the evidence from it exactly as when it fits
+  itself, since the picture depends on the verdict only the bridge decides.
+- Only faces that pass the coverage part of the gate are offered; a check
+  carries the stations that saw them, with scan ids and poses.
+- An answer says where it was fitted (`checked_on`), the log says "checked
+  on <worker>", and `GET /v1/workers` gives each worker's `job_kind`.
+- The worker keeps every scan file it fetches, for registration or a check,
+  within `--cache-gb` (default 20), dropping the least recently used
+  project's files first and never the one at work.
+- A result for a job the bridge took back is refused (409) before its body
+  is read.
 
 ### C. A budget for the Pi's scan cache
 

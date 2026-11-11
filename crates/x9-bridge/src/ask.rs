@@ -791,9 +791,66 @@ async fn files_for(st: &std::sync::Arc<AppState>, items: &[&Prepared]) -> Result
     Ok(files)
 }
 
+/// Where the faces are fitted: on a worker when one takes the check in time
+/// (`work::offer_check`), else here. Faces that can't pass the gate's coverage
+/// part aren't offered: their look needs no fit. Returns each face's look in
+/// order, and the worker that fitted them, if one did.
+async fn fit_targets(st: &std::sync::Arc<AppState>, project_id: &str, items: &[&Prepared], limit: std::time::Duration, threads: usize) -> Result<(Vec<(Check, Option<FaceFit>)>, Option<String>), String> {
+    let mut out: Vec<Option<(Check, Option<FaceFit>)>> = items.iter().map(|_| None).collect();
+    let fittable: Vec<usize> = (0..items.len()).filter(|&k| items[k].could_fit()).collect();
+    // The rest: coverage only, no files.
+    let rest: Vec<(String, Face, Value)> = (0..items.len()).filter(|k| !fittable.contains(k)).map(|k| (items[k].target_id.clone(), items[k].face, items[k].coverage.clone())).collect();
+    let rest_idx: Vec<usize> = (0..items.len()).filter(|k| !fittable.contains(k)).collect();
+    for (k, look) in rest_idx.into_iter().zip(look_many(&rest, &[], &Opts::default(), 1).map_err(|e| format!("{e:#}"))?) {
+        out[k] = Some(look);
+    }
+    let mut worker = None;
+    if !fittable.is_empty() {
+        let these: Vec<&Prepared> = fittable.iter().map(|&k| items[k]).collect();
+        let looks = match crate::work::offer_check(st, project_id, check_body(&these), these.len(), limit).await {
+            crate::work::CheckOffered::Done(looks, w) => {
+                worker = Some(w);
+                looks
+            }
+            other => {
+                if let crate::work::CheckOffered::Failed(why) = other {
+                    st.log("check", format!("The question check on the laptop failed ({why}); the bridge fits it itself"), "bridge", Some(project_id), &[]);
+                }
+                let files = files_for(st, &these).await.map_err(|e| e.detail.unwrap_or(e.title))?;
+                let targets: Vec<(String, Face, Value)> = these.iter().map(|p| (p.target_id.clone(), p.face, p.coverage.clone())).collect();
+                tokio::task::spawn_blocking(move || look_many(&targets, &files, &Opts::default(), threads)).await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))?
+            }
+        };
+        for (k, look) in fittable.into_iter().zip(looks) {
+            out[k] = Some(look);
+        }
+    }
+    Ok((out.into_iter().map(|o| o.expect("every face looked at")).collect(), worker))
+}
+
+/// A check job's body: the faces, each with the coverage the bridge computed,
+/// and the stations that saw any of them, with scan id and pose, in the
+/// registration's order.
+fn check_body(items: &[&Prepared]) -> Value {
+    let faces: Vec<Value> = items.iter().map(|p| json!({"target_id": p.target_id, "face": p.face, "coverage": p.coverage})).collect();
+    let stations: Vec<Value> = items
+        .iter()
+        .find_map(|p| p.reg.as_ref())
+        .map(|reg| {
+            reg.stations
+                .iter()
+                .filter(|s| items.iter().any(|p| p.stations.contains(&s.station) && p.scans.contains_key(&s.station)))
+                .filter_map(|s| s.pose.map(|pose| json!({"station": s.station, "scan_id": s.scan_id, "pose": pose})))
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({"faces": faces, "stations": stations})
+}
+
 /// Record a look: the verdict in the mission, the settling reading, the
 /// evidence, the basis, and the log line. Returns what the caller may see.
-async fn finish(st: &std::sync::Arc<AppState>, project_id: &str, p: Prepared, check: Check, fit: Option<FaceFit>, by: &str, t0: std::time::Instant) -> Result<Value, ApiError> {
+#[allow(clippy::too_many_arguments)]
+async fn finish(st: &std::sync::Arc<AppState>, project_id: &str, p: Prepared, check: Check, fit: Option<FaceFit>, by: &str, on: Option<&str>, t0: std::time::Instant) -> Result<Value, ApiError> {
     let Prepared { target_id, key, face, name, prev, settling, tolerance, reg, scans, coverage, walls, poses, .. } = p;
     let target_id = target_id.as_str();
     let (mut q, keep) = decide(Some(&prev), settling.as_ref(), &check);
@@ -821,6 +878,7 @@ async fn finish(st: &std::sync::Arc<AppState>, project_id: &str, p: Prepared, ch
     let mut out = public(target_id, &q, tolerance.as_ref());
     out["face"] = face_said(&face, check.length_m, &walls);
     out["seconds"] = json!((secs * 10.0).round() / 10.0);
+    out["checked_on"] = json!(on.unwrap_or("bridge"));
     if q.verdict == Some(Verdict::NotYet) && q.reason != "settling" {
         out["unseen"] = unseen_with_subjects(st, reg.as_ref(), &coverage).await;
     }
@@ -834,7 +892,8 @@ async fn finish(st: &std::sync::Arc<AppState>, project_id: &str, p: Prepared, ch
         _ => format!("not yet: {}", q.reason),
     };
     let what = if by == "bridge" { "Re-checked" } else { "Asked" };
-    st.log("note", format!("{what} {name} ({}): {said}; stations {}; {secs:.1} s", q.kind, if stations.is_empty() { "none".into() } else { stations }), by, Some(project_id), &[("target_id", target_id)]);
+    let on = on.map(|w| format!(", checked on {w}")).unwrap_or_default();
+    st.log("note", format!("{what} {name} ({}): {said}; stations {}; {secs:.1} s{on}", q.kind, if stations.is_empty() { "none".into() } else { stations }), by, Some(project_id), &[("target_id", target_id)]);
     if let Some((line, m)) = changed {
         st.save_missions();
         st.emit("mission", json!(m));
@@ -851,20 +910,33 @@ async fn finish(st: &std::sync::Arc<AppState>, project_id: &str, p: Prepared, ch
 /// logged. Returns what the caller may see.
 pub async fn on_bridge(st: &std::sync::Arc<AppState>, project_id: &str, target_id: &str, by: &str) -> Result<Value, ApiError> {
     let t0 = std::time::Instant::now();
+    // An ask while the bridge places a new station waits for it, and is then
+    // checked on the new registration: the older one may be out of date.
+    let waited = if by != "bridge" { wait_for_registration(st, project_id).await } else { 0.0 };
     // One look at a target at a time: an ask and the re-check after a station
     // would otherwise each write over the other's verdict.
     let lock = st.inner.lock().unwrap().asking.entry((project_id.to_string(), target_id.to_string())).or_default().clone();
     let _one = lock.lock().await;
     let p = prepare(st, project_id, target_id).await?;
-    let files = files_for(st, &[&p]).await?;
-    let one = vec![(p.target_id.clone(), p.face, p.coverage.clone())];
-    let (check, fit) = tokio::task::spawn_blocking(move || look_many(&one, &files, &Opts::default(), 1))
-        .await
-        .map_err(|e| ApiError::cache(format!("asking: {e}")))?
-        .map_err(|e| ApiError::cache(format!("asking: {e:#}")))?
-        .pop()
-        .expect("one look");
-    finish(st, project_id, p, check, fit, by, t0).await
+    let (mut looks, on) = fit_targets(st, project_id, &[&p], crate::work::CHECK_LIMIT_ASK, 1).await.map_err(|e| ApiError::cache(format!("asking: {e}")))?;
+    let (check, fit) = looks.pop().expect("one look");
+    let mut out = finish(st, project_id, p, check, fit, by, on.as_deref(), t0).await?;
+    if waited > 0.0 {
+        out["waited_for_registration_s"] = json!((waited * 10.0).round() / 10.0);
+    }
+    Ok(out)
+}
+
+/// Wait while the bridge registers this project (at most 20 minutes).
+/// Returns how long it waited (s), 0 when it didn't.
+async fn wait_for_registration(st: &std::sync::Arc<AppState>, project_id: &str) -> f64 {
+    let t0 = std::time::Instant::now();
+    let mut waited = false;
+    while st.inner.lock().unwrap().registering.contains_key(project_id) && t0.elapsed() < std::time::Duration::from_secs(1200) {
+        waited = true;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    if waited { t0.elapsed().as_secs_f64() } else { 0.0 }
 }
 
 /// The unseen stretches, each with the preview columns that frame it from the
@@ -956,28 +1028,25 @@ pub async fn recheck(st: &std::sync::Arc<AppState>, project_id: &str) -> f64 {
         }
     }
     let judged = judge.len();
+    let mut fitted_on: Option<String> = None;
     if !judge.is_empty() {
         let refs: Vec<&Prepared> = judge.iter().collect();
-        let looks = match files_for(st, &refs).await {
-            Ok(files) => {
-                let targets: Vec<(String, Face, Value)> = judge.iter().map(|p| (p.target_id.clone(), p.face, p.coverage.clone())).collect();
-                let threads = check_parallel();
-                tokio::task::spawn_blocking(move || look_many(&targets, &files, &Opts::default(), threads)).await.map_err(|e| anyhow::anyhow!("{e}")).and_then(|r| r)
-            }
-            Err(e) => Err(anyhow::anyhow!("{}", e.detail.as_deref().unwrap_or(&e.title))),
-        };
+        let looks = fit_targets(st, project_id, &refs, crate::work::CHECK_LIMIT_RECHECK, check_parallel()).await;
         match looks {
-            Ok(looks) => {
+            Ok((looks, on)) => {
+                if let Some(w) = &on {
+                    fitted_on = Some(w.clone());
+                }
                 for (p, (check, fit)) in judge.into_iter().zip(looks) {
                     let id = p.target_id.clone();
-                    if let Err(e) = finish(st, project_id, p, check, fit, "bridge", t0).await {
+                    if let Err(e) = finish(st, project_id, p, check, fit, "bridge", on.as_deref(), t0).await {
                         fail(&id, &e);
                     }
                 }
             }
             Err(e) => {
                 // One bad file shouldn't cost every target its check: judge them one by one.
-                st.log("check", format!("Re-check of {judged} targets together failed ({e:#}); checking them one at a time"), "bridge", Some(project_id), &[]);
+                st.log("check", format!("Re-check of {judged} targets together failed ({e}); checking them one at a time"), "bridge", Some(project_id), &[]);
                 drop(held);
                 for p in judge {
                     if let Err(e) = on_bridge(st, project_id, &p.target_id, "bridge").await {
@@ -995,8 +1064,9 @@ pub async fn recheck(st: &std::sync::Arc<AppState>, project_id: &str) -> f64 {
     st.log(
         "note",
         format!(
-            "Re-checked {} question{} after the registration in {secs:.1} s: {judged} judged{}, {skipped} kept as they were (no new station saw them and theirs didn't move)",
-            ids.len(), plural(ids.len()), if reasons.is_empty() { String::new() } else { format!(" ({reasons})") }
+            "Re-checked {} question{} after the registration in {secs:.1} s: {judged} judged{}{}, {skipped} kept as they were (no new station saw them and theirs didn't move)",
+            ids.len(), plural(ids.len()), if reasons.is_empty() { String::new() } else { format!(" ({reasons})") },
+            fitted_on.map(|w| format!(", fitted on {w}")).unwrap_or_default()
         ),
         "bridge", Some(project_id), &[],
     );
@@ -1010,7 +1080,7 @@ pub fn face_wall(id: &str, f: &Face, z_m: [f64; 2], seen_by: Vec<u16>) -> crate:
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn reading(plumb: f64, stations: &[u16]) -> Reading {
@@ -1392,7 +1462,7 @@ mod tests {
     use crate::register::{Registration, StationPose, Wall};
 
     const SCAN: &str = "5b5314cf-76b8-4f59-a445-ceee1e6df4c3";
-    const PROJECT: &str = "39187455-8278-428c-89ad-8a4835f95be6";
+    pub(crate) const PROJECT: &str = "39187455-8278-428c-89ad-8a4835f95be6";
 
     fn yard_dome() -> Vec<u8> {
         room_dome(960, [-6.0, -4.0, -1.5], [5.0, 6.0, 3.0])
@@ -1494,7 +1564,7 @@ mod tests {
 
     /// A bridge on the mock whose one scan is a full dome of the yard, with
     /// that scan registered as station 1 and a mission asking about walls.
-    async fn yard_bridge() -> (crate::testkit::Bridge, std::path::PathBuf) {
+    pub(crate) async fn yard_bridge() -> (crate::testkit::Bridge, std::path::PathBuf) {
         let fx = scratch("x9-ask-fixtures");
         std::fs::write(fx.join("dome.tzf"), yard_dome()).unwrap();
         std::fs::write(fx.join("dome.jpg"), crate::export::tests::grey_jpeg()).unwrap();
@@ -1708,6 +1778,27 @@ mod tests {
         recheck(st, PROJECT).await;
         assert!(last_line().contains(": 0 judged, 2 kept"), "{}", last_line());
         std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    #[test]
+    fn a_fit_survives_the_trip_as_bytes_and_draws_the_same_evidence() {
+        let dir = scratch("x9-ask-fit-bytes");
+        let station = dir.join("station_01.tzf");
+        std::fs::write(&station, yard_dome()).unwrap();
+        let cov = json!({"seen_share": 0.9, "length_m": 10.0, "height_m": [-1.4, 2.9], "stations": [{"station": 1}]});
+        let (c, fit) = look("east", &east(), &cov, &[(1, identity(), station)], &Opts::default()).unwrap();
+        let fit = fit.expect("the east wall fits");
+        let back = FaceFit::from_bytes(&fit.to_bytes()).unwrap();
+        assert_eq!(serde_json::to_value(&back.result).unwrap(), serde_json::to_value(&fit.result).unwrap());
+        let (q, _) = decide(None, None, &c);
+        let (mut a, mut b) = (fit, back);
+        assert_eq!(evidence(&mut a, &q, &Opts::default()), evidence(&mut b, &q, &Opts::default()), "the same picture, pixel for pixel");
+        // Not a fit: refused, not misread.
+        assert!(FaceFit::from_bytes(b"nonsense").is_err());
+        let mut cut = a.to_bytes();
+        cut.truncate(cut.len() / 2);
+        assert!(FaceFit::from_bytes(&cut).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
