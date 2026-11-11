@@ -1985,7 +1985,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "x9-bridge"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -2013,7 +2013,7 @@ dependencies = [
 
 [[package]]
 name = "x9-cli"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "x9-client"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -2041,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "x9-mock"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "axum",
  "serde_json",
