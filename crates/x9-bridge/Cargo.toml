@@ -25,6 +25,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 copc-rs = "0.5"
 libc = "0.2"  # statvfs: free space on the data disk, for the scan cache budget
 las = "=0.9.5"  # copc-rs 0.5 needs the laz 0.9 that las 0.9.5 and earlier use
+sha2 = "0.10"  # checksums in a saved project's manifest
 
 [dev-dependencies]
 x9-mock = { path = "../x9-mock" }

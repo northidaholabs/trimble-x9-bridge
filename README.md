@@ -156,6 +156,10 @@ need a person at the kit.
   walls are then covered by geometry, not by eye. Every station gets a
   verdict from independent checks; a field laptop can do the work for the
   Pi (`x9-bridge worker`), with the Pi as the fallback.
+- **The data lands on the laptop:** after the sign-off, the laptop saves the
+  project to a folder of its own: every scan file, each station's points in
+  the project frame as COPC, the registration and mission, and a manifest
+  with checksums.
 - **Next-station proposals:** the agent marks where to set up next on the
   station's preview (a tripod on the ground, labels for what was seen and
   what is hidden, landmarks to walk by) with directions in prose; the bridge

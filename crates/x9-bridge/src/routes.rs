@@ -58,6 +58,7 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/v1/projects/:project_id/registration/plan", get(get_registration_plan))
         .route("/v1/projects/:project_id/registration/face", post(post_face))
         .route("/v1/projects/:project_id/minimap", get(get_minimap))
+        .route("/v1/projects/:project_id/save", get(get_save).post(post_save))
         .route("/v1/workers", get(list_workers))
         .route("/v1/work/claim", post(work_claim))
         .route("/v1/work/:job_id/progress", post(work_progress))
@@ -908,7 +909,27 @@ async fn mission_sign_off(State(st): St, h: HeaderMap, Path(project_id): Path<St
     m.sign_off(&c.name, req.confirmed_via).map_err(ApiError::conflict)?;
     let via = m.confirmed_via.as_deref().map(|v| format!(" ({v})")).unwrap_or_default();
     st.log("approval", format!("Mission signed off: {} ({}){via}", m.goal, m.tally()), &c.name, Some(&project_id), &[("mission_id", &m.mission_id)]);
-    Ok(mission_changed(&st, &m))
+    let out = mission_changed(&st, &m);
+    // The data goes to the laptop now that the job is done (part D).
+    if st.inner.lock().unwrap().registrations.contains_key(&project_id) {
+        let _ = crate::save::queue(&st, &project_id, &c.name, "after the sign-off");
+    }
+    Ok(out)
+}
+
+/// The project's latest save to a laptop, and the save job now running.
+async fn get_save(State(st): St, h: HeaderMap, Path(project_id): Path<String>) -> ApiResult<Json<Value>> {
+    st.caller(&h)?;
+    Ok(Json(crate::save::status(&st, &project_id)))
+}
+
+/// Save the project to a folder on the laptop: every scan file, each placed
+/// station in the project frame (COPC), the registration and mission, and a
+/// manifest. Waits for a worker however long it takes.
+async fn post_save(State(st): St, h: HeaderMap, Path(project_id): Path<String>) -> ApiResult<Response> {
+    let c = st.require(&h, |r| r != Role::Viewer, "save projects")?;
+    let job = crate::save::queue(&st, &project_id, &c.name, "asked")?;
+    Ok((StatusCode::ACCEPTED, Json(job)).into_response())
 }
 
 /// The project's registration: stations in one frame, the pairs that tie
@@ -1042,6 +1063,9 @@ async fn list_workers(State(st): St, h: HeaderMap) -> ApiResult<Json<Value>> {
 #[derive(Deserialize)]
 struct ClaimReq {
     worker: String,
+    /// The scan files the worker holds (part D): the Pi may drop its copies.
+    #[serde(default)]
+    holds: Option<Vec<String>>,
 }
 
 /// A worker asks for work: 200 with a job, or 204.
@@ -1052,12 +1076,26 @@ async fn work_claim(State(st): St, h: HeaderMap, body: Bytes) -> ApiResult<Respo
     if w.is_empty() || w.len() > 64 || !w.chars().all(|ch| ch.is_ascii_alphanumeric() || "-_.".contains(ch)) {
         return Err(ApiError::invalid("worker: 1–64 letters, digits, '-', '_' or '.'"));
     }
-    let job = st.work.lock().unwrap().claim(w, &c.name);
+    let registering: std::collections::HashSet<String> = st.inner.lock().unwrap().registering.keys().cloned().collect();
+    let job = {
+        let mut work = st.work.lock().unwrap();
+        if let Some(ids) = req.holds {
+            work.note_holds(w, ids.into_iter().take(100_000).filter(|i| crate::files::safe_id(i).is_ok()).collect());
+        }
+        work.claim_with(w, &c.name, &registering)
+    };
     match job {
         None => Ok(StatusCode::NO_CONTENT.into_response()),
-        Some(v) => {
+        Some(mut v) => {
             let project = v["project_id"].as_str().map(str::to_string);
-            let what = if v["kind"] == "check" { "the question check" } else { "the registration job" };
+            if v["kind"] == "save" {
+                v = crate::save::body(&st, v["job_id"].as_str().unwrap_or(""), project.as_deref().unwrap_or("")).await;
+            }
+            let what = match v["kind"].as_str() {
+                Some("check") => "the question check",
+                Some("save") => "the save",
+                _ => "the registration job",
+            };
             st.log("note", format!("Worker {w} took {what}"), &c.name, project.as_deref(), &[("job_id", v["job_id"].as_str().unwrap_or(""))]);
             Ok(Json(v).into_response())
         }
@@ -1084,7 +1122,11 @@ async fn work_merged(State(st): St, h: HeaderMap, Path(job_id): Path<String>, bo
     let c = st.require(&h, |r| r != Role::Viewer, "do work for the bridge")?;
     let bytes = body.to_vec();
     // A check job uploads its fits here; a registration, its merged points.
-    let check = st.work.lock().unwrap().kind(&job_id) == Some("check");
+    let kind = st.work.lock().unwrap().kind(&job_id);
+    if kind == Some("save") {
+        return Err(ApiError::conflict("a save job uploads nothing: send what it saved"));
+    }
+    let check = kind == Some("check");
     let checked = tokio::task::spawn_blocking(move || {
         if check {
             crate::work::unpack_fits(&bytes).map(|_| bytes)
@@ -1108,6 +1150,9 @@ async fn work_result(State(st): St, h: HeaderMap, Path(job_id): Path<String>, bo
     if kind == "check" {
         let res: crate::work::CheckResult = parse(&body)?;
         st.work.lock().unwrap().deliver_check(&job_id, &c.name, res).map_err(ApiError::conflict)?;
+    } else if kind == "save" {
+        let res: crate::work::SaveResult = parse(&body)?;
+        st.work.lock().unwrap().deliver_save(&job_id, &c.name, res).map_err(ApiError::conflict)?;
     } else {
         let res: crate::work::WorkResult = parse(&body)?;
         st.work.lock().unwrap().deliver(&job_id, &c.name, Ok(res)).map_err(ApiError::conflict)?;

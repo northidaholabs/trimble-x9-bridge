@@ -18,11 +18,18 @@
 //! blob (`PUT …/merged`). The bridge decides, records and draws the evidence.
 //! It fits them itself on the same rules, with a shorter limit: 120 s for a
 //! re-check, 60 s for one ask.
+//!
+//! The laptop is also where the data lands (part D). Each claim lists the
+//! scan files the worker holds, so the Pi can drop its own copies when its
+//! cache is full. A `save` job writes the project's registered stations and
+//! scan files to a folder on the worker's computer (`save`). A save has no
+//! fallback on the Pi: it waits for a worker, and goes back on offer if the
+//! one that took it goes quiet for 5 minutes.
 
 use crate::register::{Audit, Pair, Pose, Wall};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
@@ -64,6 +71,40 @@ pub struct CheckOut {
     pub fitted: bool,
 }
 
+/// A file a save wrote, relative to its project folder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedFile {
+    pub path: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+/// What a save did with one station: its registered cloud (when placed) and
+/// whether it was kept from the last save unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedStation {
+    pub station: u16,
+    pub scan_id: String,
+    #[serde(default)]
+    pub copc: Option<String>,
+    #[serde(default)]
+    pub point_count: Option<u64>,
+    #[serde(default)]
+    pub kept: bool,
+    /// Why a station has no cloud or no scan file, when it hasn't.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// A worker's answer to a save job: the folder, as that computer names it,
+/// and what is in it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveResult {
+    pub folder: String,
+    pub files: Vec<SavedFile>,
+    pub stations: Vec<SavedStation>,
+}
+
 /// A worker's answer to a check job: one entry per offered face, in order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckResult {
@@ -99,6 +140,7 @@ pub fn unpack_fits(b: &[u8]) -> Result<Vec<crate::analyze::FaceFit>, String> {
 enum Delivered {
     Register(WorkResult),
     Check(CheckResult),
+    Save(SaveResult),
 }
 
 type Delivery = Result<(Delivered, Option<Vec<u8>>), String>;
@@ -107,6 +149,9 @@ enum Job {
     Register { stations: Vec<(u16, String)>, pairs: Vec<Pair> },
     /// The offer's body as the worker gets it, and how many faces it lists.
     Check { body: Value, faces: usize },
+    /// Save the project to a folder on the worker; the body is built when it
+    /// is claimed, from the registration as it then stands.
+    Save,
 }
 
 struct Offer {
@@ -116,14 +161,18 @@ struct Offer {
     claimed_by: Option<(String, String)>,
     merged: Option<Vec<u8>>,
     done: Option<oneshot::Sender<Delivery>>,
+    /// When the worker holding it last claimed or reported progress.
+    heard: Option<Instant>,
 }
 
 #[derive(Default)]
 pub struct WorkState {
     /// Worker name → last claim, and the caller behind it.
     workers: HashMap<String, (Instant, String)>,
-    /// Offered registration jobs, by job id.
+    /// Offered jobs, by job id.
     offers: HashMap<String, Offer>,
+    /// The scan files each worker holds, as it last said.
+    holds: HashMap<String, HashSet<String>>,
 }
 
 pub enum Offered {
@@ -143,7 +192,7 @@ impl WorkState {
             .filter(|(_, (t, _))| t.elapsed() < WORKER_SEEN)
             .map(|(name, (t, by))| {
                 let job = self.offers.iter().find(|(_, o)| o.claimed_by.as_ref().is_some_and(|c| &c.0 == name));
-                let kind = job.map(|(_, o)| if matches!(o.job, Job::Check { .. }) { "check" } else { "register" });
+                let kind = job.map(|(_, o)| o.job.kind());
                 json!({"worker": name, "token": by, "seen_s_ago": (t.elapsed().as_secs_f64() * 10.0).round() / 10.0, "job_id": job.map(|(j, _)| j.clone()), "job_kind": kind})
             })
             .collect();
@@ -152,17 +201,29 @@ impl WorkState {
     }
 
     /// A worker asks for work: note it, and hand it an unclaimed job,
-    /// registrations before checks (a check follows its registration).
+    /// registrations before checks (a check follows its registration), and
+    /// saves last.
+    #[cfg(test)]
     pub fn claim(&mut self, worker: &str, caller: &str) -> Option<Value> {
+        self.claim_with(worker, caller, &HashSet::new())
+    }
+
+    /// As `claim`, holding back the saves of `registering` projects (a save
+    /// should carry the registration that is coming) and of projects a save
+    /// is already running for (one writer per folder).
+    pub fn claim_with(&mut self, worker: &str, caller: &str, registering: &HashSet<String>) -> Option<Value> {
         self.workers.insert(worker.to_string(), (Instant::now(), caller.to_string()));
+        let saving: HashSet<String> = self.offers.values().filter(|o| matches!(o.job, Job::Save) && o.claimed_by.is_some()).map(|o| o.project_id.clone()).collect();
         let pick = self
             .offers
             .iter()
             .filter(|(_, o)| o.claimed_by.is_none())
-            .min_by_key(|(id, o)| (matches!(o.job, Job::Check { .. }), id.to_string()))
+            .filter(|(_, o)| !matches!(o.job, Job::Save) || !(registering.contains(&o.project_id) || saving.contains(&o.project_id)))
+            .min_by_key(|(id, o)| (o.job.rank(), id.to_string()))
             .map(|(id, _)| id.clone())?;
         let o = self.offers.get_mut(&pick)?;
         o.claimed_by = Some((worker.to_string(), caller.to_string()));
+        o.heard = Some(Instant::now());
         Some(match &o.job {
             Job::Register { stations, pairs } => json!({
                 "job_id": pick,
@@ -178,15 +239,27 @@ impl WorkState {
                 v["project_id"] = json!(o.project_id);
                 v
             }
+            Job::Save => json!({"job_id": pick, "kind": "save", "project_id": o.project_id}),
         })
     }
 
-    /// The kind of an offered job: `register` or `check`.
+    /// The kind of an offered job: `register`, `check` or `save`.
     pub fn kind(&self, job_id: &str) -> Option<&'static str> {
-        self.offers.get(job_id).map(|o| match o.job {
-            Job::Register { .. } => "register",
-            Job::Check { .. } => "check",
-        })
+        self.offers.get(job_id).map(|o| o.job.kind())
+    }
+
+    /// Note the scan files a worker says it holds.
+    pub fn note_holds(&mut self, worker: &str, ids: HashSet<String>) {
+        self.holds.insert(worker.to_string(), ids);
+    }
+
+    /// The scan files held by the workers seen recently.
+    pub fn held(&self) -> HashSet<String> {
+        self.holds
+            .iter()
+            .filter(|(w, _)| self.workers.get(*w).is_some_and(|(t, _)| t.elapsed() < WORKER_SEEN))
+            .flat_map(|(_, ids)| ids.iter().cloned())
+            .collect()
     }
 
     /// The offer `job_id`, if `caller` claimed it.
@@ -198,9 +271,11 @@ impl WorkState {
         }
     }
 
-    /// Whether `caller` holds the offered job (for progress reports).
+    /// Whether `caller` holds the offered job (for progress reports, which
+    /// count as hearing from it).
     pub fn holds(&mut self, job_id: &str, caller: &str) -> Result<(), String> {
-        self.mine(job_id, caller).map(|_| ())
+        self.mine(job_id, caller)?.heard = Some(Instant::now());
+        Ok(())
     }
 
     /// Keep the worker's merged points (already checked) for its result.
@@ -220,6 +295,7 @@ impl WorkState {
                 Ok((Delivered::Register(res), Some(o.merged.take().ok_or("upload the merged points (PUT …/merged) before the result")?)))
             }
             (Ok(_), Job::Check { .. }) => return Err("this is a check job: send its checks".into()),
+            (Ok(_), Job::Save) => return Err("this is a save job: send what it saved".into()),
             (Err(e), _) => Err(e),
         };
         if let Some(tx) = o.done.take() {
@@ -249,6 +325,42 @@ impl WorkState {
     }
 }
 
+impl Job {
+    fn kind(&self) -> &'static str {
+        match self {
+            Job::Register { .. } => "register",
+            Job::Check { .. } => "check",
+            Job::Save => "save",
+        }
+    }
+
+    /// Claim order: registrations, then checks, then saves.
+    fn rank(&self) -> u8 {
+        match self {
+            Job::Register { .. } => 0,
+            Job::Check { .. } => 1,
+            Job::Save => 2,
+        }
+    }
+}
+
+impl WorkState {
+    /// A worker's answer to a save job.
+    pub fn deliver_save(&mut self, job_id: &str, caller: &str, r: SaveResult) -> Result<(), String> {
+        let o = self.mine(job_id, caller)?;
+        if !matches!(o.job, Job::Save) {
+            return Err("this is not a save job".into());
+        }
+        if r.folder.trim().is_empty() || r.files.is_empty() {
+            return Err("a save names its folder and lists the files it wrote".into());
+        }
+        if let Some(tx) = o.done.take() {
+            let _ = tx.send(Ok((Delivered::Save(r), None)));
+        }
+        Ok(())
+    }
+}
+
 /// Offer a registration job to the workers and wait for the result.
 /// `cancelled` is polled while waiting; `phase` reports where it stands.
 pub async fn offer(
@@ -273,6 +385,7 @@ pub async fn offer(
             claimed_by: None,
             merged: None,
             done: Some(tx),
+            heard: None,
         });
         rx
     };
@@ -342,7 +455,7 @@ pub async fn offer_check(st: &crate::state::AppState, project_id: &str, body: Va
             return CheckOffered::NoWorker;
         }
         let (tx, rx) = oneshot::channel();
-        w.offers.insert(job_id.clone(), Offer { project_id: project_id.to_string(), job: Job::Check { body, faces }, claimed_by: None, merged: None, done: Some(tx) });
+        w.offers.insert(job_id.clone(), Offer { project_id: project_id.to_string(), job: Job::Check { body, faces }, claimed_by: None, merged: None, done: Some(tx), heard: None });
         rx
     };
     let take_back = || st.work.lock().unwrap().offers.remove(&job_id);
@@ -388,6 +501,80 @@ pub async fn offer_check(st: &crate::state::AppState, project_id: &str, body: Va
     CheckOffered::Done(out, worker)
 }
 
+/// How a save offered to the workers ended.
+pub enum SaveOffered {
+    /// What the worker saved, and its name.
+    Done(SaveResult, String),
+    Failed(String),
+    Cancelled,
+}
+
+/// A worker that took a save and has said nothing for this long loses it,
+/// and the save goes back on offer.
+pub const SAVE_QUIET: Duration = Duration::from_secs(300);
+
+/// A save on offer, to wait on with `offer_save`.
+pub struct SaveOffer(oneshot::Receiver<Delivery>);
+
+/// Put a save on offer now, so the next claim can take it.
+pub fn put_save(st: &crate::state::AppState, job_id: &str, project_id: &str) -> SaveOffer {
+    let (tx, rx) = oneshot::channel();
+    st.work.lock().unwrap().offers.insert(job_id.to_string(), Offer { project_id: project_id.to_string(), job: Job::Save, claimed_by: None, merged: None, done: Some(tx), heard: None });
+    SaveOffer(rx)
+}
+
+/// Wait, however long, for a worker to do the save. `on_worker` is told
+/// when a worker takes it (`Some(name)`) and when it goes back on offer
+/// (`None`).
+pub async fn offer_save(
+    st: &crate::state::AppState,
+    offer: SaveOffer,
+    job_id: &str,
+    project_id: &str,
+    quiet: Duration,
+    cancelled: &(dyn Fn() -> bool + Sync),
+    on_worker: &(dyn Fn(Option<&str>) + Sync),
+) -> SaveOffered {
+    let mut rx = offer.0;
+    let take_back = || st.work.lock().unwrap().offers.remove(job_id);
+    let mut holder: Option<String> = None;
+    loop {
+        if cancelled() {
+            take_back();
+            return SaveOffered::Cancelled;
+        }
+        let now = st.work.lock().unwrap().offers.get(job_id).and_then(|o| o.claimed_by.clone().map(|c| (c.0, o.heard)));
+        match (&holder, now) {
+            (None, Some((w, _))) => {
+                on_worker(Some(&w));
+                holder = Some(w);
+            }
+            (Some(w), Some((_, Some(heard)))) if heard.elapsed() > quiet => {
+                if let Some(o) = st.work.lock().unwrap().offers.get_mut(job_id) {
+                    (o.claimed_by, o.heard) = (None, None);
+                }
+                st.log("check", format!("The save on {w} went quiet for {} s; it is offered again", quiet.as_secs()), "bridge", Some(project_id), &[("job_id", job_id)]);
+                on_worker(None);
+                holder = None;
+            }
+            _ => {}
+        }
+        match tokio::time::timeout(Duration::from_millis(250), &mut rx).await {
+            Err(_) => continue,
+            Ok(got) => {
+                // Named from the offer: a worker may answer before this loop saw it claim.
+                let w = take_back().and_then(|o| o.claimed_by).map(|c| c.0).or(holder).unwrap_or_else(|| "the worker".into());
+                return match got {
+                    Ok(Ok((Delivered::Save(r), _))) => SaveOffered::Done(r, w),
+                    Ok(Ok(_)) => SaveOffered::Failed(format!("{w} sent the wrong kind of result")),
+                    Ok(Err(e)) => SaveOffered::Failed(format!("{w}: {e}")),
+                    Err(_) => SaveOffered::Failed(format!("{w} went away")),
+                };
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,6 +591,7 @@ mod tests {
             claimed_by: None,
             merged: None,
             done: None,
+            heard: None,
         }
     }
 
@@ -476,7 +664,7 @@ mod tests {
     }
 
     fn check_offer(faces: usize) -> Offer {
-        Offer { project_id: "p1".into(), job: Job::Check { body: json!({"faces": [], "stations": []}), faces }, claimed_by: None, merged: None, done: None }
+        Offer { project_id: "p1".into(), job: Job::Check { body: json!({"faces": [], "stations": []}), faces }, claimed_by: None, merged: None, done: None, heard: None }
     }
 
     fn out(id: &str, fitted: bool) -> CheckOut {
@@ -815,5 +1003,178 @@ mod tests {
         let j = wait_job(&b, id, 5.0).await;
         assert_eq!(j["problem"]["code"], "cache_error", "{j}");
         assert!(j["problem"]["detail"].as_str().unwrap().starts_with("registration directory"), "{j}");
+    }
+
+    // ------------------------------------------------- part D: held files, saves ---
+
+    fn save_offer(project: &str) -> Offer {
+        Offer { project_id: project.into(), job: Job::Save, claimed_by: None, merged: None, done: None, heard: None }
+    }
+
+    #[test]
+    fn held_files_count_while_their_worker_is_seen() {
+        let mut w = WorkState::default();
+        w.claim("laptop", "agent");
+        w.note_holds("laptop", HashSet::from(["s1".to_string()]));
+        w.note_holds("never-claimed", HashSet::from(["s2".to_string()]));
+        assert_eq!(w.held(), HashSet::from(["s1".to_string()]));
+        w.workers.get_mut("laptop").unwrap().0 = Instant::now().checked_sub(WORKER_SEEN + Duration::from_secs(1)).unwrap();
+        assert!(w.held().is_empty(), "a laptop gone quiet may have left with its files");
+    }
+
+    #[test]
+    fn saves_come_after_other_work_one_per_project_and_not_while_it_registers() {
+        let mut w = WorkState::default();
+        w.offers.insert("a-save".into(), save_offer("p1"));
+        w.offers.insert("b-save".into(), save_offer("p1"));
+        w.offers.insert("c-save".into(), save_offer("p2"));
+        w.offers.insert("z-reg".into(), offer_of(&[(1, "s1")]));
+        assert_eq!(w.claim("k", "agent").unwrap()["kind"], "register");
+        let registering = HashSet::from(["p2".to_string()]);
+        let j = w.claim_with("l", "agent", &registering).unwrap();
+        assert_eq!((j["job_id"].as_str(), j["kind"].as_str(), j["project_id"].as_str()), (Some("a-save"), Some("save"), Some("p1")));
+        assert_eq!(w.workers().iter().find(|v| v["worker"] == "l").unwrap()["job_kind"], "save");
+        // p1 has a save running (one writer per folder); p2 is registering.
+        assert!(w.claim_with("m", "agent", &registering).is_none());
+        assert_eq!(w.claim("m", "agent").unwrap()["job_id"], "c-save");
+        // A save takes a save's answer only, naming its folder and files.
+        let empty = SaveResult { folder: " ".into(), files: vec![], stations: vec![] };
+        assert_eq!(w.deliver_save("a-save", "agent", empty).unwrap_err(), "a save names its folder and lists the files it wrote");
+        assert_eq!(w.deliver("a-save", "agent", Ok(result(0, vec![]))).unwrap_err(), "this is a save job: send what it saved");
+        assert_eq!(w.deliver_save("z-reg", "agent", saved("/x")).unwrap_err(), "this is not a save job");
+        assert!(w.deliver_save("a-save", "agent", saved("/x")).is_ok());
+    }
+
+    fn saved(folder: &str) -> SaveResult {
+        SaveResult {
+            folder: folder.into(),
+            files: vec![SavedFile { path: "manifest.json".into(), bytes: 2, sha256: "00".into() }],
+            stations: vec![SavedStation { station: 1, scan_id: SCAN0.into(), copc: Some("stations/station-01.copc.laz".into()), point_count: Some(9), kept: false, note: None }],
+        }
+    }
+
+    fn registered(b: &Bridge) {
+        use crate::register::{Registration, StationPose};
+        let reg = Registration {
+            project_id: PID.into(), frame_scan_id: Some(SCAN0.into()), pairs: vec![], walls: vec![], summary: String::new(), updated_at: String::new(),
+            stations: vec![StationPose { scan_id: SCAN0.into(), station: 1, pose: Some(Pose { turn_deg: 0.0, xyz_m: [0.0; 3] }), audit: None }],
+        };
+        b.st.inner.lock().unwrap().registrations.insert(PID.into(), reg);
+    }
+
+    fn logged(b: &Bridge, needle: &str) -> bool {
+        b.st.inner.lock().unwrap().log.iter().any(|e| e.text.contains(needle))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_waits_for_a_laptop_and_the_bridge_keeps_what_it_saved() {
+        let b = Bridge::new().await;
+        let path = format!("/v1/projects/{PID}/save");
+        let (code, e) = b.call("POST", &path, Some(AGENT), None).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{e}");
+        assert_eq!(b.call("POST", &path, Some(VIEWER), None).await.0, StatusCode::FORBIDDEN);
+        registered(&b);
+        let (code, job) = b.call("POST", &path, Some(AGENT), None).await;
+        assert_eq!(code, StatusCode::ACCEPTED, "{job}");
+        assert_eq!((job["kind"].as_str(), job["state"].as_str(), job["phase"].as_str()), (Some("save"), Some("running"), Some("waiting for the laptop")));
+        assert!(logged(&b, "Saving the project to the laptop (asked). No laptop is connected: it is saved when one connects."));
+        let id = job["job_id"].as_str().unwrap();
+        // Asking again while it waits is the same save.
+        assert_eq!(b.call("POST", &path, Some(AGENT), None).await.1["job_id"], id);
+        let (_, status) = b.call("GET", &path, Some(VIEWER), None).await;
+        assert_eq!((status["job"]["job_id"].as_str(), status["last"].is_null()), (Some(id), true));
+        // A laptop connects, says what it holds, and takes the save with what it needs.
+        let (code, body) = b.call("POST", "/v1/work/claim", Some(AGENT), Some(json!({"worker": "laptop", "holds": [SCAN0, "../escape"]}))).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!((body["job_id"].as_str(), body["kind"].as_str()), (Some(id), Some("save")));
+        assert_eq!(body["stations"][0]["scan_id"], SCAN0);
+        assert_eq!(body["stations"][0]["trusted"], true);
+        assert_eq!(body["frame_station"], 1);
+        assert_eq!(body["registration"]["project_id"], PID);
+        assert!(!body["folder"].as_str().unwrap().contains('/'), "{body}");
+        assert_eq!(b.st.work.lock().unwrap().held(), HashSet::from([SCAN0.to_string()]));
+        assert!(logged(&b, "Worker laptop took the save"));
+        b.wait_for(&format!("/v1/jobs/{id}"), OPERATOR, 5.0, |j| j["phase"] == "saving on laptop").await;
+        // It uploads nothing, and its answer must name the folder and files.
+        assert_eq!(put_merged(&b, id, AGENT, merged_bytes()).await, StatusCode::CONFLICT);
+        let bad = json!({"folder": "", "files": [], "stations": []});
+        assert_eq!(b.call("POST", &format!("/v1/work/{id}/result"), Some(AGENT), Some(bad)).await.0, StatusCode::CONFLICT);
+        let r = serde_json::to_value(saved("/Users/crew/X9 Projects/yard-p1")).unwrap();
+        assert_eq!(b.call("POST", &format!("/v1/work/{id}/result"), Some(AGENT), Some(r.clone())).await.0, StatusCode::NO_CONTENT);
+        let j = wait_job(&b, id, 5.0).await;
+        assert_eq!(j["state"], "succeeded", "{j}");
+        assert_eq!((j["result"]["worker"].as_str(), j["result"]["files"].as_u64()), (Some("laptop"), Some(1)));
+        assert!(logged(&b, "Saved the project on laptop: /Users/crew/X9 Projects/yard-p1 (1 of 1 stations in the project frame, 0.0 GB)"));
+        let (_, status) = b.call("GET", &path, Some(VIEWER), None).await;
+        assert_eq!((status["last"]["folder"].as_str(), status["job"].is_null()), (Some("/Users/crew/X9 Projects/yard-p1"), true));
+        // A late answer is refused; the record outlives a restart.
+        assert_eq!(b.call("POST", &format!("/v1/work/{id}/result"), Some(AGENT), Some(r)).await.0, StatusCode::CONFLICT);
+        b.st.inner.lock().unwrap().saves.clear();
+        assert_eq!(b.st.load_saves(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_that_fails_or_is_cancelled_says_so_and_leaves_nothing_on_offer() {
+        let b = Bridge::new().await;
+        registered(&b);
+        let path = format!("/v1/projects/{PID}/save");
+        let id = b.call("POST", &path, Some(AGENT), None).await.1["job_id"].as_str().unwrap().to_string();
+        assert_eq!(b.call("POST", "/v1/work/claim", Some(AGENT), Some(json!({"worker": "laptop"}))).await.1["job_id"], id.as_str());
+        b.call("POST", &format!("/v1/work/{id}/fail"), Some(AGENT), Some(json!({"error": "the disk is full"}))).await;
+        let j = wait_job(&b, &id, 5.0).await;
+        assert_eq!((j["state"].as_str(), j["problem"]["code"].as_str()), (Some("failed"), Some("save_failed")), "{j}");
+        assert!(logged(&b, "The save failed (laptop: the disk is full). Nothing on the Pi was dropped for it; ask for the save again once fixed."));
+        // Cancelled while it waits for a laptop.
+        let id = b.call("POST", &path, Some(AGENT), None).await.1["job_id"].as_str().unwrap().to_string();
+        b.call("POST", &format!("/v1/jobs/{id}/cancel"), Some(OPERATOR), None).await;
+        assert_eq!(wait_job(&b, &id, 5.0).await["state"], "cancelled");
+        assert!(b.st.work.lock().unwrap().offers.is_empty());
+        assert_eq!(b.call("POST", "/v1/work/claim", Some(AGENT), Some(json!({"worker": "laptop"}))).await.0, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_whose_laptop_goes_quiet_is_offered_again() {
+        let b = Bridge::new().await;
+        let st = b.st.clone();
+        let task = tokio::spawn(async move {
+            let took = std::sync::Mutex::new(Vec::new());
+            let r = offer_save(&st, put_save(&st, "job_s", PID), "job_s", PID, Duration::from_secs(1), &|| false, &|w| took.lock().unwrap().push(w.map(str::to_string))).await;
+            (r, took.into_inner().unwrap())
+        });
+        let first = loop {
+            if let Some(j) = b.st.work.lock().unwrap().claim("laptop", "agent") {
+                break j;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(first["job_id"], "job_s");
+        // Progress keeps it; silence loses it.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        b.st.work.lock().unwrap().holds("job_s", "agent").unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(!logged(&b, "went quiet"));
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(logged(&b, "The save on laptop went quiet for 1 s; it is offered again"));
+        assert_eq!(b.st.work.lock().unwrap().holds("job_s", "agent").unwrap_err(), "this job was not claimed with your token");
+        assert_eq!(b.st.work.lock().unwrap().claim("desk", "operator").unwrap()["job_id"], "job_s");
+        b.st.work.lock().unwrap().deliver_save("job_s", "operator", saved("/d")).unwrap();
+        let (r, took) = task.await.unwrap();
+        assert!(matches!(r, SaveOffered::Done(_, ref w) if w == "desk"));
+        assert_eq!(took[..2], [Some("laptop".to_string()), None]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signing_off_saves_the_project_to_the_laptop() {
+        let b = Bridge::new().await;
+        registered(&b);
+        let m: crate::mission::Mission = serde_json::from_value(json!({
+            "mission_id": "m1", "project_id": PID, "goal": "Measure the yard", "kind": "custom", "done_when": "measured",
+            "state": "ready", "created_by": "crew", "created_at": "2026-11-11T10:00:00Z", "targets": []})).unwrap();
+        b.st.inner.lock().unwrap().missions.insert(PID.into(), m);
+        let (code, body) = b.call("POST", &format!("/v1/projects/{PID}/mission/sign-off"), Some(OPERATOR), None).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert!(logged(&b, "Saving the project to the laptop (after the sign-off). No laptop is connected"));
+        let (_, status) = b.call("GET", &format!("/v1/projects/{PID}/save"), Some(VIEWER), None).await;
+        assert_eq!(status["job"]["phase"], "waiting for the laptop");
     }
 }
