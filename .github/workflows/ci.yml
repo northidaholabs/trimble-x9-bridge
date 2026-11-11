@@ -52,7 +52,10 @@ jobs:
           node-version: "22"
       - run: cargo build --locked -p x9-bridge -p x9-mock
       - run: npm ci
-      - run: npx playwright install --with-deps chromium
+      # The browser's system packages come from Ubuntu's mirrors through apt.
+      # When the runner can't reach them, install the browser alone: the runner
+      # image ships Google Chrome, so the libraries it needs are already there.
+      - run: npx playwright install --with-deps chromium || npx playwright install chromium
       - run: npx playwright test
       - if: always()
         # The web UI's JavaScript coverage, as a table in the job summary.

@@ -1285,7 +1285,8 @@ another agent gets `403 forbidden`.
 ## Web UI
 
 The bridge serves a small web app at `/ui/` (and redirects `/` there): the
-same API, for the person in the field on the laptop.
+same API, for the person in the field. In the standard kit the browser is the
+laptop's.
 With an agent, the person doesn't need it: the MCP server asks them for the
 visit's permission and the sign-off in the chat (see the TrimbleX9-mcp README,
 "The person, in the chat"). The web UI is for looking (the 3D viewer, coverage,
@@ -1305,6 +1306,10 @@ API call still needs a token; the page itself loads without one.
 | Scanner on USB to the bridge computer; the bridge computer runs its own Wi-Fi hotspot | The hotspot | `http://<hotspot address>:8795/ui/` (NetworkManager's shared hotspot is `10.42.0.1`) |
 | Scanner on its own Wi-Fi; the bridge computer joined it | The scanner's Wi-Fi | `http://<bridge computer's address on that network>:8795/ui/`, or its mDNS name if the network passes mDNS |
 | At the desk | The same LAN as the bridge computer | `http://<its LAN address or mDNS name>:8795/ui/` |
+
+A phone is a browser like any other. On the scanner's Wi-Fi it opens the
+Pi's address there (the third row); the field-kit build does not set that up
+or check it yet. The page is laid out for a phone's width.
 
 The traffic is plain HTTP, so it is only as private as the network it
 crosses: use it on the scanner's or hotspot's own WPA2 network, not an open
