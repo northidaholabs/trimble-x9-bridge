@@ -48,7 +48,17 @@ pub enum State {
     SignedOff,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Who bound a list line to its wall face, and how it reached the bridge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Bound {
+    pub by: String,
+    pub via: String,
+    pub at: String,
+    /// The face as the person named it: a wall id (`w3`) or "drawn".
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Target {
     pub target_id: String,
     pub name: String,
@@ -77,6 +87,17 @@ pub struct Target {
     /// The plumb tolerance the job uses: an answer says within or outside.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tolerance: Option<Tolerance>,
+    /// A list line's face, bound by a person (`list.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound: Option<Bound>,
+    /// An `opening` line: its match to an opening found on its face, and the verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening: Option<crate::openings::LineCheck>,
+    /// Who declined it, and how that reached the bridge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_via: Option<String>,
     #[serde(default)]
     pub updated_at: String,
 }
@@ -104,6 +125,12 @@ pub struct Mission {
     /// How the sign-off reached the bridge ("asked in the chat", "relayed by the agent: …", "web UI").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_via: Option<String>,
+    /// The list the mission answers, when it was made from one (`list.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<crate::list::List>,
+    /// The records of the list's earlier revisions, as they stood.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub earlier: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +231,8 @@ impl Mission {
             signed_off_by: None,
             signed_off_at: None,
             confirmed_via: None,
+            list: None,
+            earlier: vec![],
         }
     }
 
@@ -221,8 +250,8 @@ impl Mission {
         let mut next = self.targets.clone();
         for u in ups {
             let id = u.target_id.trim();
-            if id.is_empty() || id.len() > 64 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-                return Err(format!("target_id {:?}: 1–64 letters, digits, '-' or '_'", u.target_id));
+            if id.is_empty() || id.len() > 64 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+                return Err(format!("target_id {:?}: 1–64 letters, digits, '-', '_' or '.'", u.target_id));
             }
             let i = match next.iter().position(|t| t.target_id == id) {
                 Some(i) => i,
@@ -230,9 +259,7 @@ impl Mission {
                     if next.len() >= MAX_TARGETS {
                         return Err(format!("at most {MAX_TARGETS} targets"));
                     }
-                    next.push(Target { target_id: id.into(), name: String::new(), kind: String::new(), status: Status::Open,
-                                       stations: vec![], measurement_id: None, note: String::new(), face: None, geometry: None,
-                                       question: None, tolerance: None, updated_at: String::new() });
+                    next.push(Target { target_id: id.into(), ..Default::default() });
                     next.len() - 1
                 }
             };
@@ -297,6 +324,9 @@ impl Mission {
             }
             if t.question.is_some() && u.status == Some(Status::Covered) {
                 return Err(format!("target {id}: a question target is covered by its answer (scanner_ask), not by hand"));
+            }
+            if t.opening.is_some() && u.status == Some(Status::Covered) {
+                return Err(format!("target {id}: an opening line is covered by its answer (scanner_count), not by hand"));
             }
             judge(t, geo)?;
             t.refresh_said();
@@ -445,7 +475,8 @@ fn judge(t: &mut Target, geo: &Geo) -> Result<(), String> {
     let scans: Vec<String> = v["stations"].as_array().map(|a| a.iter().filter_map(|s| s["scan_id"].as_str().map(str::to_string)).collect()).unwrap_or_default();
     let share = v["seen_share"].as_f64().unwrap_or(0.0);
     t.geometry = Some(v);
-    if t.question.is_some() {
+    // A question, or an opening line, is covered by its answer, not by coverage.
+    if t.question.is_some() || t.opening.is_some() {
         return Ok(());
     }
     match t.status {

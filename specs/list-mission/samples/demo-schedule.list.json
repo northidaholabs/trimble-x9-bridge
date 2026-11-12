@@ -1,0 +1,107 @@
+{
+  "format": "nil-list",
+  "version": 0,
+  "list_id": "schedule",
+  "title": "Door and window schedule, sample",
+  "revision": "A",
+  "source": {
+    "kind": "schedule",
+    "name": "Sample written for the model; no building has these openings."
+  },
+  "parties": [
+    {
+      "id": "contractor",
+      "role": "contractor"
+    }
+  ],
+  "lines": [
+    {
+      "line_id": "W1",
+      "group": "Openings",
+      "activity": "Window W1",
+      "requirement": "Rough opening 914.4 × 1219.2 mm, ±1/4\"",
+      "method": "dimensional",
+      "evidence": "measured",
+      "question": {
+        "kind": "opening",
+        "opening": {
+          "type": "window",
+          "width_mm": 914.4,
+          "height_mm": 1219.2
+        }
+      },
+      "tolerance": {
+        "words": "±1/4\"",
+        "max_mm": 6.4
+      },
+      "record": "The opening's size, with the face's picture",
+      "place_hint": "Front"
+    },
+    {
+      "line_id": "W2",
+      "group": "Openings",
+      "activity": "Window W2",
+      "requirement": "Rough opening 914.4 × 1219.2 mm, ±1/4\"",
+      "method": "dimensional",
+      "evidence": "measured",
+      "question": {
+        "kind": "opening",
+        "opening": {
+          "type": "window",
+          "width_mm": 914.4,
+          "height_mm": 1219.2
+        }
+      },
+      "tolerance": {
+        "words": "±1/4\"",
+        "max_mm": 6.4
+      },
+      "record": "The opening's size, with the face's picture",
+      "place_hint": "Front"
+    },
+    {
+      "line_id": "W3",
+      "group": "Openings",
+      "activity": "Window W3",
+      "requirement": "Rough opening 609.6 × 914.4 mm, ±1/4\"",
+      "method": "dimensional",
+      "evidence": "measured",
+      "question": {
+        "kind": "opening",
+        "opening": {
+          "type": "window",
+          "width_mm": 609.6,
+          "height_mm": 914.4
+        }
+      },
+      "tolerance": {
+        "words": "±1/4\"",
+        "max_mm": 6.4
+      },
+      "record": "The opening's size, with the face's picture",
+      "place_hint": "Side"
+    },
+    {
+      "line_id": "D1",
+      "group": "Openings",
+      "activity": "Door D1",
+      "requirement": "Rough opening 914.4 × 2032 mm, ±1/4\"",
+      "method": "dimensional",
+      "evidence": "measured",
+      "question": {
+        "kind": "opening",
+        "opening": {
+          "type": "door",
+          "width_mm": 914.4,
+          "height_mm": 2032.0
+        }
+      },
+      "tolerance": {
+        "words": "±1/4\"",
+        "max_mm": 6.4
+      },
+      "record": "The opening's size, with the face's picture",
+      "place_hint": "Front"
+    }
+  ]
+}

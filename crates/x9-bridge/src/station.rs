@@ -240,7 +240,7 @@ impl Canvas {
             }
         }
     }
-    fn rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, c: [u8; 3], width: f32) {
+    pub(crate) fn rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, c: [u8; 3], width: f32) {
         self.line((x0, y0), (x1, y0), c, width);
         self.line((x1, y0), (x1, y1), c, width);
         self.line((x1, y1), (x0, y1), c, width);

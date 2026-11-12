@@ -20,7 +20,7 @@
       "required": ["kind"],
       "additionalProperties": false,
       "properties": {
-        "kind": { "enum": ["itp", "punch_list", "inspection_form", "closeout_list", "other"] },
+        "kind": { "enum": ["itp", "punch_list", "inspection_form", "closeout_list", "schedule", "other"] },
         "name": { "type": "string" },
         "reference": { "type": "string" }
       }
@@ -85,7 +85,7 @@
       "required": ["line_id", "activity", "requirement", "method", "evidence", "question"],
       "additionalProperties": false,
       "properties": {
-        "line_id": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)*$", "description": "The ITP item number. Stable across revisions; a record answers by it." },
+        "line_id": { "type": "string", "pattern": "^[A-Za-z0-9]+([.-][A-Za-z0-9]+)*$", "maxLength": 32, "description": "The ITP item number (1.2), or a schedule's mark (W1, D-3). Stable across revisions; a record answers by it." },
         "group": { "type": "string", "description": "The ITP section: a trade or a stage." },
         "activity": { "type": "string", "minLength": 1, "description": "What was built or what is inspected." },
         "requirement": { "type": "string", "minLength": 1, "description": "The acceptance criterion, in the list's own words." },
@@ -101,8 +101,22 @@
           "additionalProperties": false,
           "properties": {
             "kind": { "enum": ["plumb", "flatness", "height", "opening", "clearance", "low_spots", "map", "photo", "statement"] },
-            "thresholds": { "type": "object", "additionalProperties": { "type": "number" }, "description": "Limits that define what is counted, when the requirement is a count or a listing." }
-          }
+            "thresholds": { "type": "object", "additionalProperties": { "type": "number" }, "description": "Limits that define what is counted, when the requirement is a count or a listing." },
+            "opening": {
+              "type": "object",
+              "description": "With kind opening: the opening the line expects, as a door and window schedule gives it (specs/construction-counts.md, part A). The line's tolerance is then max_mm, the allowance either way on width and height.",
+              "required": ["type", "width_mm", "height_mm"],
+              "additionalProperties": false,
+              "properties": {
+                "type": { "enum": ["window", "door", "opening"] },
+                "width_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 20000 },
+                "height_mm": { "type": "number", "exclusiveMinimum": 0, "maximum": 20000 }
+              }
+            }
+          },
+          "allOf": [
+            { "if": { "properties": { "kind": { "const": "opening" } } }, "then": { "required": ["opening"] }, "else": { "not": { "required": ["opening"] } } }
+          ]
         },
         "tolerance": { "$ref": "#/$defs/tolerance" },
         "points": {

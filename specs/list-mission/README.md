@@ -1,7 +1,8 @@
 # The list model
 
-The formats behind [`../list-mission.md`](../list-mission.md), a sample, and
-a checker. Draft; nothing in the bridge reads these yet.
+The formats behind [`../list-mission.md`](../list-mission.md), samples, and
+a checker. The bridge reads lists in this format, and a door and window
+schedule into it (`crates/x9-bridge/src/list.rs`), and writes records in it.
 
 The model refuses a person nothing that is theirs to decide. It refuses a
 record that is not whole, prints more than it has, or does not name who
@@ -15,7 +16,9 @@ going past what the bridge said takes one sentence of why.
 | `samples/demo-closeout.list.json` | Eight lines. 1.1 to 4.1 are the missions on the public visit page; 5.1 to 6.1 are illustrative and say so |
 | `samples/demo-closeout.csv` | The same list as a spreadsheet with an ITP's columns |
 | `samples/demo-closeout.record.json` | Only what the visit page gives, quoted. No signatures: nobody signed a line |
-| `check.py` | Both schemas, the rules a schema cannot say, and the spreadsheet against the list. Then sixteen changes to a copy of the record: ten things the record may not say, each refused, and six things a person may do, each kept and shown. Then three cases of acceptance of the work |
+| `samples/demo-schedule.csv` | A door and window schedule, written for the model: four openings |
+| `samples/demo-schedule.list.json` | The list the bridge reads from it, one `opening` line per mark. The bridge's tests hold the two together |
+| `check.py` | Both schemas, the rules a schema cannot say, the spreadsheet against the list, and the schedule against its list. Then sixteen changes to a copy of the record: ten things the record may not say, each refused, and six things a person may do, each kept and shown. Then three cases of acceptance of the work |
 
 ```bash
 python3 specs/list-mission/check.py          # needs the jsonschema package
@@ -39,13 +42,16 @@ it:
 
 ## Against the bridge at 0.15.0
 
+(Kept as it was found. The next version reads lists and writes records; see the
+spec's status line for what is built.)
+
 | Model | Bridge today | Gap |
 | --- | --- | --- |
 | Line | `Target`: `target_id`, `name`, `kind`, `note` | `requirement`, `reference`, `method`, `record` are not held |
 | `tolerance` | `Target.tolerance`, the same shape | None |
 | `plumb`, `flatness` | `Question` with a verdict, a reading and `said` | Live |
 | `height`, `low_spots`, `map` | `x9-bridge analyze` and `register`, from finished scans | Not questions a mission can ask |
-| `opening` | The window recipe's `measureOpening` | Not in a mission |
+| `opening` | The window recipe's `measureOpening`; from 0.19.0 the count of openings on a wall face | Live, for a schedule's lines |
 | `photo`, `statement` | Nothing | Not built |
 | `status` | `Verdict` and the target's `Status` | Names only |
 | `conformance` | `within` and `allowed_mm` inside `said` | No field of its own |

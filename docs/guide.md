@@ -867,7 +867,7 @@ curl -s -X POST -H "$OPERATOR" -d '{"confirmed_via":"web UI"}' $B/projects/$PROJ
 | Part | Rules |
 | --- | --- |
 | Mission | `goal` (the person's words, 1–300 characters), `kind` `exterior`, `windows`, `room` or `custom`, `done_when` (criteria, 1–600). One per project; a new one replaces it. Any role but `viewer` |
-| Targets | Upserted by `target_id` (letters, digits, `-`, `_`), up to 200. `status` `open`, `covered` (names its scans, which must be in the project), `measured` (also a `measurement_id`) or `declined` (says why in `note`) |
+| Targets | Upserted by `target_id` (letters, digits, `-`, `_`, `.`), up to 200. `status` `open`, `covered` (names its scans, which must be in the project), `measured` (also a `measurement_id`) or `declined` (says why in `note`) |
 | Ready | `POST …/ready` with a summary: `409 conflict` while any target is open, naming them; refused on an empty ledger. A later change to the ledger sends the mission back to active |
 | Sign-off | `POST …/sign-off`, operator only, optional `confirmed_via` (how the person said it). The mission is then done: further changes are `409` |
 | Wall faces | A target may name a wall: `wall_id` (from the registration) or `face` `{from, to}` (project frame, m). Once the project is registered the bridge judges it and keeps `geometry`: an open face seen over 80% of its length becomes `covered` with the stations that saw it; `covered` is refused (`400`) while less is seen. After every registration the faces are judged again (a ready mission whose face opens goes back to active) |
@@ -964,6 +964,43 @@ each recomputed from the final registration and flagged when it moved more
 than 5 mm from the answer given on site. The report applies the same gate
 once to every detected wall: a wall that isn't an answer shows its verdict
 instead of numbers, in `report.html`, `walls.csv` and the wall image.
+
+### A mission from a list, and counting openings
+
+A job often comes with a list: an inspection and test plan, or a door and
+window schedule. Loading one makes the project's mission, one ledger target
+per line (`specs/list-mission.md`). A door and window schedule's lines ask
+for each opening's size, and the bridge finds and measures the openings on
+the walls (`specs/construction-counts.md`, part A).
+
+```bash
+curl -s -X PUT -H "$H" -H 'Content-Type: text/csv' --data-binary @schedule.csv "$B/projects/$PROJECT/list?revision=A"
+curl -s -X POST -H "$OPERATOR" -d '{"place":"North wall","wall_id":"w3","confirmed_via":"web UI"}' $B/projects/$PROJECT/list/bind
+curl -s -X POST -H "$H" $B/projects/$PROJECT/count
+# {"say":"5 openings found, 4 measured. North wall (w3): 5 openings (92% seen). 0 of 6 lines answered.",
+#  "faces":[{"face_id":"f1","openings":[{"opening_id":"f1-1","looks_like":"window","said":"915 × 1218 mm …"},…],…}],
+#  "proposed":[{"line_id":"W1","opening_id":"f1-1","why":"window f1-1, measured 915 × 1218 mm against 914 × 1219"}],…}
+curl -s -X POST -H "$OPERATOR" -d '{"matches":[{"line_id":"W1","opening_id":"f1-1"}],"confirmed_via":"web UI"}' $B/projects/$PROJECT/count/matches
+curl -s -H "$H" $B/projects/$PROJECT/record
+```
+
+| Step | What happens |
+| --- | --- |
+| The list | `PUT …/list` takes a list as JSON (`specs/list-mission/list.schema.json`), or a schedule as CSV with the columns `mark`, `type` (window, door, opening), `width`, `height`, `tolerance`, `wall`. Sizes carry their unit (`914 mm`, `36 in`, `3'-0"`) unless the column names it (`width_mm`, `width_in`); a tolerance is one figure either way (`±1/4"`, `6 mm`). A missing size, an unknown type or a mark twice is refused with the row. Each mark is a line; its id is the mark. Any role but `viewer` |
+| Revisions | `?revision=B` for a schedule (a list carries its own). A new revision keeps the place and answer of every line whose requirement, question and tolerance did not change; the others start open. The record of the revision it replaces is kept. The same revision with other lines is refused; another list on a project whose mission runs is `409` |
+| Binding | A person binds lines to the wall they are on: `POST …/list/bind` with `lines` (ids) or `place` (the list's words for the wall), and `wall_id` or `from`/`to`. Operator only; the agent proposes. A plumb line is then asked on its face as a question target; an opening line is counted there |
+| The count | `POST …/count` reads every trusted station that saw a bound face, once each, and finds the openings: gaps at least 40 × 40 cm with wall round them (a door's on the floor) that the stations saw through. Each is measured: width over the middle 60% of its rows, height over the middle 60% of its columns, with an uncertainty from the point spacing at its edges and the spread between rows. A gap something stood in front of, or whose outline runs into a stretch no station saw, doesn't fit, with the reason. A recess (a surface close behind it and nothing seen beyond) isn't counted. Each face gets a picture (`…/count/{face}/image`) with the openings numbered. Faces under 80% seen count "at least" |
+| Matching | The bridge proposes which opening is which line, by size and type; a person confirms (`POST …/count/matches`, operator only; `opening_id` null undoes one). An opening no line takes on a fully matched face is listed as not on the schedule |
+| Verdicts | `not_yet` while the line's face is under 80% seen; `does_not_fit` with the reason; or an answer with its size and a conformance: `conforming` when both sides are within the tolerance by more than their uncertainty, `non_conforming` when either is outside it by more than that, `neutral` in between, `not_applicable` with no tolerance. After every registration the faces are counted again and the matches found again by position |
+| The record | `GET …/record`: each line's status, conformance, evidence (the reading, stations, picture) and who bound it, in `specs/list-mission/record.schema.json`'s shape |
+
+Built so far: the list, the record, binding, plumb and flatness lines
+through questions, and opening lines through the count. Lines answered by a
+picture or a statement, signatures and acceptance are not built yet; those
+lines stay open and say so. The count runs on the Pi; the laptop doesn't
+take counts yet. Counting hasn't been checked against a building whose
+openings were taped (`construction-counts.md` criterion 3), so its counts are
+for trying out, not for handing to anyone.
 
 ### Registration: every station in one frame
 
@@ -1463,7 +1500,8 @@ $BRIDGE_DATA/
   anything else is `404`, so a path cannot leave the cache directory.
 
 Kept across restarts, in the data directory: grants (`grants.json`), missions
-(`missions.json`), registrations (`registrations.json`, `registration/`).
+(`missions.json`, with a list mission's list, matches and verdicts), registrations
+(`registrations.json`, `registration/`).
 
 What is kept only in memory and lost on restart:
 
@@ -1472,7 +1510,9 @@ What is kept only in memory and lost on restart:
 - the field log;
 - export metadata (the files stay on disk but cannot be fetched through the
   API);
-- per-scan `created_at`, `timings` and `window`.
+- per-scan `created_at`, `timings` and `window`;
+- the latest count of openings and its pictures (count again after a
+  restart; the matches and verdicts are in the mission).
 
 Projects and scans are always read live from the scanner, so they survive a
 restart.
