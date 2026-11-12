@@ -1258,22 +1258,10 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
 
 /// Every point of a station file at full resolution: `(scanner frame,
 /// project frame, range)`, past half a metre. Returns how many were decoded.
-pub(crate) fn station_points(f: &std::path::Path, pose: &Pose, mut each: impl FnMut([f32; 3], [f64; 3], f64)) -> anyhow::Result<usize> {
-    let t = trimble_tzf::Tzf::open(f).with_context(|| format!("opening {}", f.display()))?;
-    let pts = t.grid_points().with_context(|| format!("{}: decoding", f.display()))?;
-    for g in &pts {
-        let p = [g.point.x, g.point.y, g.point.z];
-        if !p.iter().all(|v| v.is_finite()) {
-            continue;
-        }
-        let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt() as f64;
-        if r < 0.5 {
-            continue;
-        }
-        let w = pose.apply(p);
-        each(p, [w[0] as f64, w[1] as f64, w[2] as f64], r);
-    }
-    Ok(pts.len())
+pub(crate) fn station_points(f: &std::path::Path, pose: &Pose, each: impl FnMut([f32; 3], [f64; 3], f64)) -> anyhow::Result<usize> {
+    let s = crate::points::get(f)?;
+    s.walk(pose, each);
+    Ok(s.total())
 }
 
 /// A face measured as `run` measures a wall, kept for drawing once the gate
@@ -1351,19 +1339,25 @@ const FIT_MAGIC: &[u8; 4] = b"XFF1";
 pub fn measure_faces_with(walls: &[Wall], files: &[(u16, Pose, std::path::PathBuf)], opts: &Opts, threads: usize) -> anyhow::Result<Vec<FaceFit>> {
     let xy: HashMap<u16, [f64; 2]> = files.iter().map(|(n, p, _)| (*n, [p.xyz_m[0], p.xyz_m[1]])).collect();
     let mut grids: Vec<WallGrid> = walls.iter().map(|w| WallGrid::new(w, &w.seen_by.iter().filter_map(|s| xy.get(s).copied()).collect::<Vec<_>>())).collect();
-    for (n, pose, f) in files {
-        let mine: Vec<usize> = (0..walls.len()).filter(|&k| walls[k].seen_by.contains(n)).collect();
-        if mine.is_empty() {
-            continue;
-        }
-        station_points(f, pose, |_, w, r| {
+    // Only the stations that saw a wall, decoded several at once on the
+    // laptop, and added in the files' order so every sum is as before.
+    let used: Vec<(Vec<usize>, &Pose, &std::path::Path)> = files
+        .iter()
+        .map(|(n, pose, f)| ((0..walls.len()).filter(|&k| walls[k].seen_by.contains(n)).collect::<Vec<usize>>(), pose, f.as_path()))
+        .filter(|(mine, _, _)| !mine.is_empty())
+        .collect();
+    let paths: Vec<&std::path::Path> = used.iter().map(|u| u.2).collect();
+    crate::points::each_station(&paths, |i, p| {
+        let (mine, pose, _) = &used[i];
+        p.walk(pose, |_, w, r| {
             if r <= WALL_RANGE_M {
-                for &k in &mine {
+                for &k in mine {
                     grids[k].add(w);
                 }
             }
-        })?;
-    }
+        });
+        Ok(())
+    })?;
     let fit = |grid: &WallGrid| measure_wall(grid, None, opts, &format!("wall-{}.png", grid.wall.wall_id));
     let threads = threads.clamp(1, grids.len().max(1));
     if threads == 1 {

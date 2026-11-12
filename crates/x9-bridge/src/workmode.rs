@@ -17,12 +17,25 @@
 //! The laptop is where the data lands: a save job writes the project to a
 //! folder under `--save-dir`, one per project (`save`).
 //!
-//!   x9-bridge worker [--bridge URL] [--token-file FILE] [--name NAME] [--cache DIR] [--cache-gb N] [--save-dir DIR]
+//!   x9-bridge worker [--bridge URL] [--token-file FILE] [--name NAME] [--cache DIR] [--cache-gb N] [--mem-gb N] [--save-dir DIR]
 //!
 //! Defaults: the bridge over the laptop cable (http://10.55.0.1:8795), the
 //! token from `X9_WORKER_TOKEN` or ~/.config/x9-worker/token (an agent or
-//! operator token), this computer's name, ~/.cache/x9-worker, 20 GB, and
+//! operator token), this computer's name, ~/.cache/x9-worker, 20 GB on disk,
+//! 3 GB in memory (or a quarter of the computer's memory, if less), and
 //! "~/X9 Projects".
+//!
+//! Decoded stations are kept in memory up to `--mem-gb` (0 keeps none), the
+//! least recently used dropped first: each station as it registers, and
+//! each one a check or a count decodes. A question asked after a re-check
+//! then decodes no station again. A kept station is known by its file's
+//! path, length and inode, so marking a scan file used again (as the disk
+//! cache does) keeps it. A file counts as new only when it is renamed into
+//! place, which is the only way the worker writes scan files; a file
+//! rewritten in place, or deleted and made again, at the same length could
+//! keep its old points.
+//! The stations a check or count needs are decoded up to four at a time
+//! (`points.rs`).
 
 use crate::register::{audit, prepare, register_all, walls, AuditCache, Cloud, Merged, Pair, Prepared};
 use crate::work::WorkResult;
@@ -54,6 +67,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     let mut name = hostname();
     let mut cache = PathBuf::from(&home).join(".cache/x9-worker");
     let mut cache_gb: f64 = 20.0;
+    let mut mem_gb: Option<f64> = None;
     let mut save_dir = PathBuf::from(&home).join("X9 Projects");
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -64,8 +78,9 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
             "--name" => name = val()?.clone(),
             "--cache" => cache = PathBuf::from(val()?),
             "--cache-gb" => cache_gb = val()?.parse().ok().filter(|g: &f64| *g > 0.0).context("--cache-gb: a number of gigabytes")?,
+            "--mem-gb" => mem_gb = Some(val()?.parse().ok().filter(|g: &f64| g.is_finite() && *g >= 0.0).context("--mem-gb: a number of gigabytes, 0 for none")?),
             "--save-dir" => save_dir = PathBuf::from(val()?),
-            _ => bail!("usage: x9-bridge worker [--bridge URL] [--token-file FILE] [--name NAME] [--cache DIR] [--cache-gb N] [--save-dir DIR]"),
+            _ => bail!("usage: x9-bridge worker [--bridge URL] [--token-file FILE] [--name NAME] [--cache DIR] [--cache-gb N] [--mem-gb N] [--save-dir DIR]"),
         }
     }
     let token = match std::env::var("X9_WORKER_TOKEN") {
@@ -74,8 +89,14 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     };
     std::fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
     let http = reqwest::Client::builder().connect_timeout(Duration::from_secs(5)).build()?;
+    let mem_gb = mem_gb.unwrap_or_else(|| default_mem_gb(physical_memory()));
+    let threads = decode_threads();
+    // Tests set what is kept themselves, so a worker run inside them leaves
+    // it alone.
+    #[cfg(not(test))]
+    crate::points::configure((mem_gb * 1e9) as u64, threads);
     let mut w = Worker { http, base, token, name, cache, cache_bytes: (cache_gb * 1e9) as u64, prepared: HashMap::new(), checks: AuditCache::new(), save_dir };
-    eprintln!("x9-bridge worker {}: {} as {}, cache {}, saves to {}", crate::routes::VERSION, w.base, w.name, w.cache.display(), w.save_dir.display());
+    eprintln!("x9-bridge worker {}: {} as {}, cache {}, up to {mem_gb:.1} GB of stations in memory, decoding {threads} at once, saves to {}", crate::routes::VERSION, w.base, w.name, w.cache.display(), w.save_dir.display());
     let mut said_down = false;
     loop {
         match w.claim().await {
@@ -107,6 +128,28 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// The memory budget when none is given: 3 GB (about a 12-station survey),
+/// or a quarter of the computer's memory if that is less.
+fn default_mem_gb(physical: Option<u64>) -> f64 {
+    physical.map_or(3.0, |b| (b as f64 / 4.0 / 1e9).min(3.0))
+}
+
+/// The computer's memory, in bytes, where it can be read.
+fn physical_memory() -> Option<u64> {
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        let kb: u64 = s.lines().find(|l| l.starts_with("MemTotal:"))?.split_whitespace().nth(1)?.parse().ok()?;
+        return Some(kb * 1024);
+    }
+    let out = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Stations decoded at once: a full-resolution station needs about 0.5 GB
+/// while it decodes, so four at most.
+fn decode_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4)
 }
 
 fn hostname() -> String {
@@ -192,6 +235,9 @@ impl Worker {
             let f = trimble_tzf::Tzf::open(&t)?;
             let meta = f.scan_meta()?;
             let pts = f.grid_points()?;
+            // Keep its points too, so the check after this registration
+            // doesn't decode it again.
+            crate::points::remember(&t, &pts);
             Ok(Cloud::from_grid(&pts, crate::view::step_rad(&meta)))
         })
         .await;
@@ -366,7 +412,8 @@ impl Worker {
         let n = checks.len();
         let answered = checks.iter().filter(|c| c.fit.is_some()).count();
         self.post(&format!("/v1/work/{id}/result"), &serde_json::to_value(crate::work::CheckResult { checks })?).await?;
-        Ok(format!("{n} faces checked, {answered} with a reading"))
+        let (kept, bytes, _) = crate::points::kept();
+        Ok(format!("{n} faces checked, {answered} with a reading ({kept} stations in memory, {:.1} GB)", bytes as f64 / 1e9))
     }
 
     /// The station's preview from the bridge, for grey levels; none if it has none.
@@ -788,6 +835,49 @@ mod tests {
         std::fs::remove_dir_all(fx_pi).unwrap();
     }
 
+    // The guard keeps other tests from changing what is kept while this one
+    // runs, across its awaits; the tests that also take it are synchronous.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_question_on_the_laptop_decodes_no_station_again() {
+        use crate::ask::tests::{yard_bridge, PROJECT};
+        let _g = crate::points::CONFIGURED.lock().unwrap_or_else(|e| e.into_inner());
+        crate::points::configure(1 << 32, 4);
+        let (b, fx) = yard_bridge().await;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let laptop = run_checks(worker(&serve(&b).await, AGENT), stop.clone());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while b.st.work.lock().unwrap().workers().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the worker never showed up");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mine = |cache: &std::path::Path| crate::points::DECODED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|d| d.starts_with(cache)).count();
+        let first = crate::ask::on_bridge(&b.st, PROJECT, "east", "agent").await.unwrap();
+        assert_eq!(first["checked_on"], "laptop", "{first}");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let w = laptop.await.unwrap();
+        let cache = w.cache.clone();
+        let after_first = mine(&cache);
+        assert!(after_first > 0, "the first check decodes its stations");
+        // The disk cache marks the files used again on every job; the kept
+        // points must still be found.
+        stop.store(false, std::sync::atomic::Ordering::Relaxed);
+        let laptop = run_checks(w, stop.clone());
+        let second = crate::ask::on_bridge(&b.st, PROJECT, "east", "agent").await.unwrap();
+        assert_eq!(second["checked_on"], "laptop", "{second}");
+        for k in ["verdict", "reason", "stations", "face"] {
+            assert_eq!(second[k], first[k], "{k}");
+        }
+        assert_eq!(mine(&cache), after_first, "the second check decoded a station again");
+        let log: Vec<String> = b.st.inner.lock().unwrap().log.iter().map(|e| e.text.clone()).collect();
+        assert_eq!(log.iter().filter(|t| t.starts_with("Asked Target east (plumb)") && t.ends_with("checked on laptop")).count(), 2, "{log:#?}");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let w = laptop.await.unwrap();
+        crate::points::configure(0, 1);
+        std::fs::remove_dir_all(&w.cache).unwrap();
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_count_on_the_laptop_finds_what_the_pi_finds() {
         use crate::count::tests::{bound_facade, P};
@@ -1047,12 +1137,24 @@ mod tests {
         assert!(e.starts_with("usage: x9-bridge worker"), "{e}");
         let e = run(&args(&["--name", "laptop", "--bridge"])).await.unwrap_err().to_string();
         assert_eq!(e, "--bridge needs a value");
+        for bad in ["-1", "inf", "NaN", "lots"] {
+            let e = run(&args(&["--mem-gb", bad])).await.unwrap_err().to_string();
+            assert_eq!(e, "--mem-gb: a number of gigabytes, 0 for none", "{bad}");
+        }
         if token_in_env() {
             return;
         }
         let missing = std::env::temp_dir().join(crate::util::new_id("no-token"));
         let e = run(&args(&["--token-file", missing.to_str().unwrap()])).await.unwrap_err().to_string();
         assert!(e.starts_with("reading the token from"), "{e}");
+    }
+
+    #[test]
+    fn the_default_memory_budget_is_3_gb_or_a_quarter_of_the_computers_memory() {
+        assert_eq!(default_mem_gb(Some(16 << 30)), 3.0);
+        assert!((default_mem_gb(Some(8_000_000_000)) - 2.0).abs() < 1e-9);
+        assert_eq!(default_mem_gb(None), 3.0);
+        assert!(physical_memory().is_some_and(|b| b > 1 << 30), "this computer's memory can be read");
     }
 
     #[tokio::test]

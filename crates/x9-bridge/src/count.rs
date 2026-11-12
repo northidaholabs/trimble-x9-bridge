@@ -135,14 +135,19 @@ pub fn measure(specs: &[FaceSpec], files: &[(u16, Pose, PathBuf)]) -> anyhow::Re
             Some(Raster::new(&f.face, band, &xy))
         })
         .collect();
-    for (n, pose, path) in files {
-        let mine: Vec<usize> = (0..specs.len()).filter(|&k| rasters[k].is_some() && specs[k].stations.contains(n)).collect();
-        if mine.is_empty() {
-            continue;
-        }
+    // The stations that saw a face, decoded several at once on the laptop
+    // and added in the files' order.
+    let used: Vec<(Vec<usize>, &Pose, &std::path::Path)> = files
+        .iter()
+        .map(|(n, pose, path)| ((0..specs.len()).filter(|&k| rasters[k].is_some() && specs[k].stations.contains(n)).collect::<Vec<usize>>(), pose, path.as_path()))
+        .filter(|(mine, _, _)| !mine.is_empty())
+        .collect();
+    let paths: Vec<&std::path::Path> = used.iter().map(|u| u.2).collect();
+    crate::points::each_station(&paths, |i, p| {
+        let (mine, pose, _) = &used[i];
         let s = pose.xyz_m;
         let ds: Vec<f64> = mine.iter().map(|&k| rasters[k].as_ref().unwrap().standoff(s)).collect();
-        crate::analyze::station_points(path, pose, |_, w, range| {
+        p.walk(pose, |_, w, range| {
             if range <= crate::openings::RANGE_M {
                 for (j, &k) in mine.iter().enumerate() {
                     if ds[j] > 0.3 {
@@ -150,8 +155,9 @@ pub fn measure(specs: &[FaceSpec], files: &[(u16, Pose, PathBuf)]) -> anyhow::Re
                     }
                 }
             }
-        })?;
-    }
+        });
+        Ok(())
+    })?;
     Ok(specs
         .iter()
         .zip(rasters)

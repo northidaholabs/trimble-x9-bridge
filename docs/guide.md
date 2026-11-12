@@ -1150,7 +1150,18 @@ The laptop is where the data lands. The worker keeps every scan file it
 fetches (`--cache`, within `--cache-gb`, default 20) and each claim says
 which it holds, so when the Pi's own cache is full it drops the files the
 laptop holds once their stations are prepared; the scanner keeps every scan,
-so nothing is lost. When the mission is signed off, and whenever asked
+so nothing is lost.
+
+The worker also keeps decoded stations in memory, within `--mem-gb`
+(default 3 GB, or a quarter of the computer's memory if that is less; 0
+keeps none), the least recently used dropped first: each station as it
+registers, and each one a check or a count decodes. It decodes the stations
+a check or a count needs up to four at a time. A question asked after a
+re-check then decodes no station again. The points, and so every reading,
+are the same whether a station was kept or decoded afresh. The bridge on the
+Pi keeps none and decodes one station at a time.
+
+When the mission is signed off, and whenever asked
 (`POST /v1/projects/{id}/save`), the bridge offers a `save` job. The worker
 writes the project to a folder under `--save-dir` (default `~/X9 Projects`),
 one per project:

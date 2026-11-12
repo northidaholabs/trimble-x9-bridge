@@ -143,6 +143,18 @@ Built 2026-11-12: counting openings goes the same way, as a `count` job
 bound face's openings and draws its picture, and the Pi checks what comes
 back, matches, judges and records. A claimed count gets 3 minutes.
 
+Built 2026-11-12: decoding the stations, not fitting them, was most of a
+check's time on the laptop (a 10.9 m wall seen by 7 stations: about 9 s of
+decoding, under 1 s of fitting). The worker now keeps decoded stations in
+memory (`--mem-gb`, default 3 GB or a quarter of the computer's memory if
+less; least recently used dropped first), each as it registers and each a
+check or count decodes, and decodes up to four at once. On the held-out
+survey, replayed through a bridge on the same laptop with the worker's real
+path, against the 0.19.0 worker: the 15-wall re-check after station 12 in
+5.9 s (20.8 s), and one question on that wall in 1.9 s right after it
+(10.9 s), 6.2 s with nothing kept (10.0 s). The fits are byte-identical. The
+kit's timings for criterion 6 are taken again with it.
+
 A worker does one job at a time, and says nothing to the bridge while it
 measures but its progress. A registration offered while a worker holds a
 check or a count keeps waiting until that job is delivered, fails, is
