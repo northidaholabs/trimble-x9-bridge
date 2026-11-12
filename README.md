@@ -1,5 +1,7 @@
 # trimble-x9-bridge
 
+Paired with an AI agent, this bridge replaces the point-and-click steps of reality capture software. It plans each scanner setup from the last scan, ties each new station into the ones before it, and gives the agent real measurements from the point cloud, like window sizes and wall heights.
+
 A bridge service for the **Trimble X9** laser scanner: the one program that
 talks to the scanner, with one HTTP API every client uses — AI agents (through
 an MCP server), a web UI, a CLI, scripts. The safety rules live in the
