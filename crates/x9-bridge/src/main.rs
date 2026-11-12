@@ -26,6 +26,7 @@ mod minimap;
 mod mission;
 mod model;
 mod openings;
+mod points;
 mod planner;
 mod problem;
 mod recipe;
