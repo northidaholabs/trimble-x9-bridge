@@ -60,7 +60,7 @@
       "enum": ["H", "W", "R", "S"]
     },
     "tolerance": {
-      "description": "The bridge's own tolerance shape (trimble-x9-bridge docs/guide.md): the person's words, and either allowances by height or a rate.",
+      "description": "The bridge's own tolerance shape (trimble-x9-bridge docs/guide.md): the person's words, and either allowances by height or a rate. On an unsorted line, the words alone.",
       "type": "object",
       "required": ["words"],
       "additionalProperties": false,
@@ -82,7 +82,9 @@
     },
     "line": {
       "type": "object",
-      "required": ["line_id", "activity", "requirement", "method", "evidence", "question"],
+      "required": ["line_id", "activity", "requirement", "method"],
+      "description": "A sorted line has evidence and question; an unsorted one, as a spreadsheet gives it, has neither, and its tolerance is the list's words alone. The agent proposes the sorting and a person confirms it (specs/list-mission.md, part B).",
+      "dependentRequired": { "evidence": ["question"], "question": ["evidence"] },
       "additionalProperties": false,
       "properties": {
         "line_id": { "type": "string", "pattern": "^[A-Za-z0-9]+([.-][A-Za-z0-9]+)*$", "maxLength": 32, "description": "The ITP item number (1.2), or a schedule's mark (W1, D-3). Stable across revisions; a record answers by it." },
@@ -134,7 +136,8 @@
         { "if": { "properties": { "evidence": { "const": "measured" } } }, "then": { "properties": { "question": { "properties": { "kind": { "enum": ["plumb", "flatness", "height", "opening", "clearance", "low_spots", "map"] } } } } } },
         { "if": { "properties": { "evidence": { "const": "seen" } } }, "then": { "properties": { "question": { "properties": { "kind": { "const": "photo" } } } } } },
         { "if": { "properties": { "evidence": { "const": "attested" } } }, "then": { "required": ["record"], "properties": { "question": { "properties": { "kind": { "const": "statement" } } } } } },
-        { "if": { "required": ["tolerance"] }, "then": { "properties": { "evidence": { "const": "measured" } } } }
+        { "if": { "required": ["tolerance"] }, "then": { "properties": { "evidence": { "const": "measured" } } } },
+        { "if": { "not": { "required": ["evidence"] } }, "then": { "properties": { "tolerance": { "properties": { "steps": false, "mm_per_m": false, "max_mm": false } } } } }
       ]
     }
   }

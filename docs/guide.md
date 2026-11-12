@@ -969,11 +969,18 @@ instead of numbers, in `report.html`, `walls.csv` and the wall image.
 
 A job often comes with a list: an inspection and test plan, or a door and
 window schedule. Loading one makes the project's mission, one ledger target
-per line (`specs/list-mission.md`). A door and window schedule's lines ask
-for each opening's size, and the bridge finds and measures the openings on
-the walls (`specs/construction-counts.md`, part A).
+per line (`specs/list-mission.md`). A plan's rows say what must be true, not
+what the bridge is to be asked, so they arrive unsorted: the agent proposes
+each line's grade of evidence, question and tolerance, and a person confirms.
+A door and window schedule's lines ask for each opening's size, and the
+bridge finds and measures the openings on the walls
+(`specs/construction-counts.md`, part A).
 
 ```bash
+curl -s -X PUT -H "$H" -H 'Content-Type: text/csv' --data-binary @itp.csv "$B/projects/$PROJECT/list?list_id=job-7&revision=A"
+curl -s -X POST -H "$H" -d '{"sortings":[{"line_id":"1.1","evidence":"measured","question":{"kind":"plumb"},
+  "tolerance":{"words":"a quarter inch in ten feet","steps":[{"up_to_m":3.05,"mm":6.4}]}}]}' $B/projects/$PROJECT/list/proposal
+curl -s -X POST -H "$OPERATOR" -d '{"as_of":1,"confirmed_via":"web UI"}' $B/projects/$PROJECT/list/sort
 curl -s -X PUT -H "$H" -H 'Content-Type: text/csv' --data-binary @schedule.csv "$B/projects/$PROJECT/list?revision=A"
 curl -s -X POST -H "$OPERATOR" -d '{"place":"North wall","wall_id":"w3","confirmed_via":"web UI"}' $B/projects/$PROJECT/list/bind
 curl -s -X POST -H "$H" $B/projects/$PROJECT/count
@@ -986,15 +993,16 @@ curl -s -H "$H" $B/projects/$PROJECT/record
 
 | Step | What happens |
 | --- | --- |
-| The list | `PUT …/list` takes a list as JSON (`specs/list-mission/list.schema.json`), or a schedule as CSV with the columns `mark`, `type` (window, door, opening), `width`, `height`, `tolerance`, `wall`. Sizes carry their unit (`914 mm`, `36 in`, `3'-0"`) unless the column names it (`width_mm`, `width_in`); a tolerance is one figure either way (`±1/4"`, `6 mm`). A missing size, an unknown type or a mark twice is refused with the row. Each mark is a line; its id is the mark. Any role but `viewer` |
-| Revisions | `?revision=B` for a schedule (a list carries its own). A new revision keeps the place and answer of every line whose requirement, question and tolerance did not change; the others start open. The record of the revision it replaces is kept. The same revision with other lines is refused; another list on a project whose mission runs is `409` |
+| The list | `PUT …/list` takes a list as JSON (`specs/list-mission/list.schema.json`), an inspection and test plan as CSV, or a schedule as CSV. A plan has the columns `line`, `group`, `activity`, `requirement`, `reference`, `method` (dimensional, visual, test, review), `tolerance`, `record`, and one column per party whose cells are `H`, `W`, `R`, `S` or blank; any other column is read as a party's. A party's header names its role in brackets (`checker (client)`), or is a role (`contractor`, `client`); one that names none is read as a third party, and the reply's `notes` say so. A plan's line arrives unsorted; `?list_id=` names the plan for its revisions (default `itp`). A JSON list from anyone but an operator loads with its new or changed sortings as proposals. Save the spreadsheet comma-separated (a semicolon-separated one is refused and says so); rows may end in LF, CRLF or CR. Excel reads a line number such as `1.10` as a number and saves it as `1.1`: format that column as text first. A schedule has the columns `mark`, `type` (window, door, opening), `width`, `height`, `tolerance`, `wall`. Sizes carry their unit (`914 mm`, `36 in`, `3'-0"`) unless the column names it (`width_mm`, `width_in`); a tolerance is one figure either way (`±1/4"`, `6 mm`). A missing size, an unknown type or a mark twice is refused with the row. Each mark is a line; its id is the mark. Any role but `viewer` |
+| Revisions | `?revision=B` for a spreadsheet (a list carries its own). A new revision keeps the place and answer of every line whose requirement, grade, question and tolerance did not change; the others start open. A plan's unsorted line takes the earlier sorting when its requirement, method and tolerance words, as the earlier revision was loaded, are the same, and a proposal waiting on such a line waits on. The record of the revision it replaces is kept. The same revision with other lines is refused; another list on a project whose mission runs is `409` |
+| Sorting | The agent proposes (`POST …/list/proposal`, any role but `viewer`): per line, `evidence` (measured, seen, attested), `question` (`kind`), and the `tolerance` with its arithmetic. Each is checked as a list line is; the reply's `notes` are for the person: a plumb line with no tolerance ("plumb to what?"), the list's tolerance left out or reworded, a grade above what the method carries (dimensional measured, visual seen, test and review attested), a kind the bridge can't ask yet. Nothing changes on the lines. A person sorts (`POST …/list/sort`, operator only), naming what they saw: their own `sortings`, or `as_of` (the last proposal's number, from `GET …/list` or the proposal's reply) alone for every proposal up to it, or with the proposals in `lines`. `lines` without `as_of` is refused. A proposal newer than `as_of` is `409`; a yes that names nothing is refused. A line sorted differently from before starts again, open (an answer or a decline goes), on its face if the new question is asked of one; sorted the same, it keeps its answer. The log says how many were sorted as proposed and how many the person changed. `GET …/list` gives `unsorted`, `proposed` and `as_of`; an unsorted line is `open`, with the reason. A new revision drops a proposal whose line's words changed, and a carried sorting that no longer checks; the line's `note` and the record's reason say so |
 | Binding | A person binds lines to the wall they are on: `POST …/list/bind` with `lines` (ids) or `place` (the list's words for the wall), and `wall_id` or `from`/`to`. Operator only; the agent proposes. A plumb line is then asked on its face as a question target; an opening line is counted there |
 | The count | `POST …/count` reads every trusted station that saw a bound face, once each, and finds the openings: gaps at least 40 × 40 cm with wall round them (a door's on the floor) that the stations saw through. Each is measured: width over the middle 60% of its rows, height over the middle 60% of its columns, with an uncertainty from the point spacing at its edges and the spread between rows. A gap something stood in front of, or whose outline runs into a stretch no station saw, doesn't fit, with the reason. A recess (a surface close behind it and nothing seen beyond) isn't counted. Each face gets a picture (`…/count/{face}/image`) with the openings numbered. Faces under 80% seen count "at least" |
 | Matching | The bridge proposes which opening is which line, by size and type; a person confirms (`POST …/count/matches`, operator only; `opening_id` null undoes one). An opening no line takes on a fully matched face is listed as not on the schedule |
 | Verdicts | `not_yet` while the line's face is under 80% seen; `does_not_fit` with the reason; or an answer with its size and a conformance: `conforming` when both sides are within the tolerance by more than their uncertainty, `non_conforming` when either is outside it by more than that, `neutral` in between, `not_applicable` with no tolerance. After every registration the faces are counted again and the matches found again by position |
 | The record | `GET …/record`: each line's status, conformance, evidence (the reading, stations, picture) and who bound it, in `specs/list-mission/record.schema.json`'s shape |
 
-Built so far: the list, the record, binding, plumb and flatness lines
+Built so far: the list, the record, sorting, binding, plumb and flatness lines
 through questions, and opening lines through the count. Lines answered by a
 picture or a statement, signatures and acceptance are not built yet; those
 lines stay open and say so. The count runs on the Pi; the laptop doesn't

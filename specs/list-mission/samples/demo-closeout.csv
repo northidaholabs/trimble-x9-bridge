@@ -1,4 +1,4 @@
-line,group,activity,requirement,reference,method,tolerance,trade,checker,record
+line,group,activity,requirement,reference,method,tolerance,trade (contractor),checker (client),record
 1.1,Masonry,Long facade,Plumb within a quarter inch in ten feet,,dimensional,a quarter inch in ten feet,H,W,Report row with the face's heat map
 1.2,Masonry,Fourth wall face,Plumb within a quarter inch in ten feet,,dimensional,a quarter inch in ten feet,H,R,Report row with the face's heat map
 2.1,Access,Arched wall,"Height from the ground at its foot to the parapet, recorded",,dimensional,,,R,Report row with the wall's picture

@@ -131,6 +131,23 @@ pub struct Mission {
     /// The records of the list's earlier revisions, as they stood.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub earlier: Vec<Value>,
+    /// Sortings the agent proposed, by line, waiting for a person (`list::sort`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub proposed: std::collections::BTreeMap<String, crate::list::Proposed>,
+    /// Each line's tolerance in the list's words, as loaded, null for none (`list::mission`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub loaded_words: std::collections::BTreeMap<String, Option<String>>,
+    /// The last proposal's number: a person's yes names the last one they saw.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub proposal_seq: u64,
+    /// What a revision did to a line's sorting that the person should know,
+    /// until the line is sorted again.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub line_notes: std::collections::BTreeMap<String, String>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,6 +250,10 @@ impl Mission {
             confirmed_via: None,
             list: None,
             earlier: vec![],
+            proposed: Default::default(),
+            loaded_words: Default::default(),
+            proposal_seq: 0,
+            line_notes: Default::default(),
         }
     }
 

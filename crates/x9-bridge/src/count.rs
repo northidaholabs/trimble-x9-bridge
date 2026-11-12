@@ -42,12 +42,12 @@ fn bound_lines(m: &Mission) -> Vec<Bound> {
     let Some(list) = &m.list else { return vec![] };
     list.lines
         .iter()
-        .filter(|l| l.question.kind == Kind::Opening)
+        .filter(|l| l.kind() == Some(Kind::Opening))
         .filter_map(|l| {
             let t = m.targets.iter().find(|t| t.target_id == l.line_id)?;
             Some(Bound {
                 line_id: l.line_id.clone(),
-                expected: l.question.opening.clone()?,
+                expected: l.question.as_ref()?.opening.clone()?,
                 max_mm: l.tolerance.as_ref().and_then(|t| t.max_mm),
                 face: t.face?,
                 label: t.bound.as_ref().map(|b| b.label.clone()).unwrap_or_else(|| "the face".into()),
@@ -340,7 +340,7 @@ pub fn confirm(st: &AppState, project_id: &str, req: &MatchReq, by: &str) -> Res
         for it in &req.matches {
             let id = it.line_id.trim();
             let line = m.list.as_ref().and_then(|l| l.line(id)).ok_or_else(|| ApiError::invalid(format!("there is no line {id} in the list")))?;
-            if line.question.kind != Kind::Opening {
+            if line.kind() != Some(Kind::Opening) {
                 return Err(ApiError::invalid(format!("line {id} isn't an opening")));
             }
             let t = m.targets.iter_mut().find(|t| t.target_id == id).expect("a target per line");
@@ -447,10 +447,10 @@ mod tests {
         let list = format!("/v1/projects/{P}/list");
         // Before a list: nothing to count, no record.
         assert_eq!(b.call("POST", &format!("/v1/projects/{P}/count"), Some(AGENT), None).await.0, StatusCode::NOT_FOUND);
-        // An ITP spreadsheet isn't read yet; a viewer can't load lists.
-        let (code, e) = b.send("PUT", &list, Some(AGENT), "text/csv", "line,group,activity\n1.1,Masonry,Facade\n").await;
+        // A spreadsheet with an ITP's columns but not all of them is refused; a viewer can't load lists.
+        let (code, e) = b.send("PUT", &list, Some(AGENT), "text/csv", "line,group,activity,requirement\n1.1,Masonry,Facade,Plumb\n").await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
-        assert!(e["detail"].as_str().unwrap().contains("needs its lines sorted first"), "{e}");
+        assert!(e["detail"].as_str().unwrap().contains("this one has no method"), "{e}");
         assert_eq!(b.send("PUT", &list, Some(VIEWER), "text/csv", SCHEDULE).await.0, StatusCode::FORBIDDEN);
         let (code, e) = b.send("PUT", &list, Some(AGENT), "text/csv", "mark,type,width,height\nW1,window,,1 m\n").await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
@@ -567,7 +567,7 @@ mod tests {
         assert_eq!(code, StatusCode::CONFLICT);
         // A JSON list loads too.
         let sample = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../specs/list-mission/samples/demo-closeout.list.json")).unwrap();
-        let (code, m) = b.send("PUT", &format!("/v1/projects/{P}/list"), Some(AGENT), "application/json", &sample).await;
+        let (code, m) = b.send("PUT", &format!("/v1/projects/{P}/list"), Some(OPERATOR), "application/json", &sample).await;
         assert_eq!(code, StatusCode::OK, "{m}");
         assert_eq!(m["lines"].as_array().unwrap().len(), 8);
         // Binding a plumb line asks plumb of its face, with its tolerance.

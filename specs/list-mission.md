@@ -1,13 +1,12 @@
 # Spec: A mission from a list
 
-Owner: Jim · Date: 2026-11-09, revised twice on 2026-11-10 · Status: approved
-(Jim, 2026-11-11). Built for the next version, as far as
-[`construction-counts.md`](construction-counts.md) part A needs: part A (the
-list and the record, from JSON or a door and window schedule), part B's
-binding, and part C's measured lines (`plumb` and `flatness` through
-questions, `opening` through the count). Not built: the ITP spreadsheet and
-part B's sorting, seen and attested answers, declines by a person only, and
-parts D to F (criterion 10 comes first).
+Owner: Jim · Date: 2026-11-09, revised twice on 2026-11-10 and on 2026-11-12 · Status: approved
+(Jim, 2026-11-11). Built: part A (the list and the record, from JSON, an ITP
+spreadsheet or a door and window schedule), part B (sorting, proposed by the
+agent and confirmed by a person, and binding), and part C's measured lines
+(`plumb` and `flatness` through questions, `opening` through the count). Not
+built: seen and attested answers, declines by a person only, and parts D to
+F (criterion 10 comes first).
 
 A mission today starts from one sentence. The people who would buy the work
 hold lists: an inspection and test plan, a punch list, a closeout list. This
@@ -251,7 +250,8 @@ questions declined or left open while their last verdict was `not_yet`.
 ## Acceptance criteria
 
 1. test: The sample list and record validate against both schemas, and the
-   spreadsheet reads into the same lines. The bridge treats each change
+   spreadsheet reads into the same lines, unsorted; sorted as the sample is,
+   they are the sample's lines. The bridge treats each change
    `list-mission/check.py` makes to the record as the checker does. Ten
    are things the record may not say, and are refused with the reason: a
    sign-off that does not name the lines it left open, a sign-off that
@@ -391,10 +391,17 @@ Read at the fifth list from a real job, or on 2027-03-31.
 | 2026-11-10 | Who declines a line? | A person, named in the record. The agent may propose a decline. | Declining is a decision on a line, as a signature is. |
 | 2026-11-10 | Is the work accepted once every call is in? | Only if no call that counts is a rejection. A release settles what a hold party owes. | A record where every party rejected every line read as accepted in the first revision. |
 | 2026-11-10 | Must an answer match the grade the line asks for? | No. The line says the grade asked, the answer the grade it has, and the report prints both. The bridge never raises a grade. | A person on site may have only a picture or their word. Refusing it loses the line; printing it at its own grade keeps the record true. |
+| 2026-11-10 | What stays fixed? | What the record prints, that an agent is not a person, and the instrument's guards. | None of the three refuses a person's choice. They keep the record worth signing. |
 | 2026-11-11 | Approve? | Approved. | Jim. |
 | 2026-11-11 | What is a line's id? | An ITP item number (`1.2`) or a schedule's mark (`W1`, `D-3`): letters and digits joined by `.` or `-`, up to 32. | A schedule's mark is how everyone on the job names the opening, and renumbering the rows would break revisions. |
 | 2026-11-11 | Who binds a line, in this version? | A person with an operator token, on site or beforehand. The agent proposes, and its MCP tool asks the person first. | Party tokens come with part D. The bridge's existing person-only actions (the sign-off) use the operator token the same way. |
-| 2026-11-10 | What stays fixed? | What the record prints, that an agent is not a person, and the instrument's guards. | None of the three refuses a person's choice. They keep the record worth signing. |
+| 2026-11-12 | How does a spreadsheet name a party? | Any column outside the ITP's own is a party's; its header gives the role in brackets (`checker (client)`) or is a role. One with no role is read as a third party, and the bridge says so. A cell other than H, W, R, S or blank is refused with its row. | The ITP has a column per party and no fixed names for them. Refusing a non-point cell catches a stray column without a list of allowed names. |
+| 2026-11-12 | What is an unsorted line? | A line with no `evidence` and no `question`; its tolerance is the list's words alone. It is `open`, says why, and can't be bound. A JSON list may carry unsorted lines too. | Sorting is what the bridge would be asked; a spreadsheet doesn't say it, and a default from the method would print a grade nobody chose. |
+| 2026-11-12 | Where does a proposal wait? | On the mission, by line, with who proposed it and a number. A person's yes names what they saw: the sortings themselves, or `as_of`, the last proposal's number they saw, alone (every proposal up to it) or with the proposals' lines. A proposal newer than `as_of` is refused (409); lines without `as_of`, or a yes that names nothing, sort nothing. The log counts lines sorted as proposed and lines the person changed. | One yes covers the whole sorting, but only what the person was shown. The telemetry counts the lines the person re-sorted. |
+| 2026-11-12 | Can the agent sort by loading a list? | No. A list in JSON from anyone but a person loads with its new or changed sortings as proposals, those lines unsorted; a line sorted as before stays so. A schedule's lines are the reader's, as before. | Loading would otherwise be a way round the person's yes. |
+| 2026-11-12 | What does sorting again do? | A line sorted differently starts again, open, its answer or decline dropped (both were to other words), on its face if the new question is asked of one. Sorted the same, it keeps its answer. | The revision rule, inside one revision. |
+| 2026-11-12 | Does a new revision keep the sorting? | Yes, for an unsorted line whose requirement, method and tolerance words, or no words, are those of the earlier revision as loaded, and whose sorting still checks on the new line; one that doesn't is left unsorted and says why. Its answer then carries over as before. A proposal waits on where the line's words didn't change; otherwise it is dropped, and the line and the log say so. | A person sorted those words already. Comparing with the words as loaded, not as sorted, keeps a tolerance the person added or left out from making the same sheet read as another. |
+| 2026-11-12 | Does the bridge refuse a grade above the method's? | No. The proposal and the sorting say so in their notes, and a person may sort it so. | Criterion 11 and the kill-if measure the agent's proposals; refusing them would hide what they measure. |
 
 ## Open questions
 
