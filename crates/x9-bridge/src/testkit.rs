@@ -111,6 +111,18 @@ impl Bridge {
         (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
     }
 
+    /// A PUT of raw bytes; the reply's status, content type and body.
+    pub async fn put_bytes(&self, path: &str, token: Option<&str>, body: Vec<u8>) -> (StatusCode, String, Vec<u8>) {
+        let mut req = Request::builder().method("PUT").uri(path).header("content-type", "application/octet-stream");
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        let res = self.app.clone().oneshot(req.body(Body::from(body)).unwrap()).await.unwrap();
+        let code = res.status();
+        let ct = res.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        (code, ct, axum::body::to_bytes(res.into_body(), 1 << 28).await.unwrap().to_vec())
+    }
+
     /// A request whose raw reply body comes back with its status and content type.
     pub async fn bytes(&self, method: &str, path: &str, token: Option<&str>) -> (StatusCode, String, Vec<u8>) {
         let res = self.request(method, path, token, None).await;
