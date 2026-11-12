@@ -263,6 +263,7 @@ impl Raster {
             width_m: r2((u1 - u0 + 1) as f64 * self.cell),
             height_m: r2((z1 - z0 + 1) as f64 * self.cell),
             why,
+            same_as: None,
         };
         let pct = |v: f64| format!("{:.0}%", v * 100.0);
         if (ends || top) && none > 0.5 {
@@ -298,6 +299,7 @@ impl Raster {
             size: None,
             misfit,
             seen_through: r2(far + back),
+            same_as: None,
         };
         if o.misfit.is_none() {
             match self.measure(cells, b, rlo) {
@@ -569,6 +571,19 @@ pub struct Opening {
     pub misfit: Option<String>,
     /// Share of it the stations saw through.
     pub seen_through: f64,
+    /// The same opening, found on an earlier bound face of the same wall: its
+    /// id there. It is counted once, as that one; a line bound to this face
+    /// is still matched and judged by this face's reading of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_as: Option<String>,
+}
+
+impl Opening {
+    /// The opening it is, whichever face it was read on: the id it was
+    /// counted under.
+    pub fn physical(&self) -> &str {
+        self.same_as.as_deref().unwrap_or(&self.opening_id)
+    }
 }
 
 /// A gap not counted as an opening, and why.
@@ -579,6 +594,10 @@ pub struct Gap {
     pub width_m: f64,
     pub height_m: f64,
     pub why: String,
+    /// Already listed on an earlier bound face of the same wall: the opening
+    /// it is there (`f1-3`), or that face (`f1`) when it is a gap there too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_as: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -781,8 +800,55 @@ pub fn propose(lines: &[(String, Expected)], openings: &[&Opening]) -> Vec<(Stri
     out
 }
 
-/// A line's verdict from the latest count of its face.
-pub fn judge_line(c: &mut LineCheck, e: &Expected, max_mm: Option<f64>, face: &FaceCount, mark: &str) {
+/// Where a matched line's opening is in a new count.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Again<'a> {
+    /// Found again where it was matched.
+    Found(&'a Opening),
+    /// The opening there is another line's, matched nearer to it.
+    TakenBy(String),
+    /// Nothing there now.
+    Gone,
+}
+
+/// Find each matched line's opening again in a new count, all lines at
+/// once: `wants` are (line, the openings on its face now, where it was
+/// matched on that face). Pairs within `REMATCH_M` are taken nearest first
+/// (the list's order breaks a tie), and each opening, by `physical`, goes to
+/// one line only, so two lines matched close together can't both land on one.
+pub fn rematch<'a>(wants: &[(String, &'a [Opening], [f64; 2])]) -> std::collections::HashMap<String, Again<'a>> {
+    let mut cands: Vec<(f64, usize, &'a Opening)> = Vec::new();
+    for (k, (_, openings, at)) in wants.iter().enumerate() {
+        for o in openings.iter() {
+            let d = (o.centre[0] - at[0]).hypot(o.centre[1] - at[1]);
+            if d <= REMATCH_M {
+                cands.push((d, k, o));
+            }
+        }
+    }
+    cands.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut out = std::collections::HashMap::new();
+    let mut whose: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for &(_, k, o) in &cands {
+        if out.contains_key(&wants[k].0) || whose.contains_key(o.physical()) {
+            continue;
+        }
+        whose.insert(o.physical(), k);
+        out.insert(wants[k].0.clone(), Again::Found(o));
+    }
+    for (k, (line, _, _)) in wants.iter().enumerate() {
+        if out.contains_key(line) {
+            continue;
+        }
+        let taken = cands.iter().filter(|c| c.1 == k).find_map(|c| whose.get(c.2.physical()).map(|&j| wants[j].0.clone()));
+        out.insert(line.clone(), taken.map_or(Again::Gone, Again::TakenBy));
+    }
+    out
+}
+
+/// A line's verdict from the latest count of its face; `again` is where its
+/// match is now (`rematch`), when it has one.
+pub fn judge_line(c: &mut LineCheck, e: &Expected, max_mm: Option<f64>, face: &FaceCount, mark: &str, again: Option<&Again>) {
     c.face_id = face.face_id.clone();
     c.seen_share = Some(face.seen_share);
     c.checked_at = crate::util::now_rfc3339();
@@ -795,23 +861,29 @@ pub fn judge_line(c: &mut LineCheck, e: &Expected, max_mm: Option<f64>, face: &F
         c.reason = format!("{} is {:.0}% seen; the count needs {:.0}% ({found} opening{} found so far)", face.label, face.seen_share * 100.0, FACE_COVERED * 100.0, if found == 1 { "" } else { "s" });
         return;
     }
-    let Some(m) = &c.matched else {
+    if c.matched.is_none() {
         c.verdict = None;
         c.size = None;
         c.conformance = None;
         c.reason = format!("{found} opening{} found on {}; a person confirms which one is {mark}", if found == 1 { "" } else { "s" }, face.label);
         return;
-    };
-    let near = face.found.openings.iter().filter(|o| ((o.centre[0] - m.centre[0]).powi(2) + (o.centre[1] - m.centre[1]).powi(2)).sqrt() <= REMATCH_M).min_by(|a, b| {
-        let d = |o: &Opening| (o.centre[0] - m.centre[0]).hypot(o.centre[1] - m.centre[1]);
-        d(a).total_cmp(&d(b))
-    });
-    let Some(o) = near else {
-        c.verdict = None;
-        c.size = None;
-        c.conformance = None;
-        c.reason = format!("nothing was found where {mark} was matched this time; confirm its match again");
-        return;
+    }
+    let o = match again {
+        Some(Again::Found(o)) => *o,
+        Some(Again::TakenBy(other)) => {
+            c.verdict = None;
+            c.size = None;
+            c.conformance = None;
+            c.reason = format!("the opening where {mark} was matched is {other}'s now, matched nearer to it; confirm {mark}'s match again");
+            return;
+        }
+        _ => {
+            c.verdict = None;
+            c.size = None;
+            c.conformance = None;
+            c.reason = format!("nothing was found where {mark} was matched this time; confirm its match again");
+            return;
+        }
     };
     c.stations = face.stations.clone();
     match (&o.size, &o.misfit) {
@@ -1024,7 +1096,7 @@ pub(crate) mod tests {
     }
 
     fn opening(id: &str, w: f64, h: f64, kind: OpeningType, centre: [f64; 2]) -> Opening {
-        Opening { opening_id: id.into(), along_m: centre[0], centre, box_m: [0.0; 4], looks_like: kind, size: Some(size(w, h, 2.0)), misfit: None, seen_through: 0.9 }
+        Opening { opening_id: id.into(), along_m: centre[0], centre, box_m: [0.0; 4], looks_like: kind, size: Some(size(w, h, 2.0)), misfit: None, seen_through: 0.9, same_as: None }
     }
 
     #[test]
@@ -1048,33 +1120,69 @@ pub(crate) mod tests {
                     stations: vec![1, 2], unseen: Value::Null, found: Found { openings: os, not_counted: vec![] }, lines: vec!["W1".into()] }
     }
 
+    /// Judge W1 on one face, its match found again as a count does.
+    fn judged(c: &mut LineCheck, e: &Expected, f: &FaceCount) {
+        let wants: Vec<(String, &[Opening], [f64; 2])> = c.matched.iter().map(|m| ("W1".to_string(), f.found.openings.as_slice(), m.centre)).collect();
+        let again = rematch(&wants);
+        judge_line(c, e, Some(6.0), f, "W1", again.get("W1"));
+    }
+
+    #[test]
+    fn matches_are_found_again_one_line_to_an_opening() {
+        // W1 and W2 were matched 0.45 m apart, either side of a mullion. A new
+        // registration moves the openings a little: each alone would take the
+        // one nearest it, both the same; together each gets its own.
+        let os = [opening("f1-1", 900.0, 1200.0, OpeningType::Window, [3.22, 1.0]), opening("f1-2", 900.0, 1200.0, OpeningType::Window, [3.70, 1.0])];
+        let wants: Vec<(String, &[Opening], [f64; 2])> = vec![("W1".into(), &os, [3.0, 1.0]), ("W2".into(), &os, [3.45, 1.0])];
+        let again = rematch(&wants);
+        assert_eq!((again["W1"].clone(), again["W2"].clone()), (Again::Found(&os[0]), Again::Found(&os[1])));
+        // One opening left between them: the nearer match keeps it, the other is told why.
+        let one = [opening("f1-1", 900.0, 1200.0, OpeningType::Window, [3.22, 1.0])];
+        let wants: Vec<(String, &[Opening], [f64; 2])> = vec![("W1".into(), &one, [3.0, 1.0]), ("W2".into(), &one, [3.45, 1.0])];
+        let again = rematch(&wants);
+        assert_eq!((again["W1"].clone(), again["W2"].clone()), (Again::Found(&one[0]), Again::TakenBy("W1".into())));
+        let e = Expected { kind: OpeningType::Window, width_mm: 900.0, height_mm: 1200.0 };
+        let mut c = LineCheck { matched: Some(Match { opening_id: "f1-2".into(), centre: [3.45, 1.0], by: "crew".into(), via: "web UI".into(), at: "t".into() }), ..LineCheck::default() };
+        judge_line(&mut c, &e, Some(6.0), &face(0.9, one.to_vec()), "W2", again.get("W2"));
+        assert!(c.verdict.is_none() && c.reason.contains("the opening where W2 was matched is W1's now"), "{c:?}");
+        // The same opening read on two faces is one: it goes to one line.
+        let mut shared = opening("f2-1", 900.0, 1200.0, OpeningType::Window, [1.0, 1.0]);
+        shared.same_as = Some("f1-1".into());
+        let (f1, f2) = ([opening("f1-1", 900.0, 1200.0, OpeningType::Window, [3.0, 1.0])], [shared]);
+        let wants: Vec<(String, &[Opening], [f64; 2])> = vec![("W1".into(), &f1, [3.0, 1.0]), ("W9".into(), &f2, [1.05, 1.0])];
+        let again = rematch(&wants);
+        assert_eq!((again["W1"].clone(), again["W9"].clone()), (Again::Found(&f1[0]), Again::TakenBy("W1".into())));
+        // Nothing there at all.
+        assert_eq!(rematch(&[("W1".to_string(), &f1[..], [9.0, 1.0])])["W1"], Again::Gone);
+    }
+
     #[test]
     fn a_line_is_judged_from_its_match() {
         let e = Expected { kind: OpeningType::Window, width_mm: 914.0, height_mm: 1219.0 };
         let mut c = LineCheck::default();
-        judge_line(&mut c, &e, Some(6.0), &face(0.4, vec![]), "W1");
+        judged(&mut c, &e, &face(0.4, vec![]));
         assert_eq!((c.verdict, c.state().status), (Some(Verdict::NotYet), "not_yet"));
         assert!(c.reason.contains("North wall is 40% seen; the count needs 80%"), "{}", c.reason);
         let o = opening("f1-2", 916.0, 1220.0, OpeningType::Window, [3.0, 1.0]);
-        judge_line(&mut c, &e, Some(6.0), &face(0.9, vec![o.clone()]), "W1");
+        judged(&mut c, &e, &face(0.9, vec![o.clone()]));
         assert_eq!(c.verdict, None);
         assert!(c.reason.contains("1 opening found on North wall; a person confirms which one is W1"), "{}", c.reason);
         c.matched = Some(Match { opening_id: "f1-2".into(), centre: [3.1, 1.05], by: "crew".into(), via: "web UI".into(), at: "t".into() });
-        judge_line(&mut c, &e, Some(6.0), &face(0.9, vec![o.clone()]), "W1");
+        judged(&mut c, &e, &face(0.9, vec![o.clone()]));
         let s = c.state();
         assert_eq!((s.status, s.conformance), ("answered", Some("conforming")));
         let ev = c.evidence("p1").unwrap();
         assert_eq!((ev["grade"].as_str(), ev["reading"]["width_mm"].as_f64(), ev["pictures"][0].as_str()), (Some("measured"), Some(916.0), Some("/v1/projects/p1/count/f1/image")));
         assert!(ev["say"].as_str().unwrap().starts_with("916 × 1220 mm (36 1/16 in × 48 1/16 in)"), "{}", ev["say"]);
         // Found again a little way off after a new registration; gone elsewhere.
-        judge_line(&mut c, &e, Some(6.0), &face(0.9, vec![opening("f1-1", 916.0, 1220.0, OpeningType::Window, [3.25, 1.0])]), "W1");
+        judged(&mut c, &e, &face(0.9, vec![opening("f1-1", 916.0, 1220.0, OpeningType::Window, [3.25, 1.0])]));
         assert_eq!(c.verdict, Some(Verdict::Answer));
-        judge_line(&mut c, &e, Some(6.0), &face(0.9, vec![opening("f1-1", 916.0, 1220.0, OpeningType::Window, [5.0, 1.0])]), "W1");
+        judged(&mut c, &e, &face(0.9, vec![opening("f1-1", 916.0, 1220.0, OpeningType::Window, [5.0, 1.0])]));
         assert!(c.verdict.is_none() && c.reason.contains("nothing was found where W1 was matched"), "{c:?}");
         // Something in front of it now: does not fit, with the reason.
         let mut blocked = o;
         (blocked.size, blocked.misfit) = (None, Some("something stands in front of it".into()));
-        judge_line(&mut c, &e, Some(6.0), &face(0.9, vec![blocked]), "W1");
+        judged(&mut c, &e, &face(0.9, vec![blocked]));
         assert_eq!((c.state().status, c.reason.as_str()), ("does_not_fit", "something stands in front of it"));
     }
 }

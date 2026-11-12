@@ -1155,9 +1155,20 @@ async fn bind_lines(State(st): St, h: HeaderMap, Path(project_id): Path<String>,
     let (names, m) = change_mission(&st, &project_id, |m| {
         crate::list::bind(m, &ids, face, &label, &c.name, &via, &geo).map_err(|e| if e.contains("signed off") { ApiError::conflict(e) } else { ApiError::invalid(e) })
     })?;
-    st.log("approval", format!("Bound to {label}: {} ({via})", names.join(", ")), &c.name, Some(&project_id), &[("mission_id", &m.mission_id)]);
+    // Tell, don't block: a face along another bound face of the same wall is
+    // bound all the same; an opening on both is counted once.
+    let opening_lines = m.list.as_ref().is_some_and(|l| ids.iter().any(|id| l.line(id).is_some_and(|x| x.kind() == Some(crate::list::Kind::Opening))));
+    let over = if opening_lines { crate::count::overlaps(&m, &face) } else { vec![] };
+    let said_over = over.iter().map(|(l, by)| format!("{l} ({by:.1} m)")).collect::<Vec<_>>().join(", ");
+    let also = if over.is_empty() { String::new() } else { format!("; it runs along {said_over}, and an opening on both is counted once") };
+    st.log("approval", format!("Bound to {label}: {} ({via}){also}", names.join(", ")), &c.name, Some(&project_id), &[("mission_id", &m.mission_id)]);
     let lines = crate::list::lines_said(&m);
-    Ok(Json(json!({"bound": names, "face": {"label": label, "from": face.from, "to": face.to}, "lines": lines})))
+    let mut out = json!({"bound": names, "face": {"label": label, "from": face.from, "to": face.to}, "lines": lines});
+    if !over.is_empty() {
+        out["overlaps"] = json!(over.iter().map(|(l, by)| json!({"label": l, "overlap_m": by})).collect::<Vec<_>>());
+        out["say"] = json!(format!("This face runs along {said_over} on the same wall; an opening on both is counted once."));
+    }
+    Ok(Json(out))
 }
 
 /// Count the openings on the faces the schedule's lines are bound to.
