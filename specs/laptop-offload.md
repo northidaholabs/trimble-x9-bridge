@@ -1,6 +1,6 @@
 # Spec: Question checks on the laptop, and only the checks that changed
 
-Owner: Jim · Date: 2026-10-28, revised 2026-11-11 · Status: all four parts approved and built (A, B and C 2026-11-11; D 2026-11-11)
+Owner: Jim · Date: 2026-10-28, revised 2026-11-12 · Status: all four parts approved and built (A, B and C 2026-11-11; D 2026-11-11)
 
 ## Problem
 
@@ -116,9 +116,8 @@ an answer from the older one could be out of date as it is given. The
 chat says the bridge is placing the new station and that the answer
 follows.
 
-**Laptops:** Apple Silicon and Intel Macs both go to site. Every release
-carries both macOS builds; a release with either missing isn't installed
-on a kit.
+**Laptop:** the kit's laptop is an Apple Silicon Mac. A release without
+the Apple Silicon build isn't installed on the kit.
 
 `scanner_ask` and `scanner_processing` say when a check ran on the laptop.
 Nothing else about the tools changes.
@@ -242,17 +241,15 @@ Every criterion is a ship gate.
    loses the job at 120 s (re-check) and 60 s (ask), and the Pi fits it.
    A result for a job the bridge already took back is refused (409).
 5. metric: Laptop and Pi agree. On both replays, every target at every
-   count fitted on an Apple Silicon Mac, an Intel Mac and the Pi gives the same verdict,
+   count fitted on the Apple Silicon Mac and the Pi gives the same verdict,
    and plumb, lean and flatness to 0.1 mm. The bridge is deterministic for
-   the same input; the margin is for floating point on two architectures.
+   the same input; the margin is for floating point on two machines.
    Any verdict that differs fails the spec, not just the run.
 6. metric: The kit, with the laptop on the cable and its cache warm, Jim's
    timings, three runs, slowest given: the 13-wall re-check after station
    12 of the held-out survey is under 30 s, and one ask on w6 under 10 s,
-   from the registration's end to the verdicts being served. Run once on
-   an Apple Silicon Mac and once on an Intel Mac; the Intel run must also
-   be under `on-site-answers.md` criterion 8's limits (90 s and 120 s).
-   This is how criterion 8 is shown for the kit.
+   from the registration's end to the verdicts being served, on the Apple
+   Silicon Mac. This is how criterion 8 is shown for the kit.
 7. test: With `BRIDGE_CACHE_MB` set to 300 and the admin survey replayed
    station by station, the cache never passes 300 MB, every station still
    registers, and the log carries the budget note once.
@@ -276,7 +273,7 @@ Every criterion is a ship gate.
 
 - Criterion 5 fails after one fix: the laptop path is dropped. Checks stay
   on the Pi with Part A.
-- Criterion 6 fails on either Mac on 2026-11-20: `on-site-answers.md`'s
+- Criterion 6 fails on the Mac on 2026-11-20: `on-site-answers.md`'s
   kill line applies as written there.
 - Criterion 3 is over 3 min after Part A: without the laptop, the on-site
   re-check is cut back to targets asked in the chat since the last station,
@@ -316,7 +313,7 @@ checks on those visits, Part B is reviewed for removal.
 | Question | Answer | By |
 | --- | --- | --- |
 | Is criterion 8 of `on-site-answers.md` for the Pi alone or the kit? | The kit, with the laptop. | Jim, 2026-10-28 |
-| Which laptops go to site? | Apple Silicon and Intel Macs; binaries are built as needed. | Jim, 2026-10-28 |
+| Which laptops go to site? | The one Apple Silicon Mac; criteria 5 and 6 are run on it alone. Releases still carry the Intel build. | Jim, 2026-11-12 (was Apple Silicon and Intel, 2026-10-28) |
 | An ask while a registration runs: Pi now, or wait? | Wait, and check on the new registration (Part B). | Spec, 2026-10-28 |
 | What first? | Parts A and C, which help every visit with or without the laptop. | Jim, 2026-11-11 |
 | Where does the scan data end up? | On the laptop, and from there the point cloud goes to its permanent destination (part D). | Jim, 2026-11-11 |
