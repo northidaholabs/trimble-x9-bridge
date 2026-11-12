@@ -1,6 +1,10 @@
 # Spec: Counting what was built
 
-Owner: Jim · Date: 2026-11-11 · Status: draft, not approved
+Owner: Jim · Date: 2026-11-11 · Status: approved (Jim, 2026-11-11). Part A
+built for the next version, counted on the Pi (the laptop doesn't count
+yet), with the agent's tools for it (`scanner_count`,
+`scanner_confirm_matches`). Criteria 1, 2 and 4 are tests; 3, 9 and 10 are
+Jim's. Parts B and C not built.
 
 The lists that buyers hold count things. A door and window schedule lists
 every opening and its size; a rough-in inspection counts boxes; a stair
@@ -197,6 +201,12 @@ the fifth job with counts, or on 2027-03-31.
 | 2026-11-11 | Which objects? | Construction entities a terrestrial scanner sees: openings, framing, stairs, columns and anchors. Not overhead MEP. | Jim: for a terrestrial scanner it will be construction entities. Overhead work is out of the coverage model's reach and belongs to scan-to-BIM. |
 | 2026-11-11 | Objects the scan can't always be sure of? | Allowed, with a confidence and its reasons, extracted so the person sees each one, and scan positions proposed to improve it. | Jim. |
 | 2026-11-11 | What first? | Openings against the schedule, then boxes at rough-in. | Openings reuse the opening measurement and fit the list format with a pass or fail. Boxes are common, small and often half hidden: the case the confidence pattern is for. |
+| 2026-11-11 | Approve? | Approved; part A first. | Jim. |
+| 2026-11-11 | How does a schedule fit the list format? | Each mark is a line asking `opening`, with the size it expects in `question.opening` (type, width_mm, height_mm) and its tolerance as `max_mm` either way. | The list format had no place for the figure a line expects, and a schedule's tolerance is one figure either way. |
+| 2026-11-11 | When is an opening's size a pass? | When both sides are within the tolerance by more than their uncertainty. Outside it by more than that is `non_conforming`; in between is `neutral`, with both figures. | A call the measurement can't make is the tolerance making no call, which `list-mission.md` prints as neutral. |
+| 2026-11-11 | Recess or opening? | A gap backed by a surface less than 35 cm behind the face across 70% of it, with under 5% seen beyond, is a recess and isn't counted; the count lists it with why. | Criterion 2's recess. A window whose glass returns densely would read the same; criterion 3 shows whether that happens. |
+| 2026-11-11 | Settle an opening over two stations, as a plumb answer does? | No. Every registration counts the faces again, and a match is found again by position (within 25 cm). | Nothing yet shows an opening's size moving with the registration; criterion 3 can. |
+| 2026-11-11 | Where is it counted? | On the Pi, in this version. | Each station's file is read once for every bound face. The laptop takes counts next, as it takes question checks. |
 | 2026-11-11 | A confidence as a number? | No: three bands in words, each with its reasons. | A reason says what would change it; a percentage doesn't, and invites more precision than the evidence has. |
 
 ## Open questions

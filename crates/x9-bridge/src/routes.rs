@@ -71,6 +71,12 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/v1/projects/:project_id/mission/targets/:target_id/ask/image", get(ask_image))
         .route("/v1/projects/:project_id/mission/ready", post(mission_ready))
         .route("/v1/projects/:project_id/mission/sign-off", post(mission_sign_off))
+        .route("/v1/projects/:project_id/list", get(get_list).put(put_list))
+        .route("/v1/projects/:project_id/list/bind", post(bind_lines))
+        .route("/v1/projects/:project_id/record", get(get_record))
+        .route("/v1/projects/:project_id/count", get(get_count).post(post_count))
+        .route("/v1/projects/:project_id/count/matches", post(post_matches))
+        .route("/v1/projects/:project_id/count/:face_id/image", get(count_image))
         .route("/v1/scans/:scan_id/exports", post(start_export))
         .route("/v1/exports/:export_id", get(get_export))
         .route("/v1/exports/:export_id/file", get(get_export_file))
@@ -845,6 +851,13 @@ async fn update_targets(State(st): St, h: HeaderMap, Path(project_id): Path<Stri
     let before = m.clone();
     let known = project_scans(&st, &project_id).await?;
     m.update(&req.targets, &known, &st.geo(&project_id)).map_err(|e| if e.contains("signed off") { ApiError::conflict(e) } else { ApiError::invalid(e) })?;
+    // Who declined a target, for the record.
+    for u in req.targets.iter().filter(|u| u.status == Some(crate::mission::Status::Declined)) {
+        if let Some(t) = m.targets.iter_mut().find(|t| t.target_id == u.target_id.trim()) {
+            t.decided_by = Some(c.name.clone());
+            t.decided_via = Some(if c.role == Role::Agent { "by the agent".into() } else { "web UI".into() });
+        }
+    }
     for t in &m.targets {
         let Some(u) = req.targets.iter().find(|u| u.target_id.trim() == t.target_id) else { continue };
         let face = t.face.map(|f| format!(", face ({:.2}, {:.2}) to ({:.2}, {:.2})", f.from[0], f.from[1], f.to[0], f.to[1])).unwrap_or_default();
@@ -915,6 +928,138 @@ async fn mission_sign_off(State(st): St, h: HeaderMap, Path(project_id): Path<St
         let _ = crate::save::queue(&st, &project_id, &c.name, "after the sign-off");
     }
     Ok(out)
+}
+
+#[derive(Deserialize, Default)]
+struct ListQuery {
+    #[serde(default)]
+    revision: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// Load the list the job must document, as JSON (`specs/list-mission/list.schema.json`)
+/// or a door and window schedule (CSV): it becomes the project's mission, one
+/// target per line. A new revision of the same list keeps the answers of the
+/// lines whose words did not change.
+async fn put_list(State(st): St, h: HeaderMap, Path(project_id): Path<String>, Query(q): Query<ListQuery>, body: Bytes) -> ApiResult<Json<Value>> {
+    let c = st.require(&h, |r| r != Role::Viewer, "load lists")?;
+    let text = std::str::from_utf8(&body).map_err(|_| ApiError::invalid("the list is text: JSON, or a CSV schedule"))?;
+    let list = if text.trim_start().starts_with('{') {
+        parse::<crate::list::List>(&body)?
+    } else if crate::list::is_schedule(text) {
+        crate::list::from_schedule(text, q.revision.as_deref().unwrap_or("A"), q.title.as_deref()).map_err(ApiError::invalid)?
+    } else {
+        return Err(ApiError::invalid(
+            "a CSV is read as a door and window schedule (columns mark, type, width, height, tolerance, wall). An inspection and test plan's spreadsheet needs its lines sorted first, which this bridge doesn't do yet: send that list as JSON (specs/list-mission/list.schema.json)",
+        ));
+    };
+    if !st.scanner.projects().await?.iter().any(|p| p.project_uuid.as_deref() == Some(project_id.as_str())) {
+        return Err(ApiError::not_found("project"));
+    }
+    let prev = st.inner.lock().unwrap().missions.get(&project_id).cloned();
+    let m = crate::list::mission(list, &project_id, &c.name, prev.as_ref()).map_err(|e| if e.contains("signed off") || e.contains("one list per project") { ApiError::conflict(e) } else { ApiError::invalid(e) })?;
+    let l = m.list.as_ref().expect("a list mission");
+    let kept = prev.as_ref().filter(|p| p.mission_id == m.mission_id).map(|p| {
+        let n = m.targets.iter().filter(|t| p.targets.iter().any(|o| o.target_id == t.target_id && o.updated_at == t.updated_at)).count();
+        format!(" ({n} kept from revision {})", p.list.as_ref().map(|x| x.revision.as_str()).unwrap_or("?"))
+    });
+    st.log("note", format!("List loaded: {}, revision {}: {} lines{}", l.title, l.revision, l.lines.len(), kept.unwrap_or_default()), &c.name, Some(&project_id), &[("mission_id", &m.mission_id)]);
+    let lines = crate::list::lines_said(&m);
+    let mut v = mission_changed(&st, &m).0;
+    v["lines"] = json!(lines);
+    Ok(Json(v))
+}
+
+async fn get_list(State(st): St, h: HeaderMap, Path(project_id): Path<String>) -> ApiResult<Json<Value>> {
+    st.caller(&h)?;
+    let m = mission_of(&st, &project_id)?;
+    let list = m.list.clone().ok_or_else(|| ApiError::not_found("list (the mission wasn't made from one)"))?;
+    Ok(Json(json!({"list": list, "lines": crate::list::lines_said(&m), "earlier_revisions": m.earlier.iter().map(|r| r["list_revision"].clone()).collect::<Vec<_>>()})))
+}
+
+/// The record of the list: what each line came to.
+async fn get_record(State(st): St, h: HeaderMap, Path(project_id): Path<String>) -> ApiResult<Json<Value>> {
+    st.caller(&h)?;
+    let m = mission_of(&st, &project_id)?;
+    if m.list.is_none() {
+        return Err(ApiError::not_found("record (the mission wasn't made from a list)"));
+    }
+    Ok(Json(crate::list::record(&m)))
+}
+
+#[derive(Deserialize)]
+struct BindReq {
+    #[serde(default)]
+    lines: Vec<String>,
+    /// Every line whose place, in the list's words, is this.
+    #[serde(default)]
+    place: Option<String>,
+    #[serde(default)]
+    wall_id: Option<String>,
+    #[serde(default)]
+    from: Option<[f64; 2]>,
+    #[serde(default)]
+    to: Option<[f64; 2]>,
+    #[serde(default)]
+    confirmed_via: Option<String>,
+}
+
+/// A person binds list lines to a wall face (operator; the agent proposes).
+async fn bind_lines(State(st): St, h: HeaderMap, Path(project_id): Path<String>, body: Bytes) -> ApiResult<Json<Value>> {
+    let c = st.require(&h, Role::is_operator, "bind list lines to a place (a person does; the agent proposes)")?;
+    let req: BindReq = parse(&body)?;
+    let mut m = mission_of(&st, &project_id)?;
+    let geo = st.geo(&project_id);
+    let (face, label) = match (&req.wall_id, req.from, req.to) {
+        (Some(w), None, None) => (geo.wall(w.trim()).ok_or_else(|| ApiError::invalid(format!("there is no wall {w:?} in the registration")))?, w.trim().to_string()),
+        (None, Some(from), Some(to)) => (crate::register::Face { from, to }, "a drawn face".to_string()),
+        _ => return Err(ApiError::invalid("give the face as wall_id, or as from and to (project frame, m)")),
+    };
+    let mut ids = req.lines.clone();
+    if let Some(p) = &req.place {
+        let at = m.list.as_ref().map(|l| crate::list::lines_at(l, p)).unwrap_or_default();
+        if at.is_empty() {
+            return Err(ApiError::invalid(format!("no line of the list is at {p:?}")));
+        }
+        ids.extend(at);
+    }
+    ids.sort();
+    ids.dedup();
+    let via = req.confirmed_via.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(|v| v.chars().take(300).collect::<String>()).unwrap_or_else(|| "web UI".into());
+    let label = match req.place.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => format!("{p} ({label})"),
+        None => label,
+    };
+    let names = crate::list::bind(&mut m, &ids, face, &label, &c.name, &via, &geo).map_err(|e| if e.contains("signed off") { ApiError::conflict(e) } else { ApiError::invalid(e) })?;
+    st.log("approval", format!("Bound to {label}: {} ({via})", names.join(", ")), &c.name, Some(&project_id), &[("mission_id", &m.mission_id)]);
+    let lines = crate::list::lines_said(&m);
+    let _ = mission_changed(&st, &m);
+    Ok(Json(json!({"bound": names, "face": {"label": label, "from": face.from, "to": face.to}, "lines": lines})))
+}
+
+/// Count the openings on the faces the schedule's lines are bound to.
+async fn post_count(State(st): St, h: HeaderMap, Path(project_id): Path<String>) -> ApiResult<Json<Value>> {
+    let c = st.require(&h, |r| r != Role::Viewer, "count openings")?;
+    Ok(Json(crate::count::count(&st, &project_id, &c.name).await?))
+}
+
+async fn get_count(State(st): St, h: HeaderMap, Path(project_id): Path<String>) -> ApiResult<Json<Value>> {
+    st.caller(&h)?;
+    Ok(Json(crate::count::latest(&st, &project_id)?))
+}
+
+/// A person confirms which opening is which line (operator; the agent proposes).
+async fn post_matches(State(st): St, h: HeaderMap, Path(project_id): Path<String>, body: Bytes) -> ApiResult<Json<Value>> {
+    let c = st.require(&h, Role::is_operator, "confirm matches (a person does; the agent proposes)")?;
+    let req: crate::count::MatchReq = parse(&body)?;
+    Ok(Json(crate::count::confirm(&st, &project_id, &req, &c.name)?))
+}
+
+async fn count_image(State(st): St, h: HeaderMap, Path((project_id, face_id)): Path<(String, String)>) -> ApiResult<Response> {
+    st.caller(&h)?;
+    let png = st.inner.lock().unwrap().count_pictures.get(&(project_id, face_id)).cloned().ok_or_else(|| ApiError::not_found("count picture"))?;
+    Ok(([(header::CONTENT_TYPE, "image/png")], png).into_response())
 }
 
 /// The project's latest save to a laptop, and the save job now running.

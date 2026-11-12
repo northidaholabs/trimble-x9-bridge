@@ -149,6 +149,29 @@ def sheet_problems(csv_path, lst):
     return out
 
 
+def schedule_problems(csv_path, lst):
+    """A door and window schedule: one opening line per mark, with its type, wall and tolerance.
+    The sizes are converted to mm by the bridge (crates/x9-bridge/src/list.rs), and its tests hold
+    this sample's list to what the bridge reads from the sheet."""
+    out, lines = [], {l["line_id"]: l for l in lst["lines"]}
+    rows = list(csv.DictReader(Path(csv_path).open(encoding="utf8")))
+    for row in rows:
+        line = lines.get(row["mark"])
+        if not line:
+            out.append(f"{row['mark']}: in the schedule, not in the list")
+            continue
+        q = line["question"]
+        if q["kind"] != "opening" or q.get("opening", {}).get("type") != row["type"].strip().lower():
+            out.append(f"{row['mark']}: type differs")
+        if line.get("place_hint", "") != row.get("wall", ""):
+            out.append(f"{row['mark']}: wall differs")
+        if line.get("tolerance", {}).get("words", "") != row.get("tolerance", ""):
+            out.append(f"{row['mark']}: tolerance differs")
+    if {r["mark"] for r in rows} != set(lines):
+        out.append("the schedule and its list have different marks")
+    return out
+
+
 def main(argv):
     if len(argv) == 3:
         problems, notices = check(load(argv[1]), load(argv[2]))
@@ -160,6 +183,10 @@ def main(argv):
     lst, rec = load(HERE / "samples/demo-closeout.list.json"), load(HERE / "samples/demo-closeout.record.json")
     problems, notices = check(lst, rec)
     problems += sheet_problems(HERE / "samples/demo-closeout.csv", lst)
+    schedule = load(HERE / "samples/demo-schedule.list.json")
+    sched_problems = schema_problems(schedule, "list.schema.json") + schedule_problems(HERE / "samples/demo-schedule.csv", schedule)
+    problems += sched_problems
+    print("schedule sample:", "ok" if not sched_problems else sched_problems)
     by = {}
     for r in rec["lines"]:
         by.setdefault(r["status"] + ("/" + r["conformance"] if "conformance" in r else ""), []).append(r["line_id"])

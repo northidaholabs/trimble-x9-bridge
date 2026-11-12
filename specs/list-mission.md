@@ -1,6 +1,13 @@
 # Spec: A mission from a list
 
-Owner: Jim · Date: 2026-11-09, revised twice on 2026-11-10 · Status: draft, not approved
+Owner: Jim · Date: 2026-11-09, revised twice on 2026-11-10 · Status: approved
+(Jim, 2026-11-11). Built for the next version, as far as
+[`construction-counts.md`](construction-counts.md) part A needs: part A (the
+list and the record, from JSON or a door and window schedule), part B's
+binding, and part C's measured lines (`plumb` and `flatness` through
+questions, `opening` through the count). Not built: the ITP spreadsheet and
+part B's sorting, seen and attested answers, declines by a person only, and
+parts D to F (criterion 10 comes first).
 
 A mission today starts from one sentence. The people who would buy the work
 hold lists: an inspection and test plan, a punch list, a closeout list. This
@@ -384,6 +391,9 @@ Read at the fifth list from a real job, or on 2027-03-31.
 | 2026-11-10 | Who declines a line? | A person, named in the record. The agent may propose a decline. | Declining is a decision on a line, as a signature is. |
 | 2026-11-10 | Is the work accepted once every call is in? | Only if no call that counts is a rejection. A release settles what a hold party owes. | A record where every party rejected every line read as accepted in the first revision. |
 | 2026-11-10 | Must an answer match the grade the line asks for? | No. The line says the grade asked, the answer the grade it has, and the report prints both. The bridge never raises a grade. | A person on site may have only a picture or their word. Refusing it loses the line; printing it at its own grade keeps the record true. |
+| 2026-11-11 | Approve? | Approved. | Jim. |
+| 2026-11-11 | What is a line's id? | An ITP item number (`1.2`) or a schedule's mark (`W1`, `D-3`): letters and digits joined by `.` or `-`, up to 32. | A schedule's mark is how everyone on the job names the opening, and renumbering the rows would break revisions. |
+| 2026-11-11 | Who binds a line, in this version? | A person with an operator token, on site or beforehand. The agent proposes, and its MCP tool asks the person first. | Party tokens come with part D. The bridge's existing person-only actions (the sign-off) use the operator token the same way. |
 | 2026-11-10 | What stays fixed? | What the record prints, that an agent is not a person, and the instrument's guards. | None of the three refuses a person's choice. They keep the record worth signing. |
 
 ## Open questions

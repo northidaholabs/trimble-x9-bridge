@@ -45,7 +45,7 @@
         "by": { "$ref": "#/$defs/person" },
         "at": { "type": "string", "format": "date-time" },
         "via": { "type": "string" },
-        "left_open": { "type": "array", "items": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)*$" }, "uniqueItems": true, "description": "The required lines that were open, not_yet or does_not_fit when the operator signed. They keep their status; they are not declined." },
+        "left_open": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z0-9]+([.-][A-Za-z0-9]+)*$" }, "uniqueItems": true, "description": "The required lines that were open, not_yet or does_not_fit when the operator signed. They keep their status; they are not declined." },
         "reason": { "type": "string", "minLength": 1, "description": "Why the capture was signed off with lines open, in the operator's words. One reason can cover all of them." }
       },
       "allOf": [ { "if": { "required": ["left_open"], "properties": { "left_open": { "minItems": 1 } } }, "then": { "required": ["reason"] } } ]
@@ -77,7 +77,7 @@
       "required": ["line_id", "status"],
       "additionalProperties": false,
       "properties": {
-        "line_id": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)*$" },
+        "line_id": { "type": "string", "pattern": "^[A-Za-z0-9]+([.-][A-Za-z0-9]+)*$" },
         "status": {
           "enum": ["open", "not_yet", "does_not_fit", "answered", "declined"],
           "description": "open: nothing captured. not_yet and does_not_fit: the bridge's own verdicts, with its reason. answered: the line has evidence, at the grade the evidence says. declined: a person closed it without an answer, with a reason, named in decided. The agent may propose a decline; it cannot make one. A line left open at sign-off keeps its status and is named in capture_sign_off."

@@ -81,6 +81,10 @@ pub struct Inner {
     pub reading: HashMap<String, usize>,
     /// Each project's latest save to a laptop (`saves.json`).
     pub saves: HashMap<String, Value>,
+    /// Each project's latest count of openings, and its face pictures by
+    /// (project, face). Not saved: after a restart, count again.
+    pub counts: HashMap<String, crate::openings::Counted>,
+    pub count_pictures: HashMap<(String, String), Vec<u8>>,
     pub runs: HashMap<String, crate::runs::RunRecord>,
     /// Scanner tasks the bridge cancelled that may still be listed in `/tasks`.
     pub cancelled_tasks: HashSet<i64>,

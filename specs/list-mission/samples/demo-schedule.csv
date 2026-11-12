@@ -1,0 +1,5 @@
+mark,type,width,height,tolerance,wall
+W1,Window,3'-0",4'-0",±1/4",Front
+W2,Window,3'-0",4'-0",±1/4",Front
+W3,Window,2'-0",3'-0",±1/4",Side
+D1,Door,3'-0",6'-8",±1/4",Front

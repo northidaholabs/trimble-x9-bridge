@@ -1258,7 +1258,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<()> {
 
 /// Every point of a station file at full resolution: `(scanner frame,
 /// project frame, range)`, past half a metre. Returns how many were decoded.
-fn station_points(f: &std::path::Path, pose: &Pose, mut each: impl FnMut([f32; 3], [f64; 3], f64)) -> anyhow::Result<usize> {
+pub(crate) fn station_points(f: &std::path::Path, pose: &Pose, mut each: impl FnMut([f32; 3], [f64; 3], f64)) -> anyhow::Result<usize> {
     let t = trimble_tzf::Tzf::open(f).with_context(|| format!("opening {}", f.display()))?;
     let pts = t.grid_points().with_context(|| format!("{}: decoding", f.display()))?;
     for g in &pts {

@@ -99,6 +99,18 @@ impl Bridge {
         (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
     }
 
+    /// A request with a raw body (a CSV, say), whose JSON reply comes back with its status.
+    pub async fn send(&self, method: &str, path: &str, token: Option<&str>, content_type: &str, body: &str) -> (StatusCode, Value) {
+        let mut req = Request::builder().method(method).uri(path).header("content-type", content_type);
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        let res = self.app.clone().oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        let code = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 28).await.unwrap();
+        (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
     /// A request whose raw reply body comes back with its status and content type.
     pub async fn bytes(&self, method: &str, path: &str, token: Option<&str>) -> (StatusCode, String, Vec<u8>) {
         let res = self.request(method, path, token, None).await;
