@@ -99,9 +99,7 @@ impl Raster {
         if side < 0.0 {
             nrm = [-nrm[0], -nrm[1]];
         }
-        let h = (z[1] - z[0]).max(0.1);
-        let cell = (len * h / MAX_CELLS).sqrt().max(CELL_MIN_M);
-        let (nu, nz) = ((len / cell).ceil() as usize, (h / cell).ceil() as usize);
+        let Grid { cell, nu, nz, .. } = Grid::of(f, z);
         let n = nu * nz;
         Raster {
             from: f.from, dir, nrm, len, z0: z[0], cell, nu, nz,
@@ -426,12 +424,13 @@ impl Raster {
         })
     }
 
-    /// The face as the count saw it, with the openings outlined. PNG.
+    /// The face as the count saw it, with the openings outlined and numbered
+    /// by their ids' last part. PNG, `Grid::picture` pixels.
     pub fn png(&self, title: &str, found: &Found) -> Vec<u8> {
         let wall = self.closed();
-        let scale = (1200.0 / self.nu as f64).clamp(1.0, 6.0);
-        let pad = 34.0;
-        let (w, h) = ((self.nu as f64 * scale).ceil() as usize, (self.nz as f64 * scale).ceil() as usize + pad as usize);
+        let scale = picture_scale(self.nu);
+        let pad = PICTURE_PAD;
+        let (w, h) = picture_size(self.nu, self.nz);
         let mut cv = crate::station::Canvas::new(w, h, [250, 250, 250]);
         for iz in 0..self.nz {
             for iu in 0..self.nu {
@@ -472,6 +471,44 @@ impl Raster {
         }
         cv.text(&font, 15.0, (6.0, 6.0), 0.0, title, [240, 240, 240]);
         cv.png()
+    }
+}
+
+const PICTURE_PAD: f64 = 34.0;
+
+fn picture_scale(nu: usize) -> f64 {
+    (1200.0 / nu as f64).clamp(1.0, 6.0)
+}
+
+fn picture_size(nu: usize, nz: usize) -> (usize, usize) {
+    let scale = picture_scale(nu);
+    ((nu as f64 * scale).ceil() as usize, (nz as f64 * scale).ceil() as usize + PICTURE_PAD as usize)
+}
+
+/// The cells a face is counted on: their size, how many along and up, and
+/// where they reach (u from the face's `from` end, z), from the face and the
+/// heights it is read between alone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Grid {
+    pub cell: f64,
+    pub nu: usize,
+    pub nz: usize,
+    pub u_max: f64,
+    pub z: [f64; 2],
+}
+
+impl Grid {
+    pub fn of(f: &Face, z: [f64; 2]) -> Grid {
+        let len = (f.to[0] - f.from[0]).hypot(f.to[1] - f.from[1]).max(1e-6);
+        let h = (z[1] - z[0]).max(0.1);
+        let cell = (len * h / MAX_CELLS).sqrt().max(CELL_MIN_M);
+        let (nu, nz) = ((len / cell).ceil() as usize, (h / cell).ceil() as usize);
+        Grid { cell, nu, nz, u_max: nu as f64 * cell, z: [z[0], z[0] + nz as f64 * cell] }
+    }
+
+    /// The width and height of the face's picture, in pixels.
+    pub fn picture(&self) -> (usize, usize) {
+        picture_size(self.nu, self.nz)
     }
 }
 
@@ -569,6 +606,12 @@ pub struct FaceCount {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Counted {
     pub counted_at: String,
+    /// The worker that counted it and the token it claimed the count with;
+    /// none when the bridge did.
+    #[serde(default)]
+    pub counted_on: Option<String>,
+    #[serde(default)]
+    pub counted_by: Option<String>,
     pub faces: Vec<FaceCount>,
 }
 
@@ -609,6 +652,12 @@ pub struct LineCheck {
     pub stations: Vec<u16>,
     #[serde(default)]
     pub checked_at: String,
+    /// Where the count it rests on was made: a worker's name, or "bridge";
+    /// and the token the worker claimed it with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counted_on: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counted_by: Option<String>,
 }
 
 impl LineCheck {
@@ -643,6 +692,10 @@ impl LineCheck {
                            "say": size_said(s), "pictures": [format!("/v1/projects/{project_id}/count/{}/image", self.face_id)]});
         if let Some(v) = self.seen_share {
             e["seen_share"] = json!(v);
+        }
+        e["counted_on"] = json!(self.counted_on.as_deref().unwrap_or("bridge"));
+        if let Some(by) = &self.counted_by {
+            e["counted_by"] = json!(by);
         }
         Some(e)
     }

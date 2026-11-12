@@ -997,7 +997,7 @@ curl -s -H "$H" $B/projects/$PROJECT/record
 | Revisions | `?revision=B` for a spreadsheet (a list carries its own). A new revision keeps the place and answer of every line whose requirement, grade, question and tolerance did not change; the others start open. A plan's unsorted line takes the earlier sorting when its requirement, method and tolerance words, as the earlier revision was loaded, are the same, and a proposal waiting on such a line waits on. The record of the revision it replaces is kept. The same revision with other lines is refused; another list on a project whose mission runs is `409` |
 | Sorting | The agent proposes (`POST …/list/proposal`, any role but `viewer`): per line, `evidence` (measured, seen, attested), `question` (`kind`), and the `tolerance` with its arithmetic. Each is checked as a list line is; the reply's `notes` are for the person: a plumb line with no tolerance ("plumb to what?"), the list's tolerance left out or reworded, a grade above what the method carries (dimensional measured, visual seen, test and review attested), a kind the bridge can't ask yet. Nothing changes on the lines. A person sorts (`POST …/list/sort`, operator only), naming what they saw: their own `sortings`, or `as_of` (the last proposal's number, from `GET …/list` or the proposal's reply) alone for every proposal up to it, or with the proposals in `lines`. `lines` without `as_of` is refused. A proposal newer than `as_of` is `409`; a yes that names nothing is refused. A line sorted differently from before starts again, open (an answer or a decline goes), on its face if the new question is asked of one; sorted the same, it keeps its answer. The log says how many were sorted as proposed and how many the person changed. `GET …/list` gives `unsorted`, `proposed` and `as_of`; an unsorted line is `open`, with the reason. A new revision drops a proposal whose line's words changed, and a carried sorting that no longer checks; the line's `note` and the record's reason say so |
 | Binding | A person binds lines to the wall they are on: `POST …/list/bind` with `lines` (ids) or `place` (the list's words for the wall), and `wall_id` or `from`/`to`. Operator only; the agent proposes. A plumb line is then asked on its face as a question target; an opening line is counted there |
-| The count | `POST …/count` reads every trusted station that saw a bound face, once each, and finds the openings: gaps at least 40 × 40 cm with wall round them (a door's on the floor) that the stations saw through. Each is measured: width over the middle 60% of its rows, height over the middle 60% of its columns, with an uncertainty from the point spacing at its edges and the spread between rows. A gap something stood in front of, or whose outline runs into a stretch no station saw, doesn't fit, with the reason. A recess (a surface close behind it and nothing seen beyond) isn't counted. Each face gets a picture (`…/count/{face}/image`) with the openings numbered. Faces under 80% seen count "at least" |
+| The count | `POST …/count` reads every trusted station that saw a bound face, once each, and finds the openings: gaps at least 40 × 40 cm with wall round them (a door's on the floor) that the stations saw through. Each is measured: width over the middle 60% of its rows, height over the middle 60% of its columns, with an uncertainty from the point spacing at its edges and the spread between rows. A gap something stood in front of, or whose outline runs into a stretch no station saw, doesn't fit, with the reason. A recess (a surface close behind it and nothing seen beyond) isn't counted. Each face gets a picture (`…/count/{face}/image`) with the openings numbered. Faces under 80% seen count "at least". The laptop worker counts when one is on the cable, else the Pi; `counted_on` (and `counted_by`, the token the worker took it with), the record's evidence and the log ("counted on <worker>") say which. A count asked while another waited to start gives that one's result (`newer_count`) |
 | Matching | The bridge proposes which opening is which line, by size and type; a person confirms (`POST …/count/matches`, operator only; `opening_id` null undoes one). An opening no line takes on a fully matched face is listed as not on the schedule |
 | Verdicts | `not_yet` while the line's face is under 80% seen; `does_not_fit` with the reason; or an answer with its size and a conformance: `conforming` when both sides are within the tolerance by more than their uncertainty, `non_conforming` when either is outside it by more than that, `neutral` in between, `not_applicable` with no tolerance. After every registration the faces are counted again and the matches found again by position |
 | The record | `GET …/record`: each line's status, conformance, evidence (the reading, stations, picture) and who bound it, in `specs/list-mission/record.schema.json`'s shape |
@@ -1005,8 +1005,7 @@ curl -s -H "$H" $B/projects/$PROJECT/record
 Built so far: the list, the record, sorting, binding, plumb and flatness lines
 through questions, and opening lines through the count. Lines answered by a
 picture or a statement, signatures and acceptance are not built yet; those
-lines stay open and say so. The count runs on the Pi; the laptop doesn't
-take counts yet. Counting hasn't been checked against a building whose
+lines stay open and say so. Counting hasn't been checked against a building whose
 openings were taped (`construction-counts.md` criterion 3), so its counts are
 for trying out, not for handing to anyone.
 
@@ -1137,8 +1136,13 @@ it stores the result, logs it ("registered on <worker>") and re-judges the
 mission as when it works alone. It takes the job back when no worker has
 been seen for 15 s, none claims within 10 s, or the worker fails or takes
 longer than 10 minutes. It also fits question checks (`check` jobs: 120 s
-for a re-check, 60 s for one ask, then the Pi fits them itself). `GET
-/v1/workers` lists the workers seen recently and the kind of job each holds.
+for a re-check, 60 s for one ask, then the Pi fits them itself), and counts
+openings (`count` jobs: it finds each bound face's openings and draws its
+picture, and the bridge checks what comes back, matches, judges and records;
+3 minutes, then the Pi counts itself). A registration offered while the
+worker holds a check or a count waits for it, and is claimed first when that
+ends. `GET /v1/workers` lists the workers seen recently and the kind of job
+each holds.
 The release has macOS builds for laptops; the agent asks the person once per
 laptop whether to use it (`scanner_processing`).
 
@@ -1171,11 +1175,11 @@ any save still running.
 
 | Route | Who | What |
 | --- | --- | --- |
-| `POST /v1/work/claim` `{worker, holds}` | agent, operator | 200 with a job (`kind`: `register`, `check` or `save`), or 204; `holds` lists the scan files the worker keeps |
+| `POST /v1/work/claim` `{worker, holds}` | agent, operator | 200 with a job (`kind`: `register`, `check`, `count` or `save`), or 204; `holds` lists the scan files the worker keeps |
 | `POST /v1/work/{job}/progress` `{phase, progress}` | the claimer | Shown on the job |
-| `PUT /v1/work/{job}/merged` | the claimer | The merged points (binary, as the bridge stores them) |
-| `POST /v1/work/{job}/result` | the claimer | A registration: `{pairs, poses, audits, walls, skipped}`, poses and audits in the offered stations' order less the skipped. A check: `{checks}`. A save: `{folder, files, stations}` |
-| `POST /v1/work/{job}/fail` `{error}` | the claimer | The bridge does a registration or check itself; a failed save is logged |
+| `PUT /v1/work/{job}/merged` | the claimer | A registration: the merged points (binary, as the bridge stores them). A check: its fits. A count: its pictures, one PNG per face pictured, 16 MB at most in all (413 past it). Several parts go as one blob: a little-endian u32 count, then each part's u32 length and bytes |
+| `POST /v1/work/{job}/result` | the claimer | A registration: `{pairs, poses, audits, walls, skipped}`, poses and audits in the offered stations' order less the skipped. A check: `{checks}`. A count: `{faces: [{face_id, found, pictured}]}`, the offered faces in order; `found` is `{openings, not_counted}`, the openings numbered `<face_id>-1`, `-2`, … in order; the pictures are uploaded first. A count that doesn't fit the faces offered (an opening outside its face or larger than its box, more than 50 on a face, a picture of the wrong size) is refused (409) and the bridge counts it itself. A save: `{folder, files, stations}` |
+| `POST /v1/work/{job}/fail` `{error}` | the claimer | The bridge does a registration, check or count itself; a failed save is logged |
 | `POST /v1/projects/{id}/save` | agent, operator | 202 with the save job |
 | `GET /v1/projects/{id}/save` | anyone | `{last, job}`: the latest save and any save running |
 

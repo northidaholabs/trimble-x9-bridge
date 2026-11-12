@@ -2,7 +2,9 @@
 //! `work`). Claims registration jobs, fetches the scans over the bridge,
 //! decodes, registers and audits them here, and sends the result back. Also
 //! claims question checks: fits the offered faces on this computer's cores
-//! (`ask::look_many`, as the bridge would) and sends back what it found.
+//! (`ask::look_many`, as the bridge would) and sends back what it found; and
+//! counts: finds the openings on the bound faces (`count::measure`, as the
+//! bridge would) and sends back what it found, with each face's picture.
 //!
 //! The scan files it fetches are kept in the cache directory, with each
 //! station's decoded 5 cm cloud, so a check needs no transfer for a station
@@ -83,6 +85,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
                 let t0 = std::time::Instant::now();
                 let done = match job["kind"].as_str() {
                     Some("check") => w.check(&job).await,
+                    Some("count") => w.count(&job).await,
                     Some("save") => w.save(&job).await,
                     _ => w.register(&job).await,
                 };
@@ -255,17 +258,10 @@ impl Worker {
         }
     }
 
-    /// A question check: fit the offered faces here, as the bridge would, and
-    /// send back what each look found, with the fits uploaded first.
-    async fn check(&mut self, job: &Value) -> anyhow::Result<String> {
-        let id = job["job_id"].as_str().context("job_id")?.to_string();
+    /// The stations a check or count job lists, fetched into the cache (or
+    /// found there), in order: number, pose, file.
+    async fn job_files(&mut self, job: &Value, id: &str) -> anyhow::Result<Vec<(u16, crate::register::Pose, PathBuf)>> {
         let project = job["project_id"].as_str().unwrap_or("").to_string();
-        let faces: Vec<(String, crate::register::Face, Value)> = job["faces"]
-            .as_array()
-            .context("faces")?
-            .iter()
-            .map(|f| Ok((f["target_id"].as_str().context("target_id")?.to_string(), serde_json::from_value(f["face"].clone())?, f["coverage"].clone())))
-            .collect::<anyhow::Result<_>>()?;
         let stations: Vec<(u16, String, crate::register::Pose)> = job["stations"]
             .as_array()
             .context("stations")?
@@ -274,12 +270,82 @@ impl Worker {
             .collect::<anyhow::Result<_>>()?;
         let mut files = Vec::new();
         for (k, (n, scan, pose)) in stations.iter().enumerate() {
-            self.progress(&id, &format!("fetching station {n} on {}", self.name), Some(k as f64 / stations.len().max(1) as f64 * 0.3)).await;
+            self.progress(id, &format!("fetching station {n} on {}", self.name), Some(k as f64 / stations.len().max(1) as f64 * 0.3)).await;
             files.push((*n, *pose, self.tzf(scan, &project).await?));
         }
+        Ok(files)
+    }
+
+    /// Report `phase` every 5 s until aborted, so the bridge sees this
+    /// worker while it measures.
+    fn heartbeat(&self, id: &str, phase: String) -> tokio::task::JoinHandle<()> {
+        let (http, url, token) = (self.http.clone(), format!("{}/v1/work/{id}/progress", self.base), self.token.clone());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let _ = http.post(&url).bearer_auth(&token).json(&json!({"phase": phase})).send().await;
+            }
+        })
+    }
+
+    /// Upload a job's blob (`PUT …/merged`).
+    async fn put_blob(&self, id: &str, what: &str, parts: &[Vec<u8>]) -> anyhow::Result<()> {
+        let r = self.http.put(format!("{}/v1/work/{id}/merged", self.base)).bearer_auth(&self.token).body(crate::work::pack_blobs(parts)).send().await?;
+        if !r.status().is_success() {
+            bail!("uploading the {what}: {} {}", r.status(), r.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    /// A count: find the openings on the offered faces here, as the bridge
+    /// would, and send back what each face holds, with the pictures uploaded
+    /// first. The bridge matches, judges and records.
+    async fn count(&mut self, job: &Value) -> anyhow::Result<String> {
+        let id = job["job_id"].as_str().context("job_id")?.to_string();
+        let specs: Vec<crate::count::FaceSpec> = serde_json::from_value(job["faces"].clone()).context("faces")?;
+        let files = self.job_files(job, &id).await?;
+        self.progress(&id, &format!("counting openings on {} faces on {}", specs.len(), self.name), Some(0.3)).await;
+        let these = specs.clone();
+        let beat = self.heartbeat(&id, format!("counting openings on {}", self.name));
+        let reads = tokio::task::spawn_blocking(move || crate::count::measure(&these, &files)).await;
+        beat.abort();
+        let reads = reads??;
+        let mut pictures = Vec::new();
+        let faces: Vec<crate::work::CountOut> = specs
+            .iter()
+            .zip(reads)
+            .map(|(f, (found, png))| {
+                let pictured = png.is_some();
+                pictures.extend(png);
+                crate::work::CountOut { face_id: f.face_id.clone(), found, pictured }
+            })
+            .collect();
+        if !pictures.is_empty() {
+            self.put_blob(&id, "pictures", &pictures).await?;
+        }
+        let openings: usize = faces.iter().map(|f| f.found.openings.len()).sum();
+        let n = faces.len();
+        self.post(&format!("/v1/work/{id}/result"), &serde_json::to_value(crate::work::CountResult { faces })?).await?;
+        Ok(format!("{openings} openings on {n} faces"))
+    }
+
+    /// A question check: fit the offered faces here, as the bridge would, and
+    /// send back what each look found, with the fits uploaded first.
+    async fn check(&mut self, job: &Value) -> anyhow::Result<String> {
+        let id = job["job_id"].as_str().context("job_id")?.to_string();
+        let faces: Vec<(String, crate::register::Face, Value)> = job["faces"]
+            .as_array()
+            .context("faces")?
+            .iter()
+            .map(|f| Ok((f["target_id"].as_str().context("target_id")?.to_string(), serde_json::from_value(f["face"].clone())?, f["coverage"].clone())))
+            .collect::<anyhow::Result<_>>()?;
+        let files = self.job_files(job, &id).await?;
         self.progress(&id, &format!("fitting {} faces on {}", faces.len(), self.name), Some(0.3)).await;
         let threads = std::thread::available_parallelism().map_or(2, |n| n.get());
-        let looks = tokio::task::spawn_blocking(move || crate::ask::look_many(&faces, &files, &crate::analyze::Opts::default(), threads)).await??;
+        let beat = self.heartbeat(&id, format!("fitting faces on {}", self.name));
+        let looks = tokio::task::spawn_blocking(move || crate::ask::look_many(&faces, &files, &crate::analyze::Opts::default(), threads)).await;
+        beat.abort();
+        let looks = looks??;
         let mut fits = Vec::new();
         let checks: Vec<crate::work::CheckOut> = job["faces"]
             .as_array()
@@ -295,10 +361,7 @@ impl Worker {
             })
             .collect();
         if !fits.is_empty() {
-            let r = self.http.put(format!("{}/v1/work/{id}/merged", self.base)).bearer_auth(&self.token).body(crate::work::pack_fits(&fits)).send().await?;
-            if !r.status().is_success() {
-                bail!("uploading the fits: {} {}", r.status(), r.text().await.unwrap_or_default());
-            }
+            self.put_blob(&id, "fits", &fits).await?;
         }
         let n = checks.len();
         let answered = checks.iter().filter(|c| c.fit.is_some()).count();
@@ -665,13 +728,16 @@ mod tests {
         std::fs::remove_dir_all(fx).unwrap();
     }
 
-    /// A worker that claims and runs checks until `stop` is set.
+    /// A worker that claims and runs checks and counts until `stop` is set.
     fn run_checks(mut w: Worker, stop: Arc<std::sync::atomic::AtomicBool>) -> tokio::task::JoinHandle<Worker> {
         tokio::spawn(async move {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 match w.claim().await {
                     Ok(Some(job)) if job["kind"] == "check" => {
                         w.check(&job).await.unwrap();
+                    }
+                    Ok(Some(job)) if job["kind"] == "count" => {
+                        w.count(&job).await.unwrap();
                     }
                     _ => tokio::time::sleep(Duration::from_millis(20)).await,
                 }
@@ -717,6 +783,57 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let w = laptop.await.unwrap();
         assert!(std::fs::read_dir(&w.cache).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".tzf")));
+        std::fs::remove_dir_all(&w.cache).unwrap();
+        std::fs::remove_dir_all(fx).unwrap();
+        std::fs::remove_dir_all(fx_pi).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_count_on_the_laptop_finds_what_the_pi_finds() {
+        use crate::count::tests::{bound_facade, P};
+        let count = format!("/v1/projects/{P}/count");
+        // The Pi alone.
+        let (pi, fx_pi) = bound_facade().await;
+        let (_, alone) = pi.call("POST", &count, Some(AGENT), None).await;
+        assert_eq!(alone["counted_on"], "bridge", "{alone}");
+        // The same count, with a laptop on the cable.
+        let (b, fx) = bound_facade().await;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let laptop = run_checks(worker(&serve(&b).await, AGENT), stop.clone());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while b.st.work.lock().unwrap().workers().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the worker never showed up");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (code, on) = b.call("POST", &count, Some(AGENT), None).await;
+        assert_eq!(code, axum::http::StatusCode::OK, "{on}");
+        assert_eq!((on["counted_on"].as_str(), on["counted_by"].as_str()), (Some("laptop"), Some("agent")), "{on}");
+        for k in ["say", "faces", "lines", "proposed", "not_on_schedule"] {
+            assert_eq!(on[k], alone[k], "{k}");
+        }
+        assert_eq!(on["faces"][0]["openings"].as_array().unwrap().len(), 3);
+        // The same pictures, to the byte.
+        let pics = |b: &Bridge| b.st.inner.lock().unwrap().count_pictures.clone();
+        assert_eq!(pics(&b), pics(&pi));
+        assert!(!pics(&b).is_empty());
+        let (_, again) = b.call("GET", &count, Some(VIEWER), None).await;
+        assert_eq!(again["counted_on"], "laptop");
+        let log: Vec<String> = b.st.inner.lock().unwrap().log.iter().map(|e| e.text.clone()).collect();
+        assert!(log.iter().any(|t| t.starts_with("Counted openings (") && t.contains(" s, counted on laptop): 3 openings found")), "{log:#?}");
+        assert!(log.iter().any(|t| t == "Worker laptop took the count"), "{log:#?}");
+        // The record says where its count was made, and with whose token.
+        let m = json!({"matches": [{"line_id": "W1", "opening_id": "f1-1"}], "confirmed_via": "asked in the chat"});
+        assert_eq!(b.call("POST", &format!("/v1/projects/{P}/count/matches"), Some(OPERATOR), Some(m)).await.0, axum::http::StatusCode::OK);
+        let (_, r) = b.call("GET", &format!("/v1/projects/{P}/record"), Some(VIEWER), None).await;
+        let w1 = r["lines"].as_array().unwrap().iter().find(|l| l["line_id"] == "W1").unwrap();
+        assert_eq!((w1["evidence"]["counted_on"].as_str(), w1["evidence"]["counted_by"].as_str()), (Some("laptop"), Some("agent")), "{w1}");
+        // After a registration the laptop counts again.
+        crate::count::after_registration(&b.st, P).await;
+        let n = b.st.inner.lock().unwrap().log.iter().filter(|e| e.text.contains("counted on laptop")).count();
+        assert_eq!(n, 2);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let w = laptop.await.unwrap();
+        assert!(std::fs::read_dir(&w.cache).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".tzf")), "the scan file is kept for next time");
         std::fs::remove_dir_all(&w.cache).unwrap();
         std::fs::remove_dir_all(fx).unwrap();
         std::fs::remove_dir_all(fx_pi).unwrap();

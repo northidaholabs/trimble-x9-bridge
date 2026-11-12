@@ -9,7 +9,12 @@
 //! registration the faces are counted again, so a station that sees more of
 //! a face, or moves one, shows in the verdicts.
 //!
-//! Counted on the Pi in this version; the laptop doesn't take counts yet.
+//! Counting runs where the full cloud is: on the laptop worker when one is
+//! on the cable (`work::offer_count`), else on the Pi. Both run the same code
+//! (`measure`) on the same stations; only the measuring moves. The bridge
+//! checks what a worker sends back (`check_read`), proposes the matches,
+//! judges the lines and keeps the record either way, with where the count
+//! was made.
 
 use crate::ask::Verdict;
 use crate::list::Kind;
@@ -18,7 +23,7 @@ use crate::openings::{judge_line, propose, Counted, FaceCount, LineCheck, Match,
 use crate::problem::ApiError;
 use crate::register::{Face, Pose, FACE_COVERED};
 use crate::state::AppState;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -26,8 +31,148 @@ use std::sync::Arc;
 
 /// A face to count: id, label, face, its lines, its coverage, the stations that saw it.
 type Look = (String, String, Face, Vec<String>, Value, Vec<u16>);
-/// What a count reads off the points: the count, and each face's picture.
-type Read = (Counted, Vec<(String, Vec<u8>)>);
+/// What a count reads off one face: the openings, and its picture when the
+/// face could be read.
+pub type FaceRead = (crate::openings::Found, Option<Vec<u8>>);
+
+/// What is measured on one face, as the bridge or a worker gets it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FaceSpec {
+    pub face_id: String,
+    pub label: String,
+    pub face: Face,
+    /// The heights the stations saw it between (m); none when no station did.
+    pub height_m: Option<[f64; 2]>,
+    pub seen_share: f64,
+    pub stations: Vec<u16>,
+}
+
+impl FaceSpec {
+    /// The heights the face is read between: those seen, half a metre wider.
+    fn band(&self) -> Option<[f64; 2]> {
+        self.height_m.map(|[lo, hi]| [lo - 0.5, hi + 0.5])
+    }
+
+    /// The cells it is counted on; none when no station saw it.
+    pub fn grid(&self) -> Option<crate::openings::Grid> {
+        self.band().map(|z| crate::openings::Grid::of(&self.face, z))
+    }
+}
+
+/// At most this many openings, and gaps not counted, on one face.
+const MOST_PER_FACE: usize = 50;
+
+/// Whether what a worker found on a face can be what `measure` finds there:
+/// the bridge's numbering, every opening and gap inside the face's cells
+/// with sizes no larger than their boxes, and a picture (only when the face
+/// was read) of the size `measure` draws.
+pub fn check_read(spec: &FaceSpec, found: &crate::openings::Found, png: Option<&[u8]>) -> Result<(), String> {
+    let grid = spec.grid();
+    match (grid, png) {
+        (None, Some(_)) => return Err("a picture of a face no station saw".into()),
+        (Some(_), None) => return Err("no picture of a face that was read".into()),
+        (Some(g), Some(p)) => {
+            let want = g.picture();
+            let got = crate::work::png_size(p).ok_or("its picture isn't a PNG")?;
+            if (got.0 as usize, got.1 as usize) != want {
+                return Err(format!("its picture is {}×{} pixels, not {}×{}", got.0, got.1, want.0, want.1));
+            }
+        }
+        (None, None) => {}
+    }
+    if found.openings.len() > MOST_PER_FACE || found.not_counted.len() > MOST_PER_FACE {
+        return Err(format!("more than {MOST_PER_FACE} openings or gaps on one face"));
+    }
+    if grid.is_none() && !(found.openings.is_empty() && found.not_counted.is_empty()) {
+        return Err("openings on a face no station saw".into());
+    }
+    let Some(g) = grid else { return Ok(()) };
+    let slack = 1e-6;
+    let inside = |u: f64, z: f64| (-slack..=g.u_max + slack).contains(&u) && (g.z[0] - slack..=g.z[1] + slack).contains(&z);
+    let a_box = |[u0, z0, u1, z1]: [f64; 4]| [u0, z0, u1, z1].iter().all(|v| v.is_finite()) && u0 < u1 && z0 < z1 && inside(u0, z0) && inside(u1, z1);
+    for (k, o) in found.openings.iter().enumerate() {
+        let id = format!("{}-{}", spec.face_id, k + 1);
+        if o.opening_id != id {
+            return Err(format!("opening {} should be {id}: the openings are numbered in order", o.opening_id));
+        }
+        let [u0, z0, u1, z1] = o.box_m;
+        let ok = a_box(o.box_m)
+            && (u0 - slack..=u1 + slack).contains(&o.centre[0])
+            && (z0 - slack..=z1 + slack).contains(&o.centre[1])
+            && inside(o.along_m, z0)
+            && (0.0..=1.0).contains(&o.seen_through)
+            && o.size.as_ref().is_none_or(|s| {
+                let mm = [s.width_mm, s.height_mm, s.width_uncertainty_mm, s.height_uncertainty_mm];
+                let tallest = if s.from_foot { z1 - g.z[0] } else { z1 - z0 };
+                mm.iter().all(|v| v.is_finite() && *v >= 0.0)
+                    && s.sill_mm.is_none_or(f64::is_finite)
+                    && s.width_mm <= (u1 - u0 + g.cell) * 1000.0
+                    && s.height_mm <= (tallest + g.cell) * 1000.0
+                    && inside(s.along_m, z0)
+            });
+        if !ok {
+            return Err(format!("opening {id} isn't inside the face, or is larger than its box"));
+        }
+    }
+    for gap in &found.not_counted {
+        if !(gap.width_m.is_finite() && gap.height_m.is_finite() && a_box([gap.along_m, gap.bottom_m, gap.along_m + gap.width_m, gap.bottom_m + gap.height_m])) {
+            return Err("a gap not counted isn't inside the face".into());
+        }
+    }
+    Ok(())
+}
+
+/// Read the stations' points onto each face and find its openings, with a
+/// picture per face that could be read. `files` are the stations that saw
+/// any of the faces (number, pose, scan file), in the registration's order.
+/// The bridge and a worker both count with this, so they find the same.
+pub fn measure(specs: &[FaceSpec], files: &[(u16, Pose, PathBuf)]) -> anyhow::Result<Vec<FaceRead>> {
+    let mut rasters: Vec<Option<Raster>> = specs
+        .iter()
+        .map(|f| {
+            let band = f.band()?;
+            let xy: Vec<[f64; 2]> = files.iter().filter(|(n, _, _)| f.stations.contains(n)).map(|(_, p, _)| [p.xyz_m[0], p.xyz_m[1]]).collect();
+            Some(Raster::new(&f.face, band, &xy))
+        })
+        .collect();
+    for (n, pose, path) in files {
+        let mine: Vec<usize> = (0..specs.len()).filter(|&k| rasters[k].is_some() && specs[k].stations.contains(n)).collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let s = pose.xyz_m;
+        let ds: Vec<f64> = mine.iter().map(|&k| rasters[k].as_ref().unwrap().standoff(s)).collect();
+        crate::analyze::station_points(path, pose, |_, w, range| {
+            if range <= crate::openings::RANGE_M {
+                for (j, &k) in mine.iter().enumerate() {
+                    if ds[j] > 0.3 {
+                        rasters[k].as_mut().unwrap().add(s, ds[j], w);
+                    }
+                }
+            }
+        })?;
+    }
+    Ok(specs
+        .iter()
+        .zip(rasters)
+        .map(|(f, r)| {
+            let mut found = r.as_ref().map(Raster::find).unwrap_or_default();
+            number(&mut found, &f.face_id);
+            let png = r.as_ref().map(|r| {
+                let n = found.openings.len();
+                r.png(&format!("{}: {n} opening{}, {:.0}% seen", f.label, if n == 1 { "" } else { "s" }, f.seen_share * 100.0), &found)
+            });
+            (found, png)
+        })
+        .collect())
+}
+
+/// Name a face's openings in order: f1-1, f1-2, …
+fn number(found: &mut crate::openings::Found, face_id: &str) {
+    for (k, o) in found.openings.iter_mut().enumerate() {
+        o.opening_id = format!("{face_id}-{}", k + 1);
+    }
+}
 
 /// A bound opening line: its id, what it expects, its tolerance, its face.
 struct Bound {
@@ -82,6 +227,8 @@ fn apply(m: &mut Mission, counted: &Counted, scans: &std::collections::HashMap<u
         let mut c = t.opening.clone().unwrap_or_default();
         let before = (c.verdict, c.size.clone(), c.conformance.clone());
         judge_line(&mut c, &b.expected, b.max_mm, fc, &b.line_id);
+        c.counted_on = Some(counted.counted_on.clone().unwrap_or_else(|| "bridge".into()));
+        c.counted_by = counted.counted_by.clone();
         if t.status != Status::Declined {
             let answered = c.verdict == Some(Verdict::Answer);
             t.status = if answered { Status::Covered } else { Status::Open };
@@ -184,12 +331,16 @@ fn said(project_id: &str, counted: &Counted, m: &Mission) -> Value {
     if recesses > 0 {
         say.push_str(&format!(" {recesses} gap{} not counted (see not_counted).", if recesses == 1 { "" } else { "s" }));
     }
-    json!({"project_id": project_id, "counted_at": counted.counted_at, "say": say, "faces": faces, "lines": lines,
-           "proposed": proposed, "not_on_schedule": not_on, "where": "on the bridge"})
+    json!({"project_id": project_id, "counted_at": counted.counted_at, "counted_on": counted.counted_on.as_deref().unwrap_or("bridge"), "counted_by": counted.counted_by,
+           "say": say, "faces": faces, "lines": lines, "proposed": proposed, "not_on_schedule": not_on})
 }
 
 /// Count the openings on every face a schedule line is bound to, and judge
 /// the lines. `by`: who asked ("bridge" after a registration).
+///
+/// Counts of one project run one at a time. A count that waited while
+/// another, started after it was asked, finished gives that one's result:
+/// it read the faces as they stood when this one was asked, or later.
 pub async fn count(st: &Arc<AppState>, project_id: &str, by: &str) -> Result<Value, ApiError> {
     let t0 = std::time::Instant::now();
     let lock = {
@@ -197,6 +348,13 @@ pub async fn count(st: &Arc<AppState>, project_id: &str, by: &str) -> Result<Val
         inner.asking.entry((project_id.to_string(), "#count".into())).or_default().clone()
     };
     let _one = lock.lock().await;
+    if st.inner.lock().unwrap().count_started.get(project_id).is_some_and(|s| *s > t0) {
+        let mut out = latest(st, project_id)?;
+        out["took_s"] = json!(((t0.elapsed().as_secs_f64()) * 10.0).round() / 10.0);
+        out["newer_count"] = json!(true);
+        return Ok(out);
+    }
+    let started = std::time::Instant::now();
     let (m, reg) = {
         let inner = st.inner.lock().unwrap();
         let m = inner.missions.get(project_id).cloned().ok_or_else(|| ApiError::not_found("mission"))?;
@@ -221,59 +379,60 @@ pub async fn count(st: &Arc<AppState>, project_id: &str, by: &str) -> Result<Val
         looks.push((id.clone(), label.clone(), *face, lines.clone(), cov, stations));
     }
     let wanted: BTreeSet<u16> = looks.iter().flat_map(|l| l.5.iter().copied()).filter(|n| poses.contains_key(n)).collect();
-    let _reading = crate::files::reading(st, wanted.iter().filter_map(|n| scans.get(n).cloned()));
-    let mut files: Vec<(u16, Pose, PathBuf)> = Vec::new();
-    if let Some(reg) = &reg {
-        for s in reg.stations.iter().filter(|s| wanted.contains(&s.station)) {
-            files.push((s.station, poses[&s.station], crate::files::scan_file(st, &s.scan_id, crate::files::FileKind::Tzf).await?));
+    let specs: Vec<FaceSpec> = looks
+        .iter()
+        .map(|(id, label, face, _, cov, stations)| FaceSpec {
+            face_id: id.clone(),
+            label: label.clone(),
+            face: *face,
+            height_m: cov["height_m"][0].as_f64().zip(cov["height_m"][1].as_f64()).map(|(lo, hi)| [lo, hi]),
+            seen_share: cov["seen_share"].as_f64().unwrap_or(0.0),
+            stations: stations.clone(),
+        })
+        .collect();
+    let stations: Vec<(u16, String, Pose)> = reg.iter().flat_map(|r| r.stations.iter()).filter(|s| wanted.contains(&s.station)).map(|s| (s.station, s.scan_id.clone(), poses[&s.station])).collect();
+    // On the laptop when one takes it in time, else here.
+    let mut counted_on = None;
+    let mut reads = None;
+    if !stations.is_empty() {
+        let body = json!({"faces": specs, "stations": stations.iter().map(|(n, id, pose)| json!({"station": n, "scan_id": id, "pose": pose})).collect::<Vec<_>>()});
+        match crate::work::offer_count(st, project_id, body, specs.clone(), crate::work::COUNT_LIMIT).await {
+            crate::work::CountOffered::Done(r, w, token) => {
+                reads = Some(r);
+                counted_on = Some((w, token));
+            }
+            crate::work::CountOffered::Failed(w, why) => {
+                st.log("count", format!("The count on {w} didn't come back ({why}); the bridge counts it itself"), "bridge", Some(project_id), &[]);
+            }
+            crate::work::CountOffered::NoWorker => {}
         }
     }
-    let specs = looks;
-    let (counted, pictures) = tokio::task::spawn_blocking(move || -> anyhow::Result<Read> {
-        let mut rasters: Vec<Option<Raster>> = specs
-            .iter()
-            .map(|(_, _, face, _, cov, stations)| {
-                let (lo, hi) = (cov["height_m"][0].as_f64()?, cov["height_m"][1].as_f64()?);
-                let xy: Vec<[f64; 2]> = files.iter().filter(|(n, _, _)| stations.contains(n)).map(|(_, p, _)| [p.xyz_m[0], p.xyz_m[1]]).collect();
-                Some(Raster::new(face, [lo - 0.5, hi + 0.5], &xy))
-            })
-            .collect();
-        for (n, pose, path) in &files {
-            let mine: Vec<usize> = (0..specs.len()).filter(|&k| rasters[k].is_some() && specs[k].5.contains(n)).collect();
-            if mine.is_empty() {
-                continue;
+    let reads = match reads {
+        Some(r) => r,
+        None => {
+            let _reading = crate::files::reading(st, stations.iter().map(|(_, id, _)| id.clone()));
+            let mut files: Vec<(u16, Pose, PathBuf)> = Vec::new();
+            for (n, id, pose) in &stations {
+                files.push((*n, *pose, crate::files::scan_file(st, id, crate::files::FileKind::Tzf).await?));
             }
-            let s = pose.xyz_m;
-            let ds: Vec<f64> = mine.iter().map(|&k| rasters[k].as_ref().unwrap().standoff(s)).collect();
-            crate::analyze::station_points(path, pose, |_, w, range| {
-                if range <= crate::openings::RANGE_M {
-                    for (j, &k) in mine.iter().enumerate() {
-                        if ds[j] > 0.3 {
-                            rasters[k].as_mut().unwrap().add(s, ds[j], w);
-                        }
-                    }
-                }
-            })?;
+            let these = specs.clone();
+            tokio::task::spawn_blocking(move || measure(&these, &files))
+                .await
+                .map_err(|e| ApiError::cache(format!("counting: {e}")))?
+                .map_err(|e| ApiError::cache(format!("counting: {e:#}")))?
         }
-        let mut faces = Vec::new();
-        let mut pictures = Vec::new();
-        for ((id, label, face, lines, cov, stations), r) in specs.into_iter().zip(rasters) {
-            let mut found = r.as_ref().map(Raster::find).unwrap_or_default();
-            for (k, o) in found.openings.iter_mut().enumerate() {
-                o.opening_id = format!("{id}-{}", k + 1);
-            }
-            let share = cov["seen_share"].as_f64().unwrap_or(0.0);
-            if let Some(r) = &r {
-                let n = found.openings.len();
-                pictures.push((id.clone(), r.png(&format!("{label}: {n} opening{}, {:.0}% seen", if n == 1 { "" } else { "s" }, share * 100.0), &found)));
-            }
-            faces.push(FaceCount { face_id: id, label, face, length_m: cov["length_m"].as_f64().unwrap_or(0.0), seen_share: share, stations, unseen: cov["unseen"].clone(), found, lines });
+    };
+    let mut faces = Vec::new();
+    let mut pictures = Vec::new();
+    for ((id, label, face, lines, cov, stations), (mut found, png)) in looks.into_iter().zip(reads) {
+        number(&mut found, &id);
+        if let Some(png) = png {
+            pictures.push((id.clone(), png));
         }
-        Ok((Counted { counted_at: crate::util::now_rfc3339(), faces }, pictures))
-    })
-    .await
-    .map_err(|e| ApiError::cache(format!("counting: {e}")))?
-    .map_err(|e| ApiError::cache(format!("counting: {e:#}")))?;
+        faces.push(FaceCount { face_id: id, label, face, length_m: cov["length_m"].as_f64().unwrap_or(0.0), seen_share: cov["seen_share"].as_f64().unwrap_or(0.0), stations, unseen: cov["unseen"].clone(), found, lines });
+    }
+    let (counted_on, counted_by) = counted_on.map_or((None, None), |(w, t)| (Some(w), Some(t)));
+    let counted = Counted { counted_at: crate::util::now_rfc3339(), counted_on: counted_on.clone(), counted_by, faces };
     // Judge the lines on the mission as it is now (it may have changed meanwhile).
     let out = {
         let mut inner = st.inner.lock().unwrap();
@@ -282,6 +441,7 @@ pub async fn count(st: &Arc<AppState>, project_id: &str, by: &str) -> Result<Val
         let v = said(project_id, &counted, &m);
         inner.missions.insert(project_id.to_string(), m.clone());
         inner.counts.insert(project_id.to_string(), counted.clone());
+        inner.count_started.insert(project_id.to_string(), started);
         inner.count_pictures.retain(|(p, _), _| p != project_id);
         for (id, png) in pictures {
             inner.count_pictures.insert((project_id.to_string(), id), png);
@@ -293,7 +453,8 @@ pub async fn count(st: &Arc<AppState>, project_id: &str, by: &str) -> Result<Val
     };
     let took = t0.elapsed().as_secs_f64();
     if !counted.faces.is_empty() {
-        st.log("count", format!("Counted openings ({:.1} s): {}", took, out["say"].as_str().unwrap_or("")), by, Some(project_id), &[]);
+        let on = counted_on.map(|w| format!(", counted on {w}")).unwrap_or_default();
+        st.log("count", format!("Counted openings ({took:.1} s{on}): {}", out["say"].as_str().unwrap_or("")), by, Some(project_id), &[]);
     }
     let mut out = out;
     out["took_s"] = json!((took * 10.0).round() / 10.0);
@@ -394,14 +555,14 @@ pub async fn after_registration(st: &Arc<AppState>, project_id: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::register::{Merged, Registration, StationPose};
     use crate::testkit::{Bridge, AGENT, OPERATOR, VIEWER};
     use axum::http::StatusCode;
 
     const SCAN: &str = "5b5314cf-76b8-4f59-a445-ceee1e6df4c3";
-    const P: &str = "39187455-8278-428c-89ad-8a4835f95be6";
+    pub(crate) const P: &str = "39187455-8278-428c-89ad-8a4835f95be6";
 
     const SCHEDULE: &str = "mark,type,width,height,tolerance,wall\n\
         W1,window,1000 mm,1200 mm,10 mm,Front\n\
@@ -435,6 +596,69 @@ mod tests {
             inner.merged.insert(P.into(), Arc::new(m));
         }
         (b, fx)
+    }
+
+    /// The facade with the schedule loaded and its front lines bound to w1.
+    pub(crate) async fn bound_facade() -> (Bridge, std::path::PathBuf) {
+        let (b, fx) = facade_bridge().await;
+        let (code, m) = b.send("PUT", &format!("/v1/projects/{P}/list"), Some(AGENT), "text/csv", SCHEDULE).await;
+        assert_eq!(code, StatusCode::OK, "{m}");
+        let (code, v) = b.call("POST", &format!("/v1/projects/{P}/list/bind"), Some(OPERATOR), Some(json!({"place": "front", "wall_id": "w1"}))).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        (b, fx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_count_the_laptop_fails_is_counted_on_the_bridge() {
+        let (b, fx) = bound_facade().await;
+        let (_, alone) = b.call("POST", &format!("/v1/projects/{P}/count"), Some(AGENT), None).await;
+        assert_eq!(alone["counted_on"], "bridge", "{alone}");
+        // A laptop is seen, takes the count, and fails it.
+        b.st.work.lock().unwrap().claim("laptop", "agent");
+        let st = b.st.clone();
+        let counting = tokio::spawn(async move { count(&st, P, "agent").await });
+        let job = loop {
+            let (code, j) = b.call("POST", "/v1/work/claim", Some(AGENT), Some(json!({"worker": "laptop"}))).await;
+            if code == StatusCode::OK {
+                break j;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!((job["kind"].as_str(), job["faces"].as_array().unwrap().len()), (Some("count"), 1), "{job}");
+        assert_eq!((job["faces"][0]["face_id"].as_str(), job["stations"][0]["scan_id"].as_str()), (Some("f1"), Some(SCAN)), "{job}");
+        let id = job["job_id"].as_str().unwrap();
+        assert_eq!(b.call("POST", &format!("/v1/work/{id}/fail"), Some(AGENT), Some(json!({"error": "out of memory"}))).await.0, StatusCode::NO_CONTENT);
+        let c = counting.await.unwrap().unwrap();
+        assert_eq!(c["counted_on"], "bridge", "{c}");
+        assert_eq!(c["faces"], alone["faces"]);
+        assert!(b.st.inner.lock().unwrap().log.iter().any(|e| e.text == "The count on laptop didn't come back (failed: out of memory); the bridge counts it itself"));
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_count_queued_behind_a_newer_one_gives_that_ones_result() {
+        let (b, fx) = bound_facade().await;
+        let counted = |b: &Bridge| b.st.inner.lock().unwrap().log.iter().filter(|e| e.text.starts_with("Counted openings")).count();
+        // Hold the project's counts, and ask twice meanwhile.
+        let lock = b.st.inner.lock().unwrap().asking.entry((P.to_string(), "#count".into())).or_default().clone();
+        let held = lock.lock().await;
+        let (st1, st2) = (b.st.clone(), b.st.clone());
+        let first = tokio::spawn(async move { count(&st1, P, "bridge").await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = tokio::spawn(async move { count(&st2, P, "agent").await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(held);
+        // The first counts; it started after the second was asked, so the second gives its result.
+        let (a, c) = (first.await.unwrap().unwrap(), second.await.unwrap().unwrap());
+        assert!(a["newer_count"].is_null(), "{a}");
+        assert_eq!(c["newer_count"], true, "{c}");
+        assert_eq!((c["faces"].clone(), c["counted_at"].clone()), (a["faces"].clone(), a["counted_at"].clone()));
+        assert_eq!(counted(&b), 1, "read once");
+        // A count asked after that one finished counts again.
+        let (_, d) = b.call("POST", &format!("/v1/projects/{P}/count"), Some(AGENT), None).await;
+        assert!(d["newer_count"].is_null(), "{d}");
+        assert_eq!(counted(&b), 2);
+        std::fs::remove_dir_all(fx).unwrap();
     }
 
     fn line<'a>(v: &'a Value, id: &str) -> &'a Value {
@@ -520,6 +744,7 @@ mod tests {
         let rw1 = line(&r, "W1");
         assert_eq!((rw1["evidence"]["grade"].as_str(), rw1["place"]["bound_by"]["name"].as_str()), (Some("measured"), Some("crew")), "{rw1}");
         assert_eq!(rw1["evidence"]["pictures"][0], format!("/v1/projects/{P}/count/f1/image"));
+        assert_eq!((rw1["evidence"]["counted_on"].as_str(), rw1["evidence"]["counted_by"].as_str()), (Some("bridge"), None), "{rw1}");
         assert_eq!((line(&r, "W2")["status"].as_str(), line(&r, "D9")["status"].as_str()), (Some("does_not_fit"), Some("open")));
         // The mission's ledger: the answered lines are covered, the others open.
         let (_, ms) = b.call("GET", &format!("/v1/projects/{P}/mission"), Some(VIEWER), None).await;

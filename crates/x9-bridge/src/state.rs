@@ -85,6 +85,9 @@ pub struct Inner {
     /// (project, face). Not saved: after a restart, count again.
     pub counts: HashMap<String, crate::openings::Counted>,
     pub count_pictures: HashMap<(String, String), Vec<u8>>,
+    /// When each project's latest finished count started (`count::count`
+    /// skips a count asked before it).
+    pub count_started: HashMap<String, std::time::Instant>,
     pub runs: HashMap<String, crate::runs::RunRecord>,
     /// Scanner tasks the bridge cancelled that may still be listed in `/tasks`.
     pub cancelled_tasks: HashSet<i64>,

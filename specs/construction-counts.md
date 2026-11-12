@@ -1,9 +1,9 @@
 # Spec: Counting what was built
 
-Owner: Jim · Date: 2026-11-11 · Status: approved (Jim, 2026-11-11). Part A
-built for the next version, counted on the Pi (the laptop doesn't count
-yet), with the agent's tools for it (`scanner_count`,
-`scanner_confirm_matches`). Criteria 1, 2 and 4 are tests; 3, 9 and 10 are
+Owner: Jim · Date: 2026-11-11, revised 2026-11-12 · Status: approved (Jim,
+2026-11-11). Part A built, with the agent's tools for it (`scanner_count`,
+`scanner_confirm_matches`); counted on the laptop worker when one is on the
+cable, else on the Pi (2026-11-12). Criteria 1, 2 and 4 are tests; 3, 9 and 10 are
 Jim's. Parts B and C not built.
 
 The lists that buyers hold count things. A door and window schedule lists
@@ -207,6 +207,7 @@ the fifth job with counts, or on 2027-03-31.
 | 2026-11-11 | Recess or opening? | A gap backed by a surface less than 35 cm behind the face across 70% of it, with under 5% seen beyond, is a recess and isn't counted; the count lists it with why. | Criterion 2's recess. A window whose glass returns densely would read the same; criterion 3 shows whether that happens. |
 | 2026-11-11 | Settle an opening over two stations, as a plumb answer does? | No. Every registration counts the faces again, and a match is found again by position (within 25 cm). | Nothing yet shows an opening's size moving with the registration; criterion 3 can. |
 | 2026-11-11 | Where is it counted? | On the Pi, in this version. | Each station's file is read once for every bound face. The laptop takes counts next, as it takes question checks. |
+| 2026-11-12 | Where is it counted now? | On the laptop worker when one is on the cable (a `count` job), else on the Pi. The laptop finds the openings and draws each face's picture, numbered as the Pi numbers them; the Pi checks what comes back against the faces it offered (inside the face, sizes within their boxes, at most 50 a face, pictures of the face's size), proposes the matches, judges the lines and keeps the record, with where the count was made and with whose token. A claimed count gets 3 minutes, then the Pi counts it itself, as it does when no worker is seen for 15 s or none claims within 10 s. | Only the measuring moves, and both run the same code on the same stations; the laptop and the Pi may differ in the last digit, so the person confirms matches from the picture of the count they are given. The 3 minutes isn't measured on a real mission yet. |
 | 2026-11-11 | A confidence as a number? | No: three bands in words, each with its reasons. | A reason says what would change it; a percentage doesn't, and invites more precision than the evidence has. |
 
 ## Open questions

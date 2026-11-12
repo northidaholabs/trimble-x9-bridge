@@ -19,6 +19,24 @@
 //! It fits them itself on the same rules, with a shorter limit: 120 s for a
 //! re-check, 60 s for one ask.
 //!
+//! A worker counts openings too (`specs/construction-counts.md`): a `count`
+//! job lists the bound faces with their coverage and the stations that saw
+//! them. The worker reads the stations and finds each face's openings
+//! (`count::measure`, as the bridge would), uploads each face's picture as
+//! one blob (`PUT …/merged`), and sends back what it found. The bridge
+//! proposes the matches, judges the lines and keeps the record. It checks
+//! what comes back against the faces it offered (openings inside each face,
+//! the bridge's numbering, pictures of the face's size) and counts itself on
+//! the same rules, with a 3 minute limit.
+//!
+//! A worker does one job at a time, so a registration offered while a
+//! worker holds a check or a count keeps waiting until that job ends (it is
+//! delivered, fails, is taken back at its limit, or its waiter is gone),
+//! seen recently or not, and never past the job's limit from its claim; it
+//! goes to the Pi only if no worker claims it within 10 s after that.
+//! Registrations are claimed first. A laptop that hangs on a count delays a
+//! registration by at most 3 minutes and 10 s; on a check, 2 minutes and 10 s.
+//!
 //! The laptop is also where the data lands (part D). Each claim lists the
 //! scan files the worker holds, so the Pi can drop its own copies when its
 //! cache is full. A `save` job writes the project's registered stations and
@@ -111,35 +129,81 @@ pub struct CheckResult {
     pub checks: Vec<CheckOut>,
 }
 
-/// The fits of a check job as one blob: a count, then each fit's length and
-/// bytes (`FaceFit::to_bytes`).
-pub fn pack_fits(fits: &[Vec<u8>]) -> Vec<u8> {
-    let mut b = (fits.len() as u32).to_le_bytes().to_vec();
-    for f in fits {
+/// What a worker found on one face of a count job, in the offered order.
+/// `pictured` faces have their picture (PNG) in the uploaded blob, in order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CountOut {
+    pub face_id: String,
+    pub found: crate::openings::Found,
+    #[serde(default)]
+    pub pictured: bool,
+}
+
+/// A worker's answer to a count job: one entry per offered face, in order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CountResult {
+    pub faces: Vec<CountOut>,
+}
+
+/// Several byte strings as one blob: a count, then each one's length and
+/// bytes. A check job's fits (`FaceFit::to_bytes`) and a count job's
+/// pictures travel this way.
+pub fn pack_blobs(blobs: &[Vec<u8>]) -> Vec<u8> {
+    let mut b = (blobs.len() as u32).to_le_bytes().to_vec();
+    for f in blobs {
         b.extend_from_slice(&(f.len() as u32).to_le_bytes());
         b.extend_from_slice(f);
     }
     b
 }
 
-pub fn unpack_fits(b: &[u8]) -> Result<Vec<crate::analyze::FaceFit>, String> {
-    let take = |at: usize, n: usize| b.get(at..at + n).ok_or_else(|| "fits cut short".to_string());
+pub fn unpack_blobs(b: &[u8]) -> Result<Vec<&[u8]>, String> {
+    let take = |at: usize, n: usize| b.get(at..at + n).ok_or_else(|| "the blob is cut short".to_string());
     let count = u32::from_le_bytes(take(0, 4)?.try_into().unwrap()) as usize;
     let (mut at, mut out) = (4, Vec::new());
     for _ in 0..count.min(1000) {
         let n = u32::from_le_bytes(take(at, 4)?.try_into().unwrap()) as usize;
-        out.push(crate::analyze::FaceFit::from_bytes(take(at + 4, n)?)?);
+        out.push(take(at + 4, n)?);
         at += 4 + n;
     }
     if out.len() != count || at != b.len() {
-        return Err("fits don't add up".into());
+        return Err("the blob's parts don't add up".into());
     }
     Ok(out)
+}
+
+pub fn unpack_fits(b: &[u8]) -> Result<Vec<crate::analyze::FaceFit>, String> {
+    unpack_blobs(b)?.into_iter().map(crate::analyze::FaceFit::from_bytes).collect()
+}
+
+/// A count job's pictures, at most this many bytes in all.
+pub const PICTURES_MAX: usize = 16 << 20;
+
+/// A PNG's width and height, from its header; none if it isn't a PNG.
+pub fn png_size(b: &[u8]) -> Option<(u32, u32)> {
+    if !b.starts_with(b"\x89PNG\r\n\x1a\n") || b.get(12..16)? != b"IHDR" {
+        return None;
+    }
+    let be = |at: usize| Some(u32::from_be_bytes(b.get(at..at + 4)?.try_into().ok()?));
+    Some((be(16)?, be(20)?))
+}
+
+/// A count job's pictures: every part a PNG with its header.
+pub fn unpack_pictures(b: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    if b.len() > PICTURES_MAX {
+        return Err(format!("the pictures come to more than {} MB", PICTURES_MAX >> 20));
+    }
+    let parts = unpack_blobs(b)?;
+    if parts.iter().any(|p| png_size(p).is_none()) {
+        return Err("every picture is a PNG".into());
+    }
+    Ok(parts.into_iter().map(<[u8]>::to_vec).collect())
 }
 
 enum Delivered {
     Register(WorkResult),
     Check(CheckResult),
+    Count(CountResult),
     Save(SaveResult),
 }
 
@@ -149,6 +213,9 @@ enum Job {
     Register { stations: Vec<(u16, String)>, pairs: Vec<Pair> },
     /// The offer's body as the worker gets it, and how many faces it lists.
     Check { body: Value, faces: usize },
+    /// The offer's body as the worker gets it, and the faces it lists, to
+    /// check what comes back against.
+    Count { body: Value, specs: Vec<crate::count::FaceSpec> },
     /// Save the project to a folder on the worker; the body is built when it
     /// is claimed, from the registration as it then stands.
     Save,
@@ -163,6 +230,25 @@ struct Offer {
     done: Option<oneshot::Sender<Delivery>>,
     /// When the worker holding it last claimed or reported progress.
     heard: Option<Instant>,
+    /// When it was claimed, and how long a check or count may hold its
+    /// worker from then (`busy_with_short_job`).
+    claimed_at: Option<Instant>,
+    limit: Option<Duration>,
+}
+
+/// Takes an offer back when dropped: a short job whose waiter is gone (a
+/// request cut off, say) leaves nothing on offer.
+struct TakeBack<'a> {
+    st: &'a crate::state::AppState,
+    job_id: String,
+}
+
+impl Drop for TakeBack<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut w) = self.st.work.lock() {
+            w.offers.remove(&self.job_id);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -224,6 +310,7 @@ impl WorkState {
         let o = self.offers.get_mut(&pick)?;
         o.claimed_by = Some((worker.to_string(), caller.to_string()));
         o.heard = Some(Instant::now());
+        o.claimed_at = o.heard;
         Some(match &o.job {
             Job::Register { stations, pairs } => json!({
                 "job_id": pick,
@@ -232,10 +319,10 @@ impl WorkState {
                 "stations": stations.iter().map(|(n, id)| json!({"station": n, "scan_id": id})).collect::<Vec<_>>(),
                 "pairs": pairs,
             }),
-            Job::Check { body, .. } => {
+            Job::Check { body, .. } | Job::Count { body, .. } => {
                 let mut v = body.clone();
                 v["job_id"] = json!(pick);
-                v["kind"] = json!("check");
+                v["kind"] = json!(o.job.kind());
                 v["project_id"] = json!(o.project_id);
                 v
             }
@@ -243,7 +330,19 @@ impl WorkState {
         })
     }
 
-    /// The kind of an offered job: `register`, `check` or `save`.
+    /// A worker that holds a check or a count: it takes a registration as
+    /// soon as that ends. A busy worker doesn't claim, so it counts as busy
+    /// however long since it was seen, but no longer than the job's own
+    /// limit from its claim.
+    fn busy_with_short_job(&self) -> Option<String> {
+        self.offers
+            .values()
+            .filter(|o| matches!(o.job, Job::Check { .. } | Job::Count { .. }))
+            .filter(|o| o.claimed_at.zip(o.limit).is_some_and(|(t, l)| t.elapsed() < l))
+            .find_map(|o| o.claimed_by.as_ref().map(|c| c.0.clone()))
+    }
+
+    /// The kind of an offered job: `register`, `check`, `count` or `save`.
     pub fn kind(&self, job_id: &str) -> Option<&'static str> {
         self.offers.get(job_id).map(|o| o.job.kind())
     }
@@ -274,7 +373,12 @@ impl WorkState {
     /// Whether `caller` holds the offered job (for progress reports, which
     /// count as hearing from it).
     pub fn holds(&mut self, job_id: &str, caller: &str) -> Result<(), String> {
-        self.mine(job_id, caller)?.heard = Some(Instant::now());
+        let o = self.mine(job_id, caller)?;
+        o.heard = Some(Instant::now());
+        // A worker reporting progress is seen, as when it claims.
+        if let Some((w, by)) = o.claimed_by.clone() {
+            self.workers.insert(w, (Instant::now(), by));
+        }
         Ok(())
     }
 
@@ -295,6 +399,7 @@ impl WorkState {
                 Ok((Delivered::Register(res), Some(o.merged.take().ok_or("upload the merged points (PUT …/merged) before the result")?)))
             }
             (Ok(_), Job::Check { .. }) => return Err("this is a check job: send its checks".into()),
+            (Ok(_), Job::Count { .. }) => return Err("this is a count job: send what it counted".into()),
             (Ok(_), Job::Save) => return Err("this is a save job: send what it saved".into()),
             (Err(e), _) => Err(e),
         };
@@ -330,21 +435,64 @@ impl Job {
         match self {
             Job::Register { .. } => "register",
             Job::Check { .. } => "check",
+            Job::Count { .. } => "count",
             Job::Save => "save",
         }
     }
 
-    /// Claim order: registrations, then checks, then saves.
+    /// Claim order: registrations, then checks, then counts (each follows its
+    /// registration), then saves.
     fn rank(&self) -> u8 {
         match self {
             Job::Register { .. } => 0,
             Job::Check { .. } => 1,
-            Job::Save => 2,
+            Job::Count { .. } => 2,
+            Job::Save => 3,
         }
     }
 }
 
 impl WorkState {
+    /// A worker's answer to a count job: one entry per offered face, in
+    /// order, and the pictures uploaded first when any face has one.
+    ///
+    /// A result in the wrong shape is refused and the job stays the
+    /// worker's; one whose content doesn't fit the faces offered (see
+    /// `count::check_read`) is refused and ends the job, so the bridge
+    /// counts it itself.
+    pub fn deliver_count(&mut self, job_id: &str, caller: &str, r: CountResult) -> Result<(), String> {
+        let o = self.mine(job_id, caller)?;
+        let Job::Count { specs, .. } = &o.job else { return Err("this is not a count job".into()) };
+        if r.faces.len() != specs.len() || r.faces.iter().zip(specs).any(|(f, s)| f.face_id != s.face_id) {
+            let ids: Vec<&str> = specs.iter().map(|s| s.face_id.as_str()).collect();
+            return Err(format!("faces must list the {} faces offered ({}), in order", ids.len(), ids.join(", ")));
+        }
+        let pictured = r.faces.iter().filter(|f| f.pictured).count();
+        let blob = match (pictured, o.merged.take()) {
+            (0, _) => None,
+            (_, Some(b)) => Some(b),
+            (_, None) => return Err("upload the pictures (PUT …/merged) before what was counted".into()),
+        };
+        let checked = (|| {
+            let mut pictures = blob.as_deref().map(unpack_pictures).transpose()?.unwrap_or_default().into_iter();
+            for (f, spec) in r.faces.iter().zip(specs) {
+                let png = if f.pictured { Some(pictures.next().ok_or("fewer pictures than faces pictured")?) } else { None };
+                crate::count::check_read(spec, &f.found, png.as_deref()).map_err(|e| format!("{}: {e}", spec.face_id))?;
+            }
+            if pictures.next().is_some() {
+                return Err("more pictures than faces pictured".to_string());
+            }
+            Ok(())
+        })();
+        if let Some(tx) = o.done.take() {
+            let _ = tx.send(match &checked {
+                Ok(()) => Ok((Delivered::Count(r), blob)),
+                Err(e) => Err(format!("its count doesn't fit the faces offered: {e}")),
+            });
+        }
+        checked
+    }
+
     /// A worker's answer to a save job.
     pub fn deliver_save(&mut self, job_id: &str, caller: &str, r: SaveResult) -> Result<(), String> {
         let o = self.mine(job_id, caller)?;
@@ -375,7 +523,7 @@ pub async fn offer(
     let mut rx = {
         let mut w = st.work.lock().unwrap();
         w.workers.retain(|_, (t, _)| t.elapsed() < WORKER_SEEN);
-        if w.workers.is_empty() {
+        if w.workers.is_empty() && w.busy_with_short_job().is_none() {
             return Offered::NoWorker;
         }
         let (tx, rx) = oneshot::channel();
@@ -386,23 +534,34 @@ pub async fn offer(
             merged: None,
             done: Some(tx),
             heard: None,
+            claimed_at: None,
+            limit: None,
         });
         rx
     };
     phase("waiting for a worker".into());
     let take_back = || st.work.lock().unwrap().offers.remove(job_id);
-    let t0 = Instant::now();
+    let mut t0 = Instant::now();
     let worker = loop {
         if cancelled() {
             take_back();
             return Offered::Cancelled;
         }
-        if let Some((name, _)) = st.work.lock().unwrap().offers.get(job_id).and_then(|o| o.claimed_by.clone()) {
-            break name;
-        }
-        if t0.elapsed() > CLAIM_WAIT {
-            take_back();
-            return Offered::NoWorker;
+        {
+            let w = st.work.lock().unwrap();
+            if let Some((name, _)) = w.offers.get(job_id).and_then(|o| o.claimed_by.clone()) {
+                break name;
+            }
+            // A worker busy with a check or a count takes this next.
+            if let Some(busy) = w.busy_with_short_job() {
+                drop(w);
+                phase(format!("waiting for {busy} to finish a short job"));
+                t0 = Instant::now();
+            } else if t0.elapsed() > CLAIM_WAIT {
+                drop(w);
+                take_back();
+                return Offered::NoWorker;
+            }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
@@ -443,41 +602,59 @@ pub enum CheckOffered {
 pub const CHECK_LIMIT_RECHECK: Duration = Duration::from_secs(120);
 pub const CHECK_LIMIT_ASK: Duration = Duration::from_secs(60);
 
-/// Offer faces to the workers to fit, and wait for what they found. `body`
-/// lists them (`faces`: target id, face, coverage) and the stations (number,
-/// scan id, pose); `limit` is how long a claimed check may run.
-pub async fn offer_check(st: &crate::state::AppState, project_id: &str, body: Value, faces: usize, limit: Duration) -> CheckOffered {
-    let job_id = crate::util::new_id("check");
+/// Why a short job came back to the bridge: the worker that held it, and
+/// what happened, said after its name ("took longer than 60 s").
+struct Failure {
+    worker: String,
+    why: String,
+}
+
+/// Offer `job` to the workers and wait, with no cancel: the worker's
+/// delivery, its name and the token it claimed with; or why the bridge does
+/// it itself (`None`: no worker took it in time).
+async fn offer_short(st: &crate::state::AppState, project_id: &str, job: Job, limit: Duration) -> Result<(Delivered, Option<Vec<u8>>, String, String), Option<Failure>> {
+    let job_id = crate::util::new_id(job.kind());
     let mut rx = {
         let mut w = st.work.lock().unwrap();
         w.workers.retain(|_, (t, _)| t.elapsed() < WORKER_SEEN);
         if w.workers.is_empty() {
-            return CheckOffered::NoWorker;
+            return Err(None);
         }
         let (tx, rx) = oneshot::channel();
-        w.offers.insert(job_id.clone(), Offer { project_id: project_id.to_string(), job: Job::Check { body, faces }, claimed_by: None, merged: None, done: Some(tx), heard: None });
+        w.offers.insert(job_id.clone(), Offer { project_id: project_id.to_string(), job, claimed_by: None, merged: None, done: Some(tx), heard: None, claimed_at: None, limit: Some(limit) });
         rx
     };
-    let take_back = || st.work.lock().unwrap().offers.remove(&job_id);
+    let take_back = TakeBack { st, job_id: job_id.clone() };
     let t0 = Instant::now();
-    let worker = loop {
-        if let Some((name, _)) = st.work.lock().unwrap().offers.get(&job_id).and_then(|o| o.claimed_by.clone()) {
-            break name;
+    let (worker, caller) = loop {
+        if let Some(c) = st.work.lock().unwrap().offers.get(&job_id).and_then(|o| o.claimed_by.clone()) {
+            break c;
         }
         if t0.elapsed() > CLAIM_WAIT {
-            take_back();
-            return CheckOffered::NoWorker;
+            return Err(None);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     let got = tokio::time::timeout(limit, &mut rx).await;
-    take_back();
-    let (r, blob) = match got {
-        Err(_) => return CheckOffered::Failed(format!("{worker} took longer than {} s", limit.as_secs())),
-        Ok(Err(_)) => return CheckOffered::Failed(format!("{worker} went away")),
-        Ok(Ok(Err(e))) => return CheckOffered::Failed(format!("{worker}: {e}")),
-        Ok(Ok(Ok((Delivered::Check(r), blob)))) => (r, blob),
-        Ok(Ok(Ok(_))) => return CheckOffered::Failed(format!("{worker} sent the wrong kind of result")),
+    drop(take_back);
+    let fail = |why: String| Err(Some(Failure { worker: worker.clone(), why }));
+    match got {
+        Err(_) => fail(format!("took longer than {} s", limit.as_secs())),
+        Ok(Err(_)) => fail("went away".into()),
+        Ok(Ok(Err(e))) => fail(format!("failed: {e}")),
+        Ok(Ok(Ok((d, blob)))) => Ok((d, blob, worker.clone(), caller)),
+    }
+}
+
+/// Offer faces to the workers to fit, and wait for what they found. `body`
+/// lists them (`faces`: target id, face, coverage) and the stations (number,
+/// scan id, pose); `limit` is how long a claimed check may run.
+pub async fn offer_check(st: &crate::state::AppState, project_id: &str, body: Value, faces: usize, limit: Duration) -> CheckOffered {
+    let (r, blob, worker) = match offer_short(st, project_id, Job::Check { body, faces }, limit).await {
+        Ok((Delivered::Check(r), blob, w, _)) => (r, blob, w),
+        Ok((_, _, w, _)) => return CheckOffered::Failed(format!("{w} sent the wrong kind of result")),
+        Err(None) => return CheckOffered::NoWorker,
+        Err(Some(f)) => return CheckOffered::Failed(format!("{} {}", f.worker, f.why)),
     };
     let mut fits = match blob.map(|b| unpack_fits(&b)).transpose() {
         Ok(f) => f.unwrap_or_default().into_iter(),
@@ -501,6 +678,42 @@ pub async fn offer_check(st: &crate::state::AppState, project_id: &str, body: Va
     CheckOffered::Done(out, worker)
 }
 
+/// How a count job offered to the workers ended.
+pub enum CountOffered {
+    /// Per offered face, in order: what was found and its picture; the
+    /// worker, and the token it claimed the count with.
+    Done(Vec<(crate::openings::Found, Option<Vec<u8>>)>, String, String),
+    NoWorker,
+    /// The worker that held it, and what happened ("took longer than 180 s").
+    Failed(String, String),
+}
+
+/// How long a claimed count may take before the bridge counts it itself.
+/// A count reads every station that saw a bound face once and matches
+/// nothing; with the stations in the worker's cache it is expected to take
+/// well under this. Not yet measured on a real mission.
+pub const COUNT_LIMIT: Duration = Duration::from_secs(180);
+
+/// Offer the bound faces to the workers to count, and wait for what they
+/// found. `body` lists them (`faces`: the `specs`) and the stations (number,
+/// scan id, pose). What comes back has been checked against `specs`
+/// (`WorkState::deliver_count`).
+pub async fn offer_count(st: &crate::state::AppState, project_id: &str, body: Value, specs: Vec<crate::count::FaceSpec>, limit: Duration) -> CountOffered {
+    let (r, blob, worker, caller) = match offer_short(st, project_id, Job::Count { body, specs }, limit).await {
+        Ok((Delivered::Count(r), blob, w, c)) => (r, blob, w, c),
+        Ok((_, _, w, _)) => return CountOffered::Failed(w, "sent the wrong kind of result".into()),
+        Err(None) => return CountOffered::NoWorker,
+        Err(Some(f)) => return CountOffered::Failed(f.worker, f.why),
+    };
+    // Checked on delivery: one picture per face pictured, in order.
+    let mut pictures = blob.map(|b| unpack_pictures(&b).unwrap_or_default()).unwrap_or_default().into_iter();
+    let out = r.faces.into_iter().map(|f| {
+        let png = if f.pictured { pictures.next() } else { None };
+        (f.found, png)
+    }).collect();
+    CountOffered::Done(out, worker, caller)
+}
+
 /// How a save offered to the workers ended.
 pub enum SaveOffered {
     /// What the worker saved, and its name.
@@ -519,7 +732,7 @@ pub struct SaveOffer(oneshot::Receiver<Delivery>);
 /// Put a save on offer now, so the next claim can take it.
 pub fn put_save(st: &crate::state::AppState, job_id: &str, project_id: &str) -> SaveOffer {
     let (tx, rx) = oneshot::channel();
-    st.work.lock().unwrap().offers.insert(job_id.to_string(), Offer { project_id: project_id.to_string(), job: Job::Save, claimed_by: None, merged: None, done: Some(tx), heard: None });
+    st.work.lock().unwrap().offers.insert(job_id.to_string(), Offer { project_id: project_id.to_string(), job: Job::Save, claimed_by: None, merged: None, done: Some(tx), heard: None, claimed_at: None, limit: None });
     SaveOffer(rx)
 }
 
@@ -592,6 +805,8 @@ mod tests {
             merged: None,
             done: None,
             heard: None,
+            claimed_at: None,
+            limit: None,
         }
     }
 
@@ -664,7 +879,7 @@ mod tests {
     }
 
     fn check_offer(faces: usize) -> Offer {
-        Offer { project_id: "p1".into(), job: Job::Check { body: json!({"faces": [], "stations": []}), faces }, claimed_by: None, merged: None, done: None, heard: None }
+        Offer { project_id: "p1".into(), job: Job::Check { body: json!({"faces": [], "stations": []}), faces }, claimed_by: None, merged: None, done: None, heard: None, claimed_at: None, limit: Some(Duration::from_secs(60)) }
     }
 
     fn out(id: &str, fitted: bool) -> CheckOut {
@@ -706,11 +921,11 @@ mod tests {
 
     #[test]
     fn fits_pack_and_unpack_and_refuse_a_short_blob() {
-        assert!(unpack_fits(&pack_fits(&[])).unwrap().is_empty());
-        let packed = pack_fits(&[b"not a fit".to_vec()]);
+        assert!(unpack_fits(&pack_blobs(&[])).unwrap().is_empty());
+        let packed = pack_blobs(&[b"not a fit".to_vec()]);
         assert!(unpack_fits(&packed).err().unwrap().contains("not a deflated fit"));
         assert!(unpack_fits(&packed[..6]).err().unwrap().contains("cut short"));
-        let mut extra = pack_fits(&[]);
+        let mut extra = pack_blobs(&[]);
         extra.push(0);
         assert!(unpack_fits(&extra).err().unwrap().contains("don't add up"));
     }
@@ -749,6 +964,261 @@ mod tests {
         let id = job["job_id"].as_str().unwrap();
         let (code, body) = b.call("POST", &format!("/v1/work/{id}/result"), Some(AGENT), Some(json!({"checks": [serde_json::to_value(out("a", false)).unwrap()]}))).await;
         assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    }
+
+    /// A face 4 m long, seen between 0 and 2 m.
+    fn spec(id: &str) -> crate::count::FaceSpec {
+        crate::count::FaceSpec { face_id: id.into(), label: id.into(), face: crate::register::Face { from: [0.0, 0.0], to: [4.0, 0.0] }, height_m: Some([0.0, 2.0]), seen_share: 1.0, stations: vec![1] }
+    }
+
+    /// A PNG header of `w` × `h` pixels: all a picture's check reads.
+    fn png(w: usize, h: usize) -> Vec<u8> {
+        let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        b.extend_from_slice(&(w as u32).to_be_bytes());
+        b.extend_from_slice(&(h as u32).to_be_bytes());
+        b
+    }
+
+    fn picture_of(id: &str) -> Vec<u8> {
+        let (w, h) = spec(id).grid().unwrap().picture();
+        png(w, h)
+    }
+
+    fn count_offer(ids: &[&str]) -> Offer {
+        Offer { project_id: "p1".into(), job: Job::Count { body: json!({"faces": [], "stations": []}), specs: ids.iter().map(|i| spec(i)).collect() }, claimed_by: None, merged: None, done: None, heard: None, claimed_at: None, limit: Some(Duration::from_secs(60)) }
+    }
+
+    fn counted(id: &str, pictured: bool) -> CountOut {
+        CountOut { face_id: id.into(), found: crate::openings::Found::default(), pictured }
+    }
+
+    fn an_opening(id: &str, box_m: [f64; 4]) -> crate::openings::Opening {
+        crate::openings::Opening { opening_id: id.into(), along_m: box_m[0], centre: [(box_m[0] + box_m[2]) / 2.0, (box_m[1] + box_m[3]) / 2.0], box_m,
+                                   looks_like: crate::list::OpeningType::Window, size: None, misfit: None, seen_through: 0.9 }
+    }
+
+    #[test]
+    fn counts_go_out_after_checks_and_before_saves() {
+        let mut w = WorkState::default();
+        w.offers.insert("a_save".into(), Offer { job: Job::Save, ..check_offer(1) });
+        w.offers.insert("b_count".into(), count_offer(&["f1"]));
+        w.offers.insert("c_check".into(), check_offer(1));
+        w.offers.insert("d_job".into(), offer_of(&[(1, "s1")]));
+        let kinds: Vec<String> = (0..4).map(|_| w.claim("laptop", "agent").unwrap()["kind"].as_str().unwrap().to_string()).collect();
+        assert_eq!(kinds, ["register", "check", "count", "save"]);
+        assert_eq!(w.kind("b_count"), Some("count"));
+    }
+
+    #[test]
+    fn a_count_lists_every_face_by_id_and_uploads_its_pictures_first() {
+        let mut w = WorkState::default();
+        let (tx, mut rx) = oneshot::channel();
+        w.offers.insert("count_1".into(), Offer { done: Some(tx), ..count_offer(&["f1", "f2"]) });
+        let job = w.claim("laptop", "agent").unwrap();
+        assert_eq!((job["kind"].as_str(), job["job_id"].as_str(), job["project_id"].as_str()), (Some("count"), Some("count_1"), Some("p1")));
+        let res = |faces| CountResult { faces };
+        // The wrong shape is refused and the job stays the worker's.
+        assert!(w.deliver_count("count_1", "agent", res(vec![counted("f1", false)])).unwrap_err().contains("the 2 faces offered (f1, f2)"));
+        assert!(w.deliver_count("count_1", "agent", res(vec![counted("f2", false), counted("f1", false)])).unwrap_err().contains("in order"));
+        assert!(w.deliver_count("count_1", "agent", res(vec![counted("f1", true), counted("f2", false)])).unwrap_err().contains("PUT …/merged"));
+        assert!(w.deliver("count_1", "agent", Ok(result(0, vec![]))).unwrap_err().contains("send what it counted"));
+        assert!(w.deliver_count("count_1", "someone-else", res(vec![counted("f1", false), counted("f2", false)])).unwrap_err().contains("not claimed with your token"));
+        assert!(rx.try_recv().is_err(), "nothing delivered yet");
+        w.put_merged("count_1", "agent", pack_blobs(&[picture_of("f1"), picture_of("f2")])).unwrap();
+        w.deliver_count("count_1", "agent", res(vec![counted("f1", true), counted("f2", true)])).unwrap();
+        let (Delivered::Count(r), Some(blob)) = rx.try_recv().unwrap().unwrap() else { panic!("a count with its pictures") };
+        assert_eq!((r.faces.len(), unpack_pictures(&blob).unwrap().len()), (2, 2));
+        // A check job refuses a count.
+        w.offers.insert("check_2".into(), check_offer(1));
+        w.claim("laptop", "agent").unwrap();
+        assert!(w.deliver_count("check_2", "agent", res(vec![])).unwrap_err().contains("not a count job"));
+    }
+
+    #[test]
+    fn a_count_that_does_not_fit_its_faces_ends_the_job() {
+        let try_one = |found: crate::openings::Found, pictures: Vec<Vec<u8>>, pictured: bool| -> String {
+            let mut w = WorkState::default();
+            let (tx, mut rx) = oneshot::channel();
+            w.offers.insert("count_1".into(), Offer { done: Some(tx), ..count_offer(&["f1"]) });
+            w.claim("laptop", "agent").unwrap();
+            if !pictures.is_empty() {
+                w.put_merged("count_1", "agent", pack_blobs(&pictures)).unwrap();
+            }
+            let e = w.deliver_count("count_1", "agent", CountResult { faces: vec![CountOut { face_id: "f1".into(), found, pictured }] }).unwrap_err();
+            let sent = rx.try_recv().unwrap().err().expect("the bridge is told");
+            assert!(sent.contains(&e), "{sent} / {e}");
+            e
+        };
+        let one = |o: crate::openings::Opening| crate::openings::Found { openings: vec![o], not_counted: vec![] };
+        let pic = || vec![picture_of("f1")];
+        assert!(try_one(Default::default(), vec![png(10, 10)], true).contains("is 10×10 pixels, not"), "the picture size");
+        assert!(try_one(Default::default(), vec![], false).contains("no picture of a face that was read"));
+        assert!(try_one(one(an_opening("f1-2", [1.0, 0.5, 2.0, 1.5])), pic(), true).contains("should be f1-1"));
+        assert!(try_one(one(an_opening("f1-1", [3.5, 0.5, 4.8, 1.5])), pic(), true).contains("isn't inside the face"));
+        assert!(try_one(one(an_opening("f1-1", [1.0, -1.0, 2.0, 1.5])), pic(), true).contains("isn't inside the face"));
+        let mut big = an_opening("f1-1", [1.0, 0.5, 2.0, 1.5]);
+        big.size = Some(crate::openings::Size { width_mm: 1500.0, height_mm: 1000.0, width_uncertainty_mm: 3.0, height_uncertainty_mm: 3.0, sill_mm: None, along_m: 1.0, from_foot: false, rows: 10, columns: 10 });
+        assert!(try_one(one(big.clone()), pic(), true).contains("larger than its box"));
+        big.size.as_mut().unwrap().width_mm = -1.0;
+        assert!(try_one(one(big), pic(), true).contains("larger than its box"));
+        let many = crate::openings::Found { openings: (0..51).map(|k| an_opening(&format!("f1-{}", k + 1), [1.0, 0.5, 2.0, 1.5])).collect(), not_counted: vec![] };
+        assert!(try_one(many, pic(), true).contains("more than 50"));
+        let gap = crate::openings::Found { openings: vec![], not_counted: vec![crate::openings::Gap { along_m: 3.9, bottom_m: 0.0, width_m: 1.0, height_m: 0.5, why: "a recess".into() }] };
+        assert!(try_one(gap, pic(), true).contains("a gap not counted isn't inside"));
+        // A sound count is taken.
+        let mut w = WorkState::default();
+        w.offers.insert("count_1".into(), count_offer(&["f1"]));
+        w.claim("laptop", "agent").unwrap();
+        w.put_merged("count_1", "agent", pack_blobs(&pic())).unwrap();
+        let mut ok = an_opening("f1-1", [1.0, 0.5, 2.0, 1.5]);
+        ok.size = Some(crate::openings::Size { width_mm: 990.0, height_mm: 1000.0, width_uncertainty_mm: 3.0, height_uncertainty_mm: 3.0, sill_mm: Some(500.0), along_m: 1.0, from_foot: false, rows: 10, columns: 10 });
+        assert!(w.deliver_count("count_1", "agent", CountResult { faces: vec![CountOut { face_id: "f1".into(), found: one(ok), pictured: true }] }).is_ok());
+    }
+
+    #[test]
+    fn pictures_are_pngs_of_a_few_megabytes_at_most() {
+        assert_eq!(unpack_pictures(&pack_blobs(&[png(1, 2), png(3, 4)])).unwrap().len(), 2);
+        assert_eq!(png_size(&png(600, 300)), Some((600, 300)));
+        assert!(unpack_pictures(&pack_blobs(&[png(1, 1), b"GIF89a".to_vec()])).unwrap_err().contains("every picture is a PNG"));
+        assert!(unpack_pictures(&pack_blobs(&[b"\x89PNG\r\n\x1a\n".to_vec()])).unwrap_err().contains("every picture is a PNG"), "no header");
+        assert!(unpack_pictures(&[1, 0]).unwrap_err().contains("cut short"));
+        assert!(unpack_pictures(&vec![0; PICTURES_MAX + 1]).unwrap_err().contains("more than 16 MB"));
+    }
+
+    #[tokio::test]
+    async fn a_count_with_no_worker_seen_is_not_offered() {
+        let b = Bridge::new().await;
+        assert!(matches!(offer_count(&b.st, "p1", json!({}), vec![spec("f1")], Duration::from_secs(1)).await, CountOffered::NoWorker));
+    }
+
+    #[tokio::test]
+    async fn a_count_nobody_claims_comes_back_within_ten_seconds() {
+        let b = Bridge::new().await;
+        b.st.work.lock().unwrap().claim("laptop", "agent"); // seen, but it never claims the count
+        let t0 = Instant::now();
+        assert!(matches!(offer_count(&b.st, "p1", json!({}), vec![spec("f1")], Duration::from_secs(60)).await, CountOffered::NoWorker));
+        assert!((9.5..12.0).contains(&t0.elapsed().as_secs_f64()));
+        assert!(b.st.work.lock().unwrap().offers.is_empty(), "taken back");
+    }
+
+    /// Have a seen worker claim what is on offer; returns its job.
+    async fn claim_offered(b: &Bridge) -> Value {
+        loop {
+            if let Some(j) = b.st.work.lock().unwrap().claim("laptop", "agent") {
+                return j;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_worker_that_claims_a_count_and_goes_silent_loses_it_and_its_late_result_is_refused() {
+        let b = Bridge::new().await;
+        b.st.work.lock().unwrap().claim("laptop", "agent");
+        let st = b.st.clone();
+        let offered = tokio::spawn(async move { offer_count(&st, "p1", json!({"faces": [], "stations": []}), vec![spec("f1")], Duration::from_millis(400)).await });
+        let job = claim_offered(&b).await;
+        assert_eq!(b.st.work.lock().unwrap().workers()[0]["job_kind"], "count");
+        let CountOffered::Failed(worker, why) = offered.await.unwrap() else { panic!("taken back") };
+        assert_eq!((worker.as_str(), why.as_str()), ("laptop", "took longer than 0 s"));
+        let id = job["job_id"].as_str().unwrap();
+        let (code, body) = b.call("POST", &format!("/v1/work/{id}/result"), Some(AGENT), Some(json!({"faces": [serde_json::to_value(counted("f1", false)).unwrap()]}))).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_count_delivered_through_the_routes_comes_back_with_its_pictures_and_token() {
+        let b = Bridge::new().await;
+        b.st.work.lock().unwrap().claim("laptop", "agent");
+        let st = b.st.clone();
+        let mut f2 = spec("f2");
+        f2.height_m = None; // no station saw it: no picture
+        let offered = tokio::spawn(async move { offer_count(&st, "p1", json!({"faces": [], "stations": []}), vec![spec("f1"), f2], Duration::from_secs(5)).await });
+        // Claimed through the route, by the agent's token.
+        let job = loop {
+            let (code, j) = b.call("POST", "/v1/work/claim", Some(AGENT), Some(json!({"worker": "laptop"}))).await;
+            if code == StatusCode::OK {
+                break j;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let id = job["job_id"].as_str().unwrap().to_string();
+        assert!(b.st.inner.lock().unwrap().log.iter().any(|e| e.text == "Worker laptop took the count"));
+        // Pictures that aren't PNGs, or too many bytes, are refused; PNGs are kept.
+        let (code, _, _) = b.put_bytes(&format!("/v1/work/{id}/merged"), Some(AGENT), pack_blobs(&[b"GIF89a".to_vec()])).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let (code, _, body) = b.put_bytes(&format!("/v1/work/{id}/merged"), Some(AGENT), vec![0; PICTURES_MAX + 1]).await;
+        assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE, "{}", String::from_utf8_lossy(&body));
+        let (code, _, _) = b.put_bytes(&format!("/v1/work/{id}/merged"), Some(AGENT), pack_blobs(&[picture_of("f1")])).await;
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        let mut found = crate::openings::Found::default();
+        found.not_counted.push(crate::openings::Gap { along_m: 1.0, bottom_m: 0.0, width_m: 0.5, height_m: 0.5, why: "a recess".into() });
+        let faces = json!({"faces": [{"face_id": "f1", "found": found, "pictured": true}, {"face_id": "f2", "found": crate::openings::Found::default()}]});
+        let (code, body) = b.call("POST", &format!("/v1/work/{id}/result"), Some(AGENT), Some(faces)).await;
+        assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
+        let CountOffered::Done(reads, worker, token) = offered.await.unwrap() else { panic!("done") };
+        assert_eq!((worker.as_str(), token.as_str()), ("laptop", "agent"));
+        assert_eq!((reads[0].0.not_counted.len(), reads[0].1.clone(), reads[1].1.is_none()), (1, Some(picture_of("f1")), true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registration_waits_for_a_worker_busy_with_a_count() {
+        let b = Bridge::new().await;
+        // The laptop holds a count, and says nothing while it measures: it is no longer seen.
+        let st = b.st.clone();
+        b.st.work.lock().unwrap().claim("laptop", "agent");
+        let counting = tokio::spawn(async move { offer_count(&st, "p1", json!({"faces": [], "stations": []}), vec![spec("f1")], Duration::from_secs(30)).await });
+        let count_job = claim_offered(&b).await;
+        b.st.work.lock().unwrap().workers.get_mut("laptop").unwrap().0 -= WORKER_SEEN;
+        assert!(b.st.work.lock().unwrap().workers().is_empty(), "not seen");
+        // A registration offered now waits for it, past 10 s.
+        let st = b.st.clone();
+        let registering = tokio::spawn(async move { offer(&st, "job_r", "p1", &[(1, "s1".to_string())], &[], &|| false, &|_| {}).await });
+        tokio::time::sleep(Duration::from_millis(11_500)).await;
+        assert!(!registering.is_finished(), "still offered while the laptop counts");
+        assert_eq!(b.st.work.lock().unwrap().kind("job_r"), Some("register"));
+        // Progress on the count makes it seen again.
+        let id = count_job["job_id"].as_str().unwrap().to_string();
+        b.st.work.lock().unwrap().holds(&id, "agent").unwrap();
+        assert_eq!(b.st.work.lock().unwrap().workers().len(), 1);
+        // The count ends; the laptop takes the registration next.
+        b.st.work.lock().unwrap().deliver(&id, "agent", Err("stopped".into())).unwrap();
+        assert!(matches!(counting.await.unwrap(), CountOffered::Failed(..)));
+        let next = claim_offered(&b).await;
+        assert_eq!((next["kind"].as_str(), next["job_id"].as_str()), (Some("register"), Some("job_r")));
+        b.st.work.lock().unwrap().deliver("job_r", "agent", Err("stopped".into())).unwrap();
+        assert!(matches!(registering.await.unwrap(), Offered::Failed(_)));
+        // With nothing held and no one seen, a registration goes to the Pi at once.
+        assert!(b.st.work.lock().unwrap().busy_with_short_job().is_none());
+        b.st.work.lock().unwrap().workers.get_mut("laptop").unwrap().0 -= WORKER_SEEN;
+        assert!(matches!(offer(&b.st, "job_s", "p1", &[(1, "s1".to_string())], &[], &|| false, &|_| {}).await, Offered::NoWorker));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_count_whose_waiter_is_gone_holds_no_registration_back() {
+        let b = Bridge::new().await;
+        b.st.work.lock().unwrap().claim("laptop", "agent");
+        // A count is claimed, then its request is cut off.
+        let st = b.st.clone();
+        let counting = tokio::spawn(async move { offer_count(&st, "p1", json!({"faces": [], "stations": []}), vec![spec("f1")], Duration::from_secs(30)).await });
+        claim_offered(&b).await;
+        counting.abort();
+        let _ = counting.await;
+        assert!(b.st.work.lock().unwrap().offers.is_empty(), "taken back when its waiter went");
+        // A registration then goes to the Pi when no one claims it, within 10 s.
+        let t0 = Instant::now();
+        assert!(matches!(offer(&b.st, "job_r", "p1", &[(1, "s1".to_string())], &[], &|| false, &|_| {}).await, Offered::NoWorker));
+        assert!(t0.elapsed() < Duration::from_secs(12));
+        // An offer nobody claimed, or one held past its limit, holds nothing back either.
+        let mut w = WorkState::default();
+        w.offers.insert("unclaimed".into(), count_offer(&["f1"]));
+        assert_eq!(w.busy_with_short_job(), None);
+        w.claim("laptop", "agent").unwrap();
+        assert_eq!(w.busy_with_short_job().as_deref(), Some("laptop"));
+        if let Some(t) = w.offers.get_mut("unclaimed").unwrap().claimed_at.as_mut() {
+            *t -= Duration::from_secs(61);
+        }
+        assert_eq!(w.busy_with_short_job(), None, "past its limit");
     }
 
     #[test]
@@ -1008,7 +1478,7 @@ mod tests {
     // ------------------------------------------------- part D: held files, saves ---
 
     fn save_offer(project: &str) -> Offer {
-        Offer { project_id: project.into(), job: Job::Save, claimed_by: None, merged: None, done: None, heard: None }
+        Offer { project_id: project.into(), job: Job::Save, claimed_by: None, merged: None, done: None, heard: None, claimed_at: None, limit: None }
     }
 
     #[test]
