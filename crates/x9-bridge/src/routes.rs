@@ -73,6 +73,8 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/v1/projects/:project_id/mission/sign-off", post(mission_sign_off))
         .route("/v1/projects/:project_id/list", get(get_list).put(put_list))
         .route("/v1/projects/:project_id/list/bind", post(bind_lines))
+        .route("/v1/projects/:project_id/list/proposal", post(propose_sorting))
+        .route("/v1/projects/:project_id/list/sort", post(sort_lines))
         .route("/v1/projects/:project_id/record", get(get_record))
         .route("/v1/projects/:project_id/count", get(get_count).post(post_count))
         .route("/v1/projects/:project_id/count/matches", post(post_matches))
@@ -807,6 +809,22 @@ fn mission_changed(st: &AppState, m: &crate::mission::Mission) -> Json<Value> {
     Json(v)
 }
 
+/// Change the project's mission under one lock: read it, change a copy, and
+/// store the copy only if the change succeeds, so two requests at once can't
+/// write over each other. Then save and tell the web UI.
+fn change_mission<T>(st: &AppState, project_id: &str, f: impl FnOnce(&mut crate::mission::Mission) -> ApiResult<T>) -> ApiResult<(T, crate::mission::Mission)> {
+    let (out, m) = {
+        let mut inner = st.inner.lock().unwrap();
+        let mut m = inner.missions.get(project_id).cloned().ok_or_else(|| ApiError::not_found("mission"))?;
+        let out = f(&mut m)?;
+        inner.missions.insert(project_id.to_string(), m.clone());
+        (out, m)
+    };
+    st.save_missions();
+    st.emit("mission", json!(m));
+    Ok((out, m))
+}
+
 fn mission_of(st: &AppState, project_id: &str) -> ApiResult<crate::mission::Mission> {
     st.inner.lock().unwrap().missions.get(project_id).cloned().ok_or_else(|| ApiError::not_found("mission"))
 }
@@ -936,38 +954,82 @@ struct ListQuery {
     revision: Option<String>,
     #[serde(default)]
     title: Option<String>,
+    /// An inspection and test plan's id, for its revisions (default `itp`).
+    #[serde(default)]
+    list_id: Option<String>,
 }
 
-/// Load the list the job must document, as JSON (`specs/list-mission/list.schema.json`)
-/// or a door and window schedule (CSV): it becomes the project's mission, one
-/// target per line. A new revision of the same list keeps the answers of the
-/// lines whose words did not change.
+/// Load the list the job must document, as JSON (`specs/list-mission/list.schema.json`),
+/// an inspection and test plan's spreadsheet or a door and window schedule
+/// (CSV): it becomes the project's mission, one target per line. A new
+/// revision of the same list keeps the answers of the lines whose words did
+/// not change; an unsorted line takes the earlier revision's sorting when its
+/// row says the same.
 async fn put_list(State(st): St, h: HeaderMap, Path(project_id): Path<String>, Query(q): Query<ListQuery>, body: Bytes) -> ApiResult<Json<Value>> {
     let c = st.require(&h, |r| r != Role::Viewer, "load lists")?;
     let text = std::str::from_utf8(&body).map_err(|_| ApiError::invalid("the list is text: JSON, or a CSV schedule"))?;
+    let mut notes: Vec<String> = Vec::new();
     let list = if text.trim_start().starts_with('{') {
         parse::<crate::list::List>(&body)?
-    } else if crate::list::is_schedule(text) {
-        crate::list::from_schedule(text, q.revision.as_deref().unwrap_or("A"), q.title.as_deref()).map_err(ApiError::invalid)?
     } else {
-        return Err(ApiError::invalid(
-            "a CSV is read as a door and window schedule (columns mark, type, width, height, tolerance, wall). An inspection and test plan's spreadsheet needs its lines sorted first, which this bridge doesn't do yet: send that list as JSON (specs/list-mission/list.schema.json)",
-        ));
+        match (crate::list::is_schedule(text), crate::list::is_itp(text)) {
+            (true, true) => return Err(ApiError::invalid("the header has a schedule's columns (mark, width) and an inspection and test plan's (line, requirement): send one or the other")),
+            (true, false) => crate::list::from_schedule(text, q.revision.as_deref().unwrap_or("A"), q.title.as_deref()).map_err(ApiError::invalid)?,
+            (false, true) => {
+                let (l, n) = crate::list::from_itp(text, q.list_id.as_deref().unwrap_or("itp"), q.revision.as_deref().unwrap_or("A"), q.title.as_deref()).map_err(ApiError::invalid)?;
+                notes = n;
+                l
+            }
+            (false, false) if crate::list::semicolons(text) => {
+                return Err(ApiError::invalid("the spreadsheet is separated by semicolons: save it as comma-separated (CSV, comma delimited) and send it again"))
+            }
+            (false, false) => {
+                return Err(ApiError::invalid(
+                    "a CSV is read as an inspection and test plan (columns line, group, activity, requirement, reference, method, tolerance, record, and one per party) or a door and window schedule (columns mark, type, width, height, tolerance, wall); this header is neither",
+                ))
+            }
+        }
     };
     if !st.scanner.projects().await?.iter().any(|p| p.project_uuid.as_deref() == Some(project_id.as_str())) {
         return Err(ApiError::not_found("project"));
     }
-    let prev = st.inner.lock().unwrap().missions.get(&project_id).cloned();
-    let m = crate::list::mission(list, &project_id, &c.name, prev.as_ref()).map_err(|e| if e.contains("signed off") || e.contains("one list per project") { ApiError::conflict(e) } else { ApiError::invalid(e) })?;
+    // A JSON list's sortings are a person's only when a person loads it; a
+    // schedule's lines are sorted by the reader, and a plan's arrive unsorted.
+    let by_person = c.role.is_operator() || !text.trim_start().starts_with('{');
+    let (prev, m) = {
+        let mut inner = st.inner.lock().unwrap();
+        let prev = inner.missions.get(&project_id).cloned();
+        let m = crate::list::mission(list, &project_id, &c.name, prev.as_ref(), by_person).map_err(|e| if e.contains("signed off") || e.contains("one list per project") { ApiError::conflict(e) } else { ApiError::invalid(e) })?;
+        inner.missions.insert(project_id.clone(), m.clone());
+        (prev, m)
+    };
     let l = m.list.as_ref().expect("a list mission");
     let kept = prev.as_ref().filter(|p| p.mission_id == m.mission_id).map(|p| {
         let n = m.targets.iter().filter(|t| p.targets.iter().any(|o| o.target_id == t.target_id && o.updated_at == t.updated_at)).count();
         format!(" ({n} kept from revision {})", p.list.as_ref().map(|x| x.revision.as_str()).unwrap_or("?"))
     });
-    st.log("note", format!("List loaded: {}, revision {}: {} lines{}", l.title, l.revision, l.lines.len(), kept.unwrap_or_default()), &c.name, Some(&project_id), &[("mission_id", &m.mission_id)]);
+    let unsorted = crate::list::unsorted(&m);
+    let to_sort = if unsorted.is_empty() { String::new() } else { format!("; {} to sort", unsorted.len()) };
+    st.log("note", format!("List loaded: {}, revision {}: {} lines{}{to_sort}", l.title, l.revision, l.lines.len(), kept.unwrap_or_default()), &c.name, Some(&project_id), &[("mission_id", &m.mission_id)]);
+    let before = prev.as_ref().map(|p| p.proposal_seq).unwrap_or(0);
+    let new: Vec<&str> = m.proposed.values().filter(|p| p.seq > before).map(|p| p.sorting.line_id.as_str()).collect();
+    if !new.is_empty() {
+        st.log("note", format!("Sorting proposed from the list for {}: a person sorts them", new.join(", ")), &c.name, Some(&project_id), &[("mission_id", &m.mission_id)]);
+    }
+    for (id, n) in &m.line_notes {
+        if prev.as_ref().and_then(|p| p.line_notes.get(id)) != Some(n) {
+            st.log("note", format!("Line {id}: {n}"), &c.name, Some(&project_id), &[("mission_id", &m.mission_id)]);
+        }
+    }
     let lines = crate::list::lines_said(&m);
-    let mut v = mission_changed(&st, &m).0;
+    st.save_missions();
+    let mut v = json!(m);
+    st.emit("mission", v.clone());
     v["lines"] = json!(lines);
+    v["unsorted"] = json!(unsorted);
+    if !notes.is_empty() {
+        v["notes"] = json!(notes);
+    }
     Ok(Json(v))
 }
 
@@ -975,7 +1037,66 @@ async fn get_list(State(st): St, h: HeaderMap, Path(project_id): Path<String>) -
     st.caller(&h)?;
     let m = mission_of(&st, &project_id)?;
     let list = m.list.clone().ok_or_else(|| ApiError::not_found("list (the mission wasn't made from one)"))?;
-    Ok(Json(json!({"list": list, "lines": crate::list::lines_said(&m), "earlier_revisions": m.earlier.iter().map(|r| r["list_revision"].clone()).collect::<Vec<_>>()})))
+    Ok(Json(json!({"list": list, "lines": crate::list::lines_said(&m), "unsorted": crate::list::unsorted(&m), "proposed": m.proposed, "as_of": m.proposal_seq,
+                   "earlier_revisions": m.earlier.iter().map(|r| r["list_revision"].clone()).collect::<Vec<_>>()})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalReq {
+    sortings: Vec<crate::list::Sorting>,
+}
+
+/// The agent proposes how lines are sorted: their grade, question and
+/// tolerance. Nothing changes on the lines until a person sorts them.
+async fn propose_sorting(State(st): St, h: HeaderMap, Path(project_id): Path<String>, body: Bytes) -> ApiResult<Json<Value>> {
+    let c = st.require(&h, |r| r != Role::Viewer, "propose a sorting")?;
+    let req: ProposalReq = parse(&body)?;
+    let (lines, m) = change_mission(&st, &project_id, |m| crate::list::propose(m, &req.sortings, &c.name).map_err(|e| if e.contains("signed off") { ApiError::conflict(e) } else { ApiError::invalid(e) }))?;
+    let ids: Vec<&str> = req.sortings.iter().map(|s| s.line_id.trim()).collect();
+    st.log("note", format!("Sorting proposed for {}: {}", if ids.len() == 1 { "line" } else { "lines" }, ids.join(", ")), &c.name, Some(&project_id), &[("mission_id", &m.mission_id)]);
+    let waiting: Vec<String> = crate::list::unsorted(&m).into_iter().filter(|id| !m.proposed.contains_key(id)).collect();
+    Ok(Json(json!({"proposed": lines, "not_proposed": waiting, "as_of": m.proposal_seq,
+                   "say": "Proposed. A person sorts the lines: they confirm the proposal or change it."})))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SortReq {
+    /// Proposals to apply, by line.
+    #[serde(default)]
+    lines: Vec<String>,
+    /// The last proposal the person saw: with no `lines` or `sortings`, every
+    /// proposal up to it; a newer one named is refused (409).
+    #[serde(default)]
+    as_of: Option<u64>,
+    /// The person's own sortings, over any proposal for the same line.
+    #[serde(default)]
+    sortings: Vec<crate::list::Sorting>,
+    #[serde(default)]
+    confirmed_via: Option<String>,
+}
+
+/// A person sorts lines (operator; the agent proposes): the proposals they
+/// confirm, and any they change.
+async fn sort_lines(State(st): St, h: HeaderMap, Path(project_id): Path<String>, body: Bytes) -> ApiResult<Json<Value>> {
+    let c = st.require(&h, Role::is_operator, "sort list lines (a person does; the agent proposes)")?;
+    let req: SortReq = if body.iter().all(u8::is_ascii_whitespace) { SortReq::default() } else { parse(&body)? };
+    let (done, m) = change_mission(&st, &project_id, |m| {
+        crate::list::sort(m, &req.lines, &req.sortings, req.as_of).map_err(|e| match e {
+            crate::list::SortError::Newer(e) => ApiError::conflict(e),
+            crate::list::SortError::Invalid(e) if e.contains("signed off") => ApiError::conflict(e),
+            crate::list::SortError::Invalid(e) => ApiError::invalid(e),
+        })
+    })?;
+    let via = req.confirmed_via.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(|v| v.chars().take(300).collect::<String>()).unwrap_or_else(|| "web UI".into());
+    let n = done.sorted.len() + done.unchanged.len();
+    let changed = if done.changed_by_person > 0 { format!(", {} changed by the person", done.changed_by_person) } else { String::new() };
+    let again = if done.unchanged.is_empty() { String::new() } else { format!("; {} as before", done.unchanged.join(", ")) };
+    st.log("approval", format!("Sorted {n} {} ({} as proposed{changed}){again} ({via})", if n == 1 { "line" } else { "lines" }, done.as_proposed), &c.name, Some(&project_id), &[("mission_id", &m.mission_id)]);
+    let lines = crate::list::lines_said(&m);
+    Ok(Json(json!({"sorted": done.sorted, "unchanged": done.unchanged, "as_proposed": done.as_proposed, "changed_by_person": done.changed_by_person,
+                   "notes": done.notes, "unsorted": crate::list::unsorted(&m), "lines": lines})))
 }
 
 /// The record of the list: what each line came to.
@@ -1009,7 +1130,7 @@ struct BindReq {
 async fn bind_lines(State(st): St, h: HeaderMap, Path(project_id): Path<String>, body: Bytes) -> ApiResult<Json<Value>> {
     let c = st.require(&h, Role::is_operator, "bind list lines to a place (a person does; the agent proposes)")?;
     let req: BindReq = parse(&body)?;
-    let mut m = mission_of(&st, &project_id)?;
+    let m = mission_of(&st, &project_id)?;
     let geo = st.geo(&project_id);
     let (face, label) = match (&req.wall_id, req.from, req.to) {
         (Some(w), None, None) => (geo.wall(w.trim()).ok_or_else(|| ApiError::invalid(format!("there is no wall {w:?} in the registration")))?, w.trim().to_string()),
@@ -1031,10 +1152,11 @@ async fn bind_lines(State(st): St, h: HeaderMap, Path(project_id): Path<String>,
         Some(p) => format!("{p} ({label})"),
         None => label,
     };
-    let names = crate::list::bind(&mut m, &ids, face, &label, &c.name, &via, &geo).map_err(|e| if e.contains("signed off") { ApiError::conflict(e) } else { ApiError::invalid(e) })?;
+    let (names, m) = change_mission(&st, &project_id, |m| {
+        crate::list::bind(m, &ids, face, &label, &c.name, &via, &geo).map_err(|e| if e.contains("signed off") { ApiError::conflict(e) } else { ApiError::invalid(e) })
+    })?;
     st.log("approval", format!("Bound to {label}: {} ({via})", names.join(", ")), &c.name, Some(&project_id), &[("mission_id", &m.mission_id)]);
     let lines = crate::list::lines_said(&m);
-    let _ = mission_changed(&st, &m);
     Ok(Json(json!({"bound": names, "face": {"label": label, "from": face.from, "to": face.to}, "lines": lines})))
 }
 

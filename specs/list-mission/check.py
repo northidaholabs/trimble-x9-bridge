@@ -51,7 +51,9 @@ def rules(lst, rec):
         line, status, conf = lines[lid], r["status"], r.get("conformance")
         ev = r.get("evidence") or {}
         grade = ev.get("grade")
-        if status == "answered":
+        if status == "answered" and "evidence" not in line:
+            notes.append(f"{lid}: answered on a line nobody has sorted; no grade was asked to compare it with")
+        elif status == "answered":
             if RANK[grade] < RANK[line["evidence"]]:
                 notes.append(f"{lid}: answered below the grade asked; the list asks for {line['evidence']}, the answer is {grade}")
             if grade == "attested" and not ev.get("document"):
@@ -130,22 +132,61 @@ def check(lst, rec):
     return (problems, []) if problems else rules(lst, rec)
 
 
+ITP_COLUMNS = ["line", "group", "activity", "requirement", "reference", "method", "tolerance", "record"]
+
+
+ROLES = {"contractor": "contractor", "subcontractor": "subcontractor", "sub": "subcontractor", "client": "client",
+         "owner": "client", "inspector": "inspector", "third_party": "third_party"}
+
+
+def party_column(header):
+    """A party's column: `checker (client)`, or a role's own name; ASCII
+    letters and digits make its id. The bridge reads it the same way
+    (crates/x9-bridge/src/list.rs, from_itp)."""
+    name, _, role = header.strip().partition("(")
+    pid = "-".join("".join(c if c.isascii() and c.isalnum() else " " for c in name.lower()).split())
+    word = lambda w: ROLES.get(w.strip().lower().replace(" ", "_").replace("-", "_"))
+    return pid, word(role.rstrip(" )")) if role else word(name)
+
+
+def itp_list(csv_path):
+    """The list a spreadsheet reads into before any sorting: every line
+    unsorted (no evidence, no question), its tolerance the sheet's words."""
+    rows = list(csv.DictReader(Path(csv_path).open(encoding="utf8")))
+    parties = {h: party_column(h) for h in rows[0] if h.strip().lower() not in ITP_COLUMNS}
+    lines = []
+    for row in rows:
+        line = {"line_id": row["line"], "activity": row["activity"], "requirement": row["requirement"], "method": row["method"]}
+        line |= {k: row[k] for k in ("group", "reference", "record") if row.get(k)}
+        if row.get("tolerance"):
+            line["tolerance"] = {"words": row["tolerance"]}
+        if points := {pid: row[h] for h, (pid, _) in parties.items() if row[h]}:
+            line["points"] = points
+        lines.append(line)
+    return {"format": "nil-list", "version": 0, "list_id": "itp", "title": "Inspection and test plan", "revision": "A",
+            "source": {"kind": "itp"}, "parties": [{"id": pid, "role": role or "third_party"} for pid, role in parties.values()], "lines": lines}
+
+
 def sheet_problems(csv_path, lst):
-    """The spreadsheet carries the ITP's columns. What it cannot carry is the agent's sorting step."""
-    out, lines = [], {l["line_id"]: l for l in lst["lines"]}
-    parties = [p["id"] for p in lst["parties"]]
-    for row in csv.DictReader(Path(csv_path).open(encoding="utf8")):
-        line = lines.get(row["line"])
+    """The spreadsheet carries the ITP's columns, unsorted; sorting adds each line's grade, question
+    and tolerance arithmetic. Read, it is a valid list whose lines and parties are the sample's
+    less its sorting."""
+    sheet = itp_list(csv_path)
+    out = schema_problems(sheet, "list.schema.json")
+    if sheet["parties"] != lst["parties"]:
+        out.append("the sheet's party columns differ from the list's parties")
+    lines = {l["line_id"]: l for l in lst["lines"]}
+    for row in sheet["lines"]:
+        line = lines.get(row["line_id"])
         if not line:
-            out.append(f"{row['line']}: in the sheet, not in the list")
+            out.append(f"{row['line_id']}: in the sheet, not in the list")
             continue
-        want = {"group": line.get("group", ""), "activity": line["activity"], "requirement": line["requirement"],
-                "reference": line.get("reference", ""), "method": line["method"],
-                "tolerance": line.get("tolerance", {}).get("words", ""), "record": line.get("record", "")}
-        want.update({p: line.get("points", {}).get(p, "") for p in parties})
-        out += [f"{row['line']}: {k} differs" for k, v in want.items() if row.get(k, "") != v]
+        want = {k: v for k, v in line.items() if k not in ("evidence", "question", "place_hint", "note")}
+        if "tolerance" in want:
+            want["tolerance"] = {"words": want["tolerance"]["words"]}
+        out += [f"{row['line_id']}: {k} differs" for k in sorted(set(want) | set(row)) if row.get(k) != want.get(k)]
         if line["evidence"] != DEFAULT_EVIDENCE[line["method"]]:
-            out.append(f"{row['line']}: evidence is not the method's default; the sheet cannot say so")
+            out.append(f"{row['line_id']}: evidence is not the method's default")
     return out
 
 
