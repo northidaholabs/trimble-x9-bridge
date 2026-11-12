@@ -19,7 +19,7 @@
 use crate::ask::Verdict;
 use crate::list::Kind;
 use crate::mission::{Mission, Status};
-use crate::openings::{judge_line, propose, Counted, FaceCount, LineCheck, Match, Raster};
+use crate::openings::{judge_line, propose, rematch, Again, Counted, FaceCount, LineCheck, Match, Raster};
 use crate::problem::ApiError;
 use crate::register::{Face, Pose, FACE_COVERED};
 use crate::state::AppState;
@@ -90,6 +90,9 @@ pub fn check_read(spec: &FaceSpec, found: &crate::openings::Found, png: Option<&
     let slack = 1e-6;
     let inside = |u: f64, z: f64| (-slack..=g.u_max + slack).contains(&u) && (g.z[0] - slack..=g.z[1] + slack).contains(&z);
     let a_box = |[u0, z0, u1, z1]: [f64; 4]| [u0, z0, u1, z1].iter().all(|v| v.is_finite()) && u0 < u1 && z0 < z1 && inside(u0, z0) && inside(u1, z1);
+    if found.openings.iter().any(|o| o.same_as.is_some()) || found.not_counted.iter().any(|g| g.same_as.is_some()) {
+        return Err("same_as is the bridge's to say".into());
+    }
     for (k, o) in found.openings.iter().enumerate() {
         let id = format!("{}-{}", spec.face_id, k + 1);
         if o.opening_id != id {
@@ -180,6 +183,166 @@ fn number(found: &mut crate::openings::Found, face_id: &str) {
     }
 }
 
+/// Two bound faces are one wall when they run parallel within this angle…
+const SAME_WALL_DEG: f64 = 5.0;
+/// …and, where they overlap, each lies within this of the other's line: the
+/// 15 cm the registration takes a point to be on a face at.
+const SAME_WALL_M: f64 = 0.15;
+
+/// Where `b` overlaps `a`, measured along `a`: (how far, m; how far off
+/// `b`'s line `a` is at the overlap's two ends, the larger, m).
+fn overlap_on(a: &Face, b: &Face) -> Option<(f64, f64)> {
+    let d = [a.to[0] - a.from[0], a.to[1] - a.from[1]];
+    let len = d[0].hypot(d[1]);
+    let e = [b.to[0] - b.from[0], b.to[1] - b.from[1]];
+    let len_b = e[0].hypot(e[1]);
+    if len < 1e-6 || len_b < 1e-6 {
+        return None;
+    }
+    let u = [d[0] / len, d[1] / len];
+    let w = [e[0] / len_b, e[1] / len_b];
+    let along = |p: [f64; 2]| u[0] * (p[0] - a.from[0]) + u[1] * (p[1] - a.from[1]);
+    let (x, y) = (along(b.from), along(b.to));
+    let (lo, hi) = (x.min(y).max(0.0), x.max(y).min(len));
+    if hi <= lo {
+        return None;
+    }
+    let off_b = |t: f64| {
+        let p = [a.from[0] + u[0] * t, a.from[1] + u[1] * t];
+        (w[0] * (p[1] - b.from[1]) - w[1] * (p[0] - b.from[0])).abs()
+    };
+    Some((hi - lo, off_b(lo).max(off_b(hi))))
+}
+
+/// How far `a` and `b` run along each other when they are one wall (m);
+/// none when they aren't, or don't overlap. The same either way round:
+/// parallel or antiparallel within `SAME_WALL_DEG`, and within
+/// `SAME_WALL_M` of each other over the overlap, measured from both.
+pub fn same_wall(a: &Face, b: &Face) -> Option<f64> {
+    let (ab, ba) = (overlap_on(a, b)?, overlap_on(b, a)?);
+    let dir = |f: &Face| {
+        let d = [f.to[0] - f.from[0], f.to[1] - f.from[1]];
+        let l = d[0].hypot(d[1]);
+        [d[0] / l, d[1] / l]
+    };
+    let (u, w) = (dir(a), dir(b));
+    if (u[0] * w[1] - u[1] * w[0]).abs() > SAME_WALL_DEG.to_radians().sin() || ab.1.min(ba.1) > SAME_WALL_M {
+        return None;
+    }
+    Some(ab.0.min(ba.0))
+}
+
+/// Two openings, or gaps, on one wall are the same when their boxes overlap
+/// across at least this share of the smaller: an opening one face's end
+/// cuts through is part of the same hole, though its middle has moved.
+const SAME_BOX: f64 = 0.5;
+
+/// A box on face `f` (u0, z0, u1, z1, m along it), as it lies along face
+/// `a` of the same wall.
+fn along(a: &Face, f: &Face, b: [f64; 4]) -> [f64; 4] {
+    let unit = |g: &Face| {
+        let d = [g.to[0] - g.from[0], g.to[1] - g.from[1]];
+        let len = d[0].hypot(d[1]).max(1e-6);
+        [d[0] / len, d[1] / len]
+    };
+    let (ua, uf) = (unit(a), unit(f));
+    let u = |t: f64| {
+        let p = [f.from[0] + uf[0] * t, f.from[1] + uf[1] * t];
+        ua[0] * (p[0] - a.from[0]) + ua[1] * (p[1] - a.from[1])
+    };
+    let (x, y) = (u(b[0]), u(b[2]));
+    [x.min(y), b[1], x.max(y), b[3]]
+}
+
+/// Whether box `p` on face `fa` and box `q` on face `fb`, both one wall,
+/// are the same opening (`SAME_BOX`).
+fn same_box(fa: &Face, p: [f64; 4], fb: &Face, q: [f64; 4]) -> bool {
+    let q = along(fa, fb, q);
+    let w = (p[2].min(q[2]) - p[0].max(q[0])).max(0.0);
+    let h = (p[3].min(q[3]) - p[1].max(q[1])).max(0.0);
+    let area = |b: [f64; 4]| (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0);
+    let least = area(p).min(area(q));
+    least > 0.0 && w * h >= SAME_BOX * least
+}
+
+fn gap_box(g: &crate::openings::Gap) -> [f64; 4] {
+    [g.along_m, g.bottom_m, g.along_m + g.width_m, g.bottom_m + g.height_m]
+}
+
+/// Count each opening once. Bound faces of one wall overlap (a wall and a
+/// stretch of it, or two walls the registration split), and an opening in
+/// the overlap is found on each. The earlier face in the list's order keeps
+/// it; on a later one it is `same_as` that one: their boxes overlap
+/// (`SAME_BOX`). A gap not counted is listed once the same way.
+fn count_once(faces: &mut [FaceCount]) {
+    for j in 1..faces.len() {
+        let earlier: Vec<usize> = (0..j).filter(|&i| same_wall(&faces[i].face, &faces[j].face).is_some()).collect();
+        if earlier.is_empty() {
+            continue;
+        }
+        let fjf = faces[j].face;
+        // Its openings: the same as one an earlier face counted.
+        {
+            let (before, rest) = faces.split_at_mut(j);
+            for o in rest[0].found.openings.iter_mut() {
+                o.same_as = earlier.iter().find_map(|&i| before[i].found.openings.iter().find(|p| same_box(&before[i].face, p.box_m, &fjf, o.box_m)).map(|p| p.physical().to_string()));
+            }
+        }
+        // An earlier face's gap that is one of them (an earlier face saw
+        // less of the hole) is that opening, not a gap of its own.
+        let holes: Vec<([f64; 4], String)> = faces[j].found.openings.iter().map(|o| (o.box_m, o.physical().to_string())).collect();
+        for &i in &earlier {
+            let fi = faces[i].face;
+            for h in faces[i].found.not_counted.iter_mut() {
+                if let Some((_, id)) = holes.iter().find(|(b, _)| same_box(&fi, gap_box(h), &fjf, *b)) {
+                    h.same_as = Some(id.clone());
+                }
+            }
+        }
+        // Its gaps: an opening counted already, or a gap listed already
+        // (followed to where it was first listed).
+        let (before, rest) = faces.split_at_mut(j);
+        for g in rest[0].found.not_counted.iter_mut() {
+            let b = gap_box(g);
+            g.same_as = earlier.iter().find_map(|&i| {
+                let fi = &before[i];
+                let opening = fi.found.openings.iter().find(|p| same_box(&fi.face, p.box_m, &fjf, b)).map(|p| p.physical().to_string());
+                opening.or_else(|| fi.found.not_counted.iter().find(|h| same_box(&fi.face, gap_box(h), &fjf, b)).map(|h| h.same_as.clone().unwrap_or_else(|| fi.face_id.clone())))
+            });
+        }
+    }
+}
+
+/// Each matched line's opening in `counted`, found again on its face, all
+/// lines at once (`rematch`).
+fn found_again<'a>(m: &Mission, counted: &'a Counted) -> std::collections::HashMap<String, Again<'a>> {
+    let wants: Vec<(String, &'a [crate::openings::Opening], [f64; 2])> = m
+        .targets
+        .iter()
+        .filter_map(|t| {
+            let mt = t.opening.as_ref()?.matched.as_ref()?;
+            let fc = counted.faces.iter().find(|f| Some(f.face) == t.face)?;
+            Some((t.target_id.clone(), fc.found.openings.as_slice(), mt.centre))
+        })
+        .collect();
+    rematch(&wants)
+}
+
+/// The bound faces of opening lines that `face` runs along, other than
+/// itself: (label, how far, m).
+pub fn overlaps(m: &Mission, face: &Face) -> Vec<(String, f64)> {
+    let mut out: Vec<(Face, String, f64)> = Vec::new();
+    for b in bound_lines(m) {
+        if b.face == *face || out.iter().any(|o| o.0 == b.face) {
+            continue;
+        }
+        if let Some(by) = same_wall(&b.face, face) {
+            out.push((b.face, b.label, (by * 10.0).round() / 10.0));
+        }
+    }
+    out.into_iter().map(|(_, l, by)| (l, by)).collect()
+}
+
 /// A bound opening line: its id, what it expects, its tolerance, its face.
 struct Bound {
     line_id: String,
@@ -227,12 +390,19 @@ fn faces_of(bound: &[Bound]) -> Vec<(String, String, Face, Vec<String>)> {
 /// was counted from), open otherwise. Declined lines stay declined.
 fn apply(m: &mut Mission, counted: &Counted, scans: &std::collections::HashMap<u16, String>) {
     let bound = bound_lines(m);
+    let again = found_again(m, counted);
     for b in &bound {
         let Some(fc) = counted.faces.iter().find(|f| f.face == b.face) else { continue };
         let Some(t) = m.targets.iter_mut().find(|t| t.target_id == b.line_id) else { continue };
         let mut c = t.opening.clone().unwrap_or_default();
         let before = (c.verdict, c.size.clone(), c.conformance.clone());
-        judge_line(&mut c, &b.expected, b.max_mm, fc, &b.line_id);
+        judge_line(&mut c, &b.expected, b.max_mm, fc, &b.line_id, again.get(&b.line_id));
+        // Openings are numbered afresh by every count: a match found again
+        // takes the id it has now. Where it was matched stays as the person
+        // matched it, so a match can't drift along the wall count by count.
+        if let (Some(Again::Found(o)), Some(mt)) = (again.get(&b.line_id), c.matched.as_mut()) {
+            mt.opening_id = o.opening_id.clone();
+        }
         c.counted_on = Some(counted.counted_on.clone().unwrap_or_else(|| "bridge".into()));
         c.counted_by = counted.counted_by.clone();
         if t.status != Status::Declined {
@@ -251,20 +421,24 @@ fn apply(m: &mut Mission, counted: &Counted, scans: &std::collections::HashMap<u
 /// line, its state; the matches the bridge proposes for a person to confirm.
 fn said(project_id: &str, counted: &Counted, m: &Mission) -> Value {
     let bound = bound_lines(m);
-    // Which opening each matched line is on now (it may have a new id after a new count).
+    // Which line each opening is now, by the opening it is (`physical`):
+    // the matches found again in this count, all lines at once.
+    let again = found_again(m, counted);
     let mut on_now: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for t in &m.targets {
-        let Some(c) = &t.opening else { continue };
-        let (Some(mt), Some(fc)) = (&c.matched, counted.faces.iter().find(|f| Some(f.face) == t.face)) else { continue };
-        if let Some(o) = fc.found.openings.iter().find(|o| (o.centre[0] - mt.centre[0]).hypot(o.centre[1] - mt.centre[1]) <= crate::openings::REMATCH_M) {
-            on_now.insert(o.opening_id.clone(), t.target_id.clone());
+    for (line, a) in &again {
+        if let Again::Found(o) = a {
+            on_now.insert(o.physical().to_string(), line.clone());
         }
     }
     let mut proposed = Vec::new();
-    let mut not_on = Vec::new();
+    // Openings proposed, and those on no face with lines left to match, by the opening they are.
+    let mut put: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut not_on: Vec<String> = Vec::new();
+    // Openings a face with lines still to match could take.
+    let mut wanted: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut faces = Vec::new();
     let mut parts = Vec::new();
-    let (mut found_all, mut measured_all) = (0, 0);
+    let mut measured_once: std::collections::HashSet<String> = std::collections::HashSet::new();
     for fc in &counted.faces {
         let unmatched_lines: Vec<(String, crate::list::Expected)> = bound
             .iter()
@@ -272,21 +446,33 @@ fn said(project_id: &str, counted: &Counted, m: &Mission) -> Value {
             .filter(|b| m.targets.iter().find(|t| t.target_id == b.line_id).is_some_and(|t| t.status != Status::Declined))
             .map(|b| (b.line_id.clone(), b.expected.clone()))
             .collect();
-        let free: Vec<&crate::openings::Opening> = fc.found.openings.iter().filter(|o| !on_now.contains_key(&o.opening_id)).collect();
+        let free: Vec<&crate::openings::Opening> = fc.found.openings.iter().filter(|o| !on_now.contains_key(o.physical()) && !put.contains(o.physical())).collect();
+        if !unmatched_lines.is_empty() {
+            wanted.extend(free.iter().map(|o| o.physical().to_string()));
+        }
         if fc.seen_share >= FACE_COVERED {
             for (l, o, why) in propose(&unmatched_lines, &free) {
+                if let Some(op) = fc.found.openings.iter().find(|x| x.opening_id == o) {
+                    put.insert(op.physical().to_string());
+                }
                 proposed.push(json!({"line_id": l, "opening_id": o, "why": why}));
             }
             if unmatched_lines.is_empty() {
-                not_on.extend(free.iter().map(|o| o.opening_id.clone()));
+                not_on.extend(free.iter().map(|o| o.physical().to_string()));
             }
         }
+        for o in fc.found.openings.iter().filter(|o| o.size.is_some() && o.misfit.is_none()) {
+            measured_once.insert(o.physical().to_string());
+        }
         let n = fc.found.openings.len();
-        let measured = fc.found.openings.iter().filter(|o| o.size.is_some() && o.misfit.is_none()).count();
-        found_all += n;
-        measured_all += measured;
         let least = if fc.seen_share < FACE_COVERED { "at least " } else { "" };
-        parts.push(format!("{}: {least}{n} opening{} ({:.0}% seen)", fc.label, if n == 1 { "" } else { "s" }, fc.seen_share * 100.0));
+        let shared: Vec<&str> = fc.found.openings.iter().filter_map(|o| o.same_as.as_deref()).collect();
+        let shared = match shared.len() {
+            0 => String::new(),
+            1 => format!(", 1 of them {} counted already", shared[0]),
+            k => format!(", {k} of them {} counted already", shared.join(", ")),
+        };
+        parts.push(format!("{}: {least}{n} opening{}{shared} ({:.0}% seen)", fc.label, if n == 1 { "" } else { "s" }, fc.seen_share * 100.0));
         let openings: Vec<Value> = fc
             .found
             .openings
@@ -296,7 +482,7 @@ fn said(project_id: &str, counted: &Counted, m: &Mission) -> Value {
                 if let Some(s) = &o.size {
                     v["said"] = json!(crate::openings::size_said(s));
                 }
-                v["line_id"] = json!(on_now.get(&o.opening_id));
+                v["line_id"] = json!(on_now.get(o.physical()));
                 v
             })
             .collect();
@@ -317,11 +503,19 @@ fn said(project_id: &str, counted: &Counted, m: &Mission) -> Value {
                     l["size"] = json!(s);
                     l["said"] = json!(crate::openings::size_said(s));
                 }
-                l["opening_id"] = json!(on_now.iter().find(|(_, v)| **v == id).map(|(k, _)| k));
+                l["opening_id"] = json!(match again.get(&id) {
+                    Some(Again::Found(o)) => Some(o.opening_id.clone()),
+                    _ => None,
+                });
             }
             l
         })
         .collect();
+    // Each opening once: those not the same as one on an earlier face.
+    let found_all: usize = counted.faces.iter().map(|f| f.found.openings.iter().filter(|o| o.same_as.is_none()).count()).sum();
+    let measured_all = measured_once.len();
+    let mut seen_not_on = std::collections::HashSet::new();
+    not_on.retain(|o| !put.contains(o) && !wanted.contains(o) && seen_not_on.insert(o.clone()));
     let answered = lines.iter().filter(|l| l["status"] == "answered").count();
     let unbound = lines.iter().filter(|l| l["bound"].is_null()).count();
     let mut say = if counted.faces.is_empty() {
@@ -333,7 +527,7 @@ fn said(project_id: &str, counted: &Counted, m: &Mission) -> Value {
     if unbound > 0 && !counted.faces.is_empty() {
         say.push_str(&format!(" {unbound} line{} not bound to a face yet.", if unbound == 1 { " is" } else { "s are" }));
     }
-    let recesses: usize = counted.faces.iter().map(|f| f.found.not_counted.len()).sum();
+    let recesses: usize = counted.faces.iter().map(|f| f.found.not_counted.iter().filter(|g| g.same_as.is_none()).count()).sum();
     if recesses > 0 {
         say.push_str(&format!(" {recesses} gap{} not counted (see not_counted).", if recesses == 1 { "" } else { "s" }));
     }
@@ -437,6 +631,7 @@ pub async fn count(st: &Arc<AppState>, project_id: &str, by: &str) -> Result<Val
         }
         faces.push(FaceCount { face_id: id, label, face, length_m: cov["length_m"].as_f64().unwrap_or(0.0), seen_share: cov["seen_share"].as_f64().unwrap_or(0.0), stations, unseen: cov["unseen"].clone(), found, lines });
     }
+    count_once(&mut faces);
     let (counted_on, counted_by) = counted_on.map_or((None, None), |(w, t)| (Some(w), Some(t)));
     let counted = Counted { counted_at: crate::util::now_rfc3339(), counted_on: counted_on.clone(), counted_by, faces };
     // Judge the lines on the mission as it is now (it may have changed meanwhile).
@@ -503,6 +698,13 @@ pub fn confirm(st: &AppState, project_id: &str, req: &MatchReq, by: &str) -> Res
         if req.matches.is_empty() {
             return Err(ApiError::invalid("matches: at least one"));
         }
+        // The opening each other matched line holds in this count, found
+        // again as the count found it (its stored id may be an older count's).
+        let held: std::collections::HashMap<String, String> = found_again(&m, &counted)
+            .into_iter()
+            .filter_map(|(l, a)| if let Again::Found(o) = a { Some((l, o.physical().to_string())) } else { None })
+            .collect();
+        let asked: std::collections::HashSet<&str> = req.matches.iter().map(|it| it.line_id.trim()).collect();
         let mut lines = Vec::new();
         for it in &req.matches {
             let id = it.line_id.trim();
@@ -529,12 +731,20 @@ pub fn confirm(st: &AppState, project_id: &str, req: &MatchReq, by: &str) -> Res
                 }
             }
         }
-        // One line per opening.
-        let mut taken: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+        // One line per opening, whichever face it was matched on.
+        let mut taken: std::collections::HashMap<String, (&str, &str)> = std::collections::HashMap::new();
         for t in &m.targets {
             let Some(mt) = t.opening.as_ref().and_then(|c| c.matched.as_ref()) else { continue };
-            if let Some(other) = taken.insert(mt.opening_id.clone(), &t.target_id) {
-                return Err(ApiError::invalid(format!("opening {} would be both {other} and {}: undo one match (opening_id null) in the same request", mt.opening_id, t.target_id)));
+            let physical = if asked.contains(t.target_id.as_str()) {
+                counted.opening(&mt.opening_id).map_or(mt.opening_id.clone(), |(_, o)| o.physical().to_string())
+            } else {
+                // A match not found again in this count holds nothing.
+                let Some(p) = held.get(&t.target_id) else { continue };
+                p.clone()
+            };
+            if let Some((other, as_id)) = taken.insert(physical, (&t.target_id, &mt.opening_id)) {
+                let what = if as_id == mt.opening_id { format!("opening {}", mt.opening_id) } else { format!("openings {as_id} and {} are the same, and", mt.opening_id) };
+                return Err(ApiError::invalid(format!("{what} would be both {other} and {}: undo one match (opening_id null) in the same request", t.target_id)));
             }
         }
         let scans = inner.registrations.get(project_id).map(|r| r.station_scans()).unwrap_or_default();
@@ -780,6 +990,169 @@ pub(crate) mod tests {
         assert_eq!(b.call("POST", &matches, Some(OPERATOR), Some(json!({"matches": [{"line_id": "W1", "opening_id": null}]}))).await.0, StatusCode::CONFLICT);
         assert_eq!(b.call("POST", &bind, Some(OPERATOR), Some(json!({"lines": ["W1"], "wall_id": "w1"}))).await.0, StatusCode::CONFLICT);
         std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_opening_on_two_faces_of_one_wall_is_counted_once() {
+        // The front lines on w1; the back door's line on a face drawn along
+        // the same wall from y = -1 to 5, over the front door and the recess.
+        let (b, fx) = bound_facade().await;
+        let (code, v) = b.call("POST", &format!("/v1/projects/{P}/list/bind"), Some(OPERATOR), Some(json!({"lines": ["D9"], "from": [5.02, -1.0], "to": [4.98, 5.0]}))).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert_eq!(v["overlaps"], json!([{"label": "front (w1)", "overlap_m": 6.0}]), "{v}");
+        assert!(v["say"].as_str().unwrap().contains("an opening on both is counted once"), "{v}");
+        assert!(b.st.inner.lock().unwrap().log.iter().any(|e| e.text.starts_with("Bound to a drawn face: Door D9") && e.text.ends_with("it runs along front (w1) (6.0 m), and an opening on both is counted once")));
+        let (code, c) = b.call("POST", &format!("/v1/projects/{P}/count"), Some(AGENT), None).await;
+        assert_eq!(code, StatusCode::OK, "{c}");
+        let faces = c["faces"].as_array().unwrap();
+        assert_eq!(faces.len(), 2, "{c}");
+        // The front door is f1-3; on the drawn face it is the same opening.
+        let door = faces[1]["openings"].as_array().unwrap().iter().find(|o| o["same_as"] == "f1-3").unwrap_or_else(|| panic!("{c}"));
+        let door_id = door["opening_id"].as_str().unwrap().to_string();
+        assert!(faces[1]["openings"].as_array().unwrap().iter().all(|o| !o["same_as"].is_null()), "every opening on the drawn face is one the front has: {c}");
+        assert!(faces[1]["not_counted"].as_array().unwrap().iter().all(|g| !g["same_as"].is_null()), "the recess is listed once: {c}");
+        // Counted once: three openings, two measured, one recess.
+        let say = c["say"].as_str().unwrap();
+        assert!(say.starts_with("3 openings found, 2 measured."), "{say}");
+        assert!(say.contains("f1-3 counted already") && say.contains(" 1 gap not counted"), "{say}");
+        // The door is proposed to one line, not to both D1 and D9.
+        let proposed: Vec<(String, String)> = c["proposed"].as_array().unwrap().iter().map(|p| (p["line_id"].as_str().unwrap().into(), p["opening_id"].as_str().unwrap().into())).collect();
+        assert!(proposed.contains(&("D1".into(), "f1-3".into())), "{proposed:?}");
+        assert!(!proposed.iter().any(|(_, o)| *o == door_id), "{proposed:?}");
+        assert!(c["not_on_schedule"].as_array().unwrap().iter().all(|o| o != "f1-3"), "{c}");
+        // A person can't make the one door both D1 and D9.
+        let matches = format!("/v1/projects/{P}/count/matches");
+        let both = json!({"matches": [{"line_id": "D1", "opening_id": "f1-3"}, {"line_id": "D9", "opening_id": door_id}]});
+        let (code, e) = b.call("POST", &matches, Some(OPERATOR), Some(both)).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{e}");
+        assert!(e["detail"].as_str().unwrap().contains(&format!("openings f1-3 and {door_id} are the same, and would be both D1 and D9")), "{e}");
+        // D9 may be that door, on its own face, and is judged from that face's reading.
+        let (code, c) = b.call("POST", &matches, Some(OPERATOR), Some(json!({"matches": [{"line_id": "D9", "opening_id": door_id}]}))).await;
+        assert_eq!(code, StatusCode::OK, "{c}");
+        assert_eq!((line(&c, "D9")["status"].as_str(), line(&c, "D9")["opening_id"].as_str()), (Some("answered"), Some(door_id.as_str())), "{c}");
+        // Then the door is D9's on the front too: shown so, and not offered to D1.
+        let front_door = c["faces"][0]["openings"].as_array().unwrap().iter().find(|o| o["opening_id"] == "f1-3").unwrap().clone();
+        assert_eq!(front_door["line_id"], "D9", "{c}");
+        assert!(!c["proposed"].as_array().unwrap().iter().any(|p| p["opening_id"] == "f1-3"), "{c}");
+        let (code, e) = b.call("POST", &matches, Some(OPERATOR), Some(json!({"matches": [{"line_id": "D1", "opening_id": "f1-3"}]}))).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{e}");
+        assert!(e["detail"].as_str().unwrap().contains("would be both"), "{e}");
+        // The drawn face has no line left to match, but W2, on the front, could
+        // still take the blocked window it shares: not "not on the schedule".
+        assert!(c["not_on_schedule"].as_array().unwrap().iter().all(|o| o != "f1-2"), "{c}");
+        // W1 is bound to the drawn face too: being first in the list, that face
+        // is f1 now and keeps the shared openings; the front is f2.
+        let (code, v) = b.call("POST", &format!("/v1/projects/{P}/list/bind"), Some(OPERATOR), Some(json!({"lines": ["W1"], "from": [5.02, -1.0], "to": [4.98, 5.0]}))).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        let (_, c) = b.call("POST", &format!("/v1/projects/{P}/count"), Some(AGENT), None).await;
+        assert_eq!((c["faces"][0]["label"].as_str(), c["faces"][1]["label"].as_str()), (Some("a drawn face"), Some("front (w1)")), "{c}");
+        assert!(c["say"].as_str().unwrap().starts_with("3 openings found, 2 measured."), "{}", c["say"]);
+        let d9 = line(&c, "D9");
+        assert_eq!(d9["status"], "answered", "{c}");
+        let d9_on = d9["opening_id"].as_str().unwrap().to_string();
+        assert!(d9_on.starts_with("f1-"), "D9's match takes the door's new id: {d9_on}");
+        let front_door = c["faces"][1]["openings"].as_array().unwrap().iter().find(|o| o["same_as"] == d9_on.as_str()).unwrap_or_else(|| panic!("{c}")).clone();
+        assert_eq!(front_door["line_id"], "D9", "{c}");
+        let (code, e) = b.call("POST", &matches, Some(OPERATOR), Some(json!({"matches": [{"line_id": "D1", "opening_id": front_door["opening_id"]}]}))).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{e}");
+        assert!(e["detail"].as_str().unwrap().contains("are the same, and would be both D1 and D9"), "{e}");
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_match_is_checked_by_the_opening_it_holds_now() {
+        // W1 is matched to f1-1. Recounted, a new window to its left is f1-1
+        // and W1's is f1-2: W2 may be the new f1-1.
+        let (b, fx) = bound_facade().await;
+        assert_eq!(b.call("POST", &format!("/v1/projects/{P}/count"), Some(AGENT), None).await.0, StatusCode::OK);
+        let matches = format!("/v1/projects/{P}/count/matches");
+        let (code, c) = b.call("POST", &matches, Some(OPERATOR), Some(json!({"matches": [{"line_id": "W1", "opening_id": "f1-1"}]}))).await;
+        assert_eq!(code, StatusCode::OK, "{c}");
+        {
+            let mut inner = b.st.inner.lock().unwrap();
+            let f = &mut inner.counts.get_mut(P).unwrap().faces[0];
+            let mut new = f.found.openings[0].clone();
+            new.box_m = [0.2, -0.5, 1.1, 0.7];
+            new.centre = [0.65, 0.1];
+            new.along_m = 0.2;
+            if let Some(s) = new.size.as_mut() {
+                s.width_mm = 900.0;
+                s.along_m = 0.2;
+            }
+            f.found.openings.insert(0, new);
+            for (k, o) in f.found.openings.iter_mut().enumerate() {
+                o.opening_id = format!("f1-{}", k + 1);
+            }
+        }
+        let (code, c) = b.call("POST", &matches, Some(OPERATOR), Some(json!({"matches": [{"line_id": "W2", "opening_id": "f1-1"}]}))).await;
+        assert_eq!(code, StatusCode::OK, "{c}");
+        assert_eq!((line(&c, "W1")["opening_id"].as_str(), line(&c, "W2")["opening_id"].as_str()), (Some("f1-2"), Some("f1-1")), "{c}");
+        // W1's stored match took its opening's new id.
+        let w1 = b.st.inner.lock().unwrap().missions[P].targets.iter().find(|t| t.target_id == "W1").unwrap().opening.clone().unwrap();
+        assert_eq!(w1.matched.unwrap().opening_id, "f1-2");
+        // And a real double is still refused under the new ids.
+        let (code, e) = b.call("POST", &matches, Some(OPERATOR), Some(json!({"matches": [{"line_id": "D1", "opening_id": "f1-2"}]}))).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{e}");
+        assert!(e["detail"].as_str().unwrap().contains("would be both W1 and D1"), "{e}");
+        std::fs::remove_dir_all(fx).unwrap();
+    }
+
+    fn face_count(id: &str, from: [f64; 2], to: [f64; 2], openings: Vec<[f64; 4]>, gaps: Vec<[f64; 4]>) -> FaceCount {
+        let opening = |k: usize, b: [f64; 4]| crate::openings::Opening {
+            opening_id: format!("{id}-{}", k + 1), along_m: b[0], centre: [(b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0], box_m: b,
+            looks_like: crate::list::OpeningType::Window, size: None, misfit: None, seen_through: 0.9, same_as: None };
+        let gap = |b: [f64; 4]| crate::openings::Gap { along_m: b[0], bottom_m: b[1], width_m: b[2] - b[0], height_m: b[3] - b[1], why: "a recess".into(), same_as: None };
+        FaceCount { face_id: id.into(), label: id.into(), face: Face { from, to }, length_m: 10.0, seen_share: 1.0, stations: vec![1], unseen: Value::Null,
+                    found: crate::openings::Found { openings: openings.into_iter().enumerate().map(|(k, b)| opening(k, b)).collect(), not_counted: gaps.into_iter().map(gap).collect() },
+                    lines: vec![] }
+    }
+
+    #[test]
+    fn gaps_are_listed_once_and_are_the_opening_another_face_counts() {
+        // Three parallel faces 10 cm apart: f1–f2 and f2–f3 are one wall, f1–f3 aren't.
+        let mut faces = vec![
+            face_count("f1", [0.0, 0.0], [10.0, 0.0], vec![], vec![[5.0, 0.0, 6.0, 1.0]]),
+            face_count("f2", [2.0, 0.1], [10.0, 0.1], vec![], vec![[3.0, 0.0, 4.0, 1.0]]),
+            face_count("f3", [2.0, 0.2], [10.0, 0.2], vec![], vec![[3.0, 0.0, 4.0, 1.0]]),
+        ];
+        count_once(&mut faces);
+        let same: Vec<Option<String>> = faces.iter().map(|f| f.found.not_counted[0].same_as.clone()).collect();
+        assert_eq!(same, [None, Some("f1".into()), Some("f1".into())], "followed to where it was first listed");
+        // A gap on f1 where f2 counts an opening (f2 saw through it): it is that opening.
+        let mut faces = vec![
+            face_count("f1", [0.0, 0.0], [10.0, 0.0], vec![], vec![[5.0, 0.0, 6.0, 1.0]]),
+            face_count("f2", [10.0, 0.05], [2.0, 0.05], vec![[4.0, 0.0, 5.0, 1.0]], vec![]),
+        ];
+        count_once(&mut faces);
+        assert_eq!(faces[0].found.not_counted[0].same_as.as_deref(), Some("f2-1"), "antiparallel faces too");
+        // Another storey on the same plan line: one wall, but the boxes don't meet.
+        let mut faces = vec![face_count("f1", [0.0, 0.0], [10.0, 0.0], vec![[5.0, 0.0, 6.0, 1.0]], vec![]), face_count("f2", [0.0, 0.0], [10.0, 0.0], vec![[5.0, 3.0, 6.0, 4.0]], vec![])];
+        count_once(&mut faces);
+        assert!(faces[1].found.openings[0].same_as.is_none());
+    }
+
+    #[test]
+    fn faces_are_one_wall_when_parallel_close_and_overlapping() {
+        let f = |from: [f64; 2], to: [f64; 2]| Face { from, to };
+        let w = f([0.0, 0.0], [10.0, 0.0]);
+        let both = |a: &Face, b: &Face| {
+            let (x, y) = (same_wall(a, b), same_wall(b, a));
+            assert_eq!(x.map(|v| (v * 1000.0).round()), y.map(|v| (v * 1000.0).round()), "the same either way round");
+            x
+        };
+        assert!((both(&w, &f([4.0, 0.1], [12.0, -0.1])).unwrap() - 6.0).abs() < 0.01);
+        assert!((both(&w, &f([12.0, 0.0], [4.0, 0.0])).unwrap() - 6.0).abs() < 0.01, "antiparallel");
+        assert_eq!(both(&w, &f([4.0, 0.3], [8.0, 0.3])), None, "30 cm out: another wall");
+        assert_eq!(both(&w, &f([4.0, 0.0], [8.0, 1.0])), None, "at an angle");
+        assert_eq!(both(&w, &f([11.0, 0.0], [14.0, 0.0])), None, "beyond its end");
+        assert_eq!(both(&w, &f([2.0, 0.0], [2.0, 0.0])), None, "no length");
+        // A 4.2 m stretch at 1° to a 20 m wall, touching it at one end: one
+        // wall, whichever is given first (its far end is 7 cm off; the long
+        // wall's far end, 35 cm off the short one's line, isn't in the overlap).
+        let long = f([0.0, 0.0], [20.0, 0.0]);
+        let t = 1f64.to_radians();
+        let short = f([8.0, 0.0], [8.0 + 4.2 * t.cos(), 4.2 * t.sin()]);
+        assert!((both(&long, &short).unwrap() - 4.2).abs() < 0.01);
     }
 
     #[tokio::test]

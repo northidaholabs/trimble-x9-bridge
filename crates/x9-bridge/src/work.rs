@@ -994,7 +994,7 @@ mod tests {
 
     fn an_opening(id: &str, box_m: [f64; 4]) -> crate::openings::Opening {
         crate::openings::Opening { opening_id: id.into(), along_m: box_m[0], centre: [(box_m[0] + box_m[2]) / 2.0, (box_m[1] + box_m[3]) / 2.0], box_m,
-                                   looks_like: crate::list::OpeningType::Window, size: None, misfit: None, seen_through: 0.9 }
+                                   looks_like: crate::list::OpeningType::Window, size: None, misfit: None, seen_through: 0.9, same_as: None }
     }
 
     #[test]
@@ -1063,8 +1063,12 @@ mod tests {
         assert!(try_one(one(big), pic(), true).contains("larger than its box"));
         let many = crate::openings::Found { openings: (0..51).map(|k| an_opening(&format!("f1-{}", k + 1), [1.0, 0.5, 2.0, 1.5])).collect(), not_counted: vec![] };
         assert!(try_one(many, pic(), true).contains("more than 50"));
-        let gap = crate::openings::Found { openings: vec![], not_counted: vec![crate::openings::Gap { along_m: 3.9, bottom_m: 0.0, width_m: 1.0, height_m: 0.5, why: "a recess".into() }] };
+        let gap = crate::openings::Found { openings: vec![], not_counted: vec![crate::openings::Gap { along_m: 3.9, bottom_m: 0.0, width_m: 1.0, height_m: 0.5, why: "a recess".into(), same_as: None }] };
         assert!(try_one(gap, pic(), true).contains("a gap not counted isn't inside"));
+        // Which openings are the same across faces is the bridge's to say.
+        let mut said = an_opening("f1-1", [1.0, 0.5, 2.0, 1.5]);
+        said.same_as = Some("f0-1".into());
+        assert!(try_one(one(said), pic(), true).contains("same_as is the bridge's to say"));
         // A sound count is taken.
         let mut w = WorkState::default();
         w.offers.insert("count_1".into(), count_offer(&["f1"]));
@@ -1152,7 +1156,7 @@ mod tests {
         let (code, _, _) = b.put_bytes(&format!("/v1/work/{id}/merged"), Some(AGENT), pack_blobs(&[picture_of("f1")])).await;
         assert_eq!(code, StatusCode::NO_CONTENT);
         let mut found = crate::openings::Found::default();
-        found.not_counted.push(crate::openings::Gap { along_m: 1.0, bottom_m: 0.0, width_m: 0.5, height_m: 0.5, why: "a recess".into() });
+        found.not_counted.push(crate::openings::Gap { along_m: 1.0, bottom_m: 0.0, width_m: 0.5, height_m: 0.5, why: "a recess".into(), same_as: None });
         let faces = json!({"faces": [{"face_id": "f1", "found": found, "pictured": true}, {"face_id": "f2", "found": crate::openings::Found::default()}]});
         let (code, body) = b.call("POST", &format!("/v1/work/{id}/result"), Some(AGENT), Some(faces)).await;
         assert_eq!(code, StatusCode::NO_CONTENT, "{body}");

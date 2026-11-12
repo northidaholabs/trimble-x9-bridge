@@ -369,10 +369,10 @@ impl Worker {
         if !pictures.is_empty() {
             self.put_blob(&id, "pictures", &pictures).await?;
         }
-        let openings: usize = faces.iter().map(|f| f.found.openings.len()).sum();
-        let n = faces.len();
+        let read: Vec<String> = faces.iter().map(|f| format!("{} {}", f.face_id, f.found.openings.len())).collect();
         self.post(&format!("/v1/work/{id}/result"), &serde_json::to_value(crate::work::CountResult { faces })?).await?;
-        Ok(format!("{openings} openings on {n} faces"))
+        // Openings read per face, before the bridge counts each one once.
+        Ok(format!("openings read per face: {}", read.join(", ")))
     }
 
     /// A question check: fit the offered faces here, as the bridge would, and
