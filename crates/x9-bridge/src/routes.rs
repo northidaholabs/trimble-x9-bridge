@@ -1041,7 +1041,11 @@ async fn bind_lines(State(st): St, h: HeaderMap, Path(project_id): Path<String>,
 /// Count the openings on the faces the schedule's lines are bound to.
 async fn post_count(State(st): St, h: HeaderMap, Path(project_id): Path<String>) -> ApiResult<Json<Value>> {
     let c = st.require(&h, |r| r != Role::Viewer, "count openings")?;
-    Ok(Json(crate::count::count(&st, &project_id, &c.name).await?))
+    // In its own task: a request cut off doesn't cut the count short, and
+    // its result is still kept for GET …/count.
+    let st2 = st.clone();
+    let counting = tokio::spawn(async move { crate::count::count(&st2, &project_id, &c.name).await });
+    Ok(Json(counting.await.map_err(|e| ApiError::cache(format!("counting: {e}")))??))
 }
 
 async fn get_count(State(st): St, h: HeaderMap, Path(project_id): Path<String>) -> ApiResult<Json<Value>> {
@@ -1238,6 +1242,7 @@ async fn work_claim(State(st): St, h: HeaderMap, body: Bytes) -> ApiResult<Respo
             }
             let what = match v["kind"].as_str() {
                 Some("check") => "the question check",
+                Some("count") => "the count",
                 Some("save") => "the save",
                 _ => "the registration job",
             };
@@ -1263,21 +1268,23 @@ async fn work_progress(State(st): St, h: HeaderMap, Path(job_id): Path<String>, 
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn work_merged(State(st): St, h: HeaderMap, Path(job_id): Path<String>, body: Bytes) -> ApiResult<StatusCode> {
+async fn work_merged(State(st): St, h: HeaderMap, Path(job_id): Path<String>, body: axum::body::Body) -> ApiResult<StatusCode> {
     let c = st.require(&h, |r| r != Role::Viewer, "do work for the bridge")?;
-    let bytes = body.to_vec();
-    // A check job uploads its fits here; a registration, its merged points.
+    // A check job uploads its fits here; a count job, its pictures (a few
+    // MB at most); a registration, its merged points.
     let kind = st.work.lock().unwrap().kind(&job_id);
     if kind == Some("save") {
         return Err(ApiError::conflict("a save job uploads nothing: send what it saved"));
     }
-    let check = kind == Some("check");
-    let checked = tokio::task::spawn_blocking(move || {
-        if check {
-            crate::work::unpack_fits(&bytes).map(|_| bytes)
-        } else {
-            crate::register::Merged::from_bytes(&bytes).map(|_| bytes)
-        }
+    let limit = if kind == Some("count") { crate::work::PICTURES_MAX } else { 1 << 29 };
+    let bytes = axum::body::to_bytes(body, limit)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "Upload too large").detail(format!("this job uploads at most {} MB", limit >> 20)))?
+        .to_vec();
+    let checked = tokio::task::spawn_blocking(move || match kind {
+        Some("check") => crate::work::unpack_fits(&bytes).map(|_| bytes),
+        Some("count") => crate::work::unpack_pictures(&bytes).map(|_| bytes),
+        _ => crate::register::Merged::from_bytes(&bytes).map(|_| bytes),
     })
         .await
         .map_err(|e| ApiError::conflict(e.to_string()))?
@@ -1295,6 +1302,9 @@ async fn work_result(State(st): St, h: HeaderMap, Path(job_id): Path<String>, bo
     if kind == "check" {
         let res: crate::work::CheckResult = parse(&body)?;
         st.work.lock().unwrap().deliver_check(&job_id, &c.name, res).map_err(ApiError::conflict)?;
+    } else if kind == "count" {
+        let res: crate::work::CountResult = parse(&body)?;
+        st.work.lock().unwrap().deliver_count(&job_id, &c.name, res).map_err(ApiError::conflict)?;
     } else if kind == "save" {
         let res: crate::work::SaveResult = parse(&body)?;
         st.work.lock().unwrap().deliver_save(&job_id, &c.name, res).map_err(ApiError::conflict)?;

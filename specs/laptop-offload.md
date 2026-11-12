@@ -138,6 +138,23 @@ Built 2026-11-11:
 - A result for a job the bridge took back is refused (409) before its body
   is read.
 
+Built 2026-11-12: counting openings goes the same way, as a `count` job
+([`construction-counts.md`](construction-counts.md)): the worker finds each
+bound face's openings and draws its picture, and the Pi checks what comes
+back, matches, judges and records. A claimed count gets 3 minutes.
+
+A worker does one job at a time, and says nothing to the bridge while it
+measures but its progress. A registration offered while a worker holds a
+check or a count keeps waiting until that job is delivered, fails, is
+taken back at its limit or loses its waiter (a count's request cut off),
+however long since the worker was seen, and never past the job's limit from
+its claim; it goes to the Pi only if no worker claims it within 10 s after
+that. A count asked over the API runs on even if its request is cut off, and
+its result is kept for `GET …/count`. Registrations
+are claimed first, so the laptop takes it as soon as the short job ends. A
+laptop that hangs on a count delays a registration by at most 3 minutes and
+10 s; on a check, 2 minutes and 10 s.
+
 ### C. A budget for the Pi's scan cache
 
 `BRIDGE_CACHE_MB` (default: whatever leaves 1 GB free on the data disk at
