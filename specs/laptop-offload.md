@@ -236,7 +236,8 @@ The format is COPC, one file per station in the project frame, in the
 project frame's own local CRS (the frame station's levelled scanner frame).
 One merged cloud is left to the cloud copy, where memory isn't the Pi's or
 the laptop's. Still open: who confirms the cloud copy arrived, once there is
-one.
+one. (Taken up in the draft spec *Field and office on one job*, 2026-11-13,
+kept outside this repo: the manifest's checksums are the receipt.)
 
 **What it opens up (a follow-on, its own spec, [`whole-cloud-questions.md`](whole-cloud-questions.md)):** with every station's file
 and the merged cloud on the laptop, the agent can ask about the whole cloud,

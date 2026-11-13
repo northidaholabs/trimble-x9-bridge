@@ -217,7 +217,8 @@ Changing them needs a mission neither replay has seen.
   in `on-site-answers.md`, each with its own spec.
 - Floor flatness numbers (FF/FL) and any comparison with a design model.
 - Questions about the cloud copy, from off site. The same kinds will run
-  there once the cloud spec exists, with the same gates.
+  there once the cloud spec exists, with the same gates. (It is drafted:
+  *Field and office on one job*, 2026-11-13, kept outside this repo.)
 - One merged cloud. The stations stay separate files, read together.
 - A figure without a picture of where it was measured.
 
