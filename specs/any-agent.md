@@ -197,7 +197,8 @@ Thin, each one passing the bridge's words and links through untouched:
 - Voice. A voice agent gets `say` like any other; how it speaks is its own.
 - Dots until it has a public API.
 - Syncing the record to the cloud. The relay sits where the sync will go,
-  but syncing is its own spec.
+  but syncing is its own spec (drafted 2026-11-13 as
+  *Field and office on one job*, kept outside this repo).
 
 ## Telemetry
 

@@ -188,7 +188,8 @@ tool servers on a customer's plane:
   `minimal`.
 - The relay, streamable HTTP and the core toolset: `any-agent.md` parts D
   and E.
-- Syncing the record off site.
+- Syncing the record off site. That is the draft spec
+  *Field and office on one job* (2026-11-13), kept outside this repo.
 - Any public claim that the agent "works with your gateway" before criteria
   7 and 8 pass.
 
