@@ -19,6 +19,7 @@ mod bench;
 mod count;
 mod export;
 mod files;
+mod footing;
 mod list;
 mod map;
 mod measure;
