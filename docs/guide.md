@@ -1209,7 +1209,22 @@ It lays the points out in plan view, sorting cells into ground, things
 standing at body height (walls, trunks, posts), and overhead (canopy,
 eaves). Ground the scanner couldn't see because something stood in the way
 counts as hidden. It then tries every open spot a person can walk to from
-the tripod, a step out, and casts rays from each. The first pick sees the
+the tripod, a step out, and casts rays from each. The walk goes over ground
+the scan saw and never steps more than 0.4 m up or down between cells, so a
+table top or a loading dock is not walked onto. A spot counts only where a
+tripod can stand: ground seen across the 0.5 m its legs reach (some in each
+quarter of it and spread along the line to it, so one scan line is not
+taken for a floor), at most 15° of slope, no step of more than about
+0.25 m, edge, low plants or rubble under it (a kerb it straddles is fine), nothing standing 0.4 to 2 m up within it (a wall,
+furniture, a plant, a post), and no drop of more than 0.4 m within 1 m of
+it (so not a table, a wall top or a vehicle), and ground near its level
+seen up to 1.5 m beyond it (seen from above, the ground below an edge is in
+its shadow, so a spot at an edge has none past it; branches over the drop
+don't count). Eaves or canopy higher than
+that don't count against it. Each pick's `preview_px` also passes the check
+a marker put on it gets ([Propose the next station](#propose-the-next-station)).
+`spots_tried` counts every spot looked at, `spots_unstandable` those set
+aside. The first pick sees the
 most hidden ground while sharing at least 5 m of surface, seen from the same
 side, with this station, which is enough to register it. Each later pick
 covers what the ones before it left, a step away from them. The plan's cell
@@ -1222,11 +1237,11 @@ That plot is how the spots are chosen. It is not the picture used to direct some
 
 | Field | What |
 | --- | --- |
-| `candidates` | Up to 3, best first: `xy_m` (this station's frame), `distance_m`, `walk_m` (over ground the scan saw), `sees_hidden_m2`, `shared_surface_m`, `preview_px` (the ground there), `landmark` |
+| `candidates` | Up to 3, best first: `xy_m` (this station's frame), `distance_m`, `walk_m` (over ground the scan saw), `sees_hidden_m2`, `shared_surface_m`, `slope_deg` (the ground under the tripod), `ground_above_floor_m` (that ground against this station's), `preview_px` (the ground there), `landmark` |
 | `landmark` | The standing thing beside a pick: a post at least 1.5 m tall within 6 m if there is one, else anything that tall, else the nearest. `xy_m`, `distance_m` (from the pick), `height_m`, `footprint_m2`, `shape` (`post` under 1 m², else `mass`), `preview_px`. May be `null` |
 | `subject` | Optional preview columns `x0,x1` (`x1 < x0` crosses the seam): count only hidden ground in that direction, 15° either side. Columns outside the preview are `400 invalid_request` |
-| `reason` | Why there are no candidates: not a full dome, no open ground reachable, nothing hidden another setup would see |
-| `cell_m`, `radius_m`, `min_step_m`, `hidden_m2`, `still_hidden_m2`, `spots_tried` | The plan's scale and what is left after the picks |
+| `reason` | Why there are no candidates: not a full dome, no open ground reachable, no spot where a tripod can stand, nothing hidden another setup would see |
+| `cell_m`, `radius_m`, `min_step_m`, `hidden_m2`, `still_hidden_m2`, `spots_tried`, `spots_unstandable` | The plan's scale, what is left after the picks, and how many spots tried were set aside because a tripod can't stand there |
 
 The plan without a subject is computed once per scan (a second or two) and
 cached. It knows only this station; what earlier stations saw is in the
@@ -1274,16 +1289,27 @@ curl -s -H "$H" $B/next-stations          # every scan's latest proposal, newest
 
 | Field | What |
 | --- | --- |
-| `marker` | Where the tripod should stand, in preview pixels, on the ground; `label` goes under "SET UP HERE" and says where on the ground ("on the pavement, ~5 m past the lamp post"); a label that only names the spot ("setup", "station 2") is refused |
+| `marker` | Where the tripod should stand, in preview pixels, on ground a tripod can stand on (as for [the plan](#plan-the-next-station)); `label` goes under "SET UP HERE" and says where on the ground ("on the pavement, ~5 m past the lamp post"); a label that only names the spot ("setup", "station 2") is refused |
 | `note` | The directions in prose (1–600 characters), naming a landmark label in its own words. No left, right, clockwise or compass words: they depend on which way the person faces, and a scan's axes are wherever the scanner's zero angle pointed |
 | `labels`, `boxes` | Up to 3 together, texts up to 80 characters, each within a quarter of the preview's width of the marker; `kind` `seen` (green), `hidden` (red) or `landmark` (white). At least one `landmark` label, named in up to 30 characters ("lamp post"); where it stands goes in the note. A label's text runs away from the tripod, or above its dot when there's no room that side |
 
 The bridge checks everything lies inside the preview, near the marker, with a
-landmark the note names and no side words (`400 invalid_request` otherwise), draws the picture (the annotated part of the panorama, enlarged,
+landmark the note names and no side words, and, when the scan decodes, that
+the marker is on ground a tripod can stand on, by the plan's rules for the
+ground under a spot (not its walk there): a marker on a wall, a table, a
+slope, stairs, canopy over the ground, or ground the scan barely saw is
+refused with why (`400 invalid_request` for any of these). Far out one
+preview pixel spans a metre or more of ground, so the points in the
+marker's pixel within 2 m of the one nearest its centre are tried, nearest
+first, and the marker stands on the first that takes a tripod (a pixel
+across a wall top and the ground far behind it is not taken for that
+ground). The tripod is drawn on that spot. Ground up a hill, above the scanner, is judged too; the
+tripod is drawn only below it. It draws the picture (the annotated part of the panorama, enlarged,
 text kept inside the frame; where the scan saw the ground under the marker,
 the tripod is drawn its real size there, 1.65 m to the scanner's top, in
 perspective, with a soft shadow on the ground beside it, and the response's
-`marker.distance_m` says how far out that ground is), keeps the latest proposal per scan, writes the
+`marker.distance_m` says how far out that ground is and `marker.slope_deg`
+how much it slopes), keeps the latest proposal per scan, writes the
 note to the field log and sends a `next_station` event. Any role but `viewer`.
 Proposals are kept in memory; deleting the scan deletes its proposal.
 

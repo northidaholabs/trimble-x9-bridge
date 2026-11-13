@@ -479,6 +479,112 @@ pub fn ground_at(pts: &[GridPoint], grid: (u32, u32), preview: (usize, usize), a
     (kx.abs() > 1.0 && ky.abs() > 1.0).then_some(Ground { out_m, below_m: -z, px_per_rad: (kx, ky), az_rad: nearest.1 .0 })
 }
 
+/// Where (m, the scan's frame) the scan saw what is at preview pixel `at`:
+/// the median x, y and z of the five points nearest the pixel's centre
+/// within 2.5 pixels, or `None` with fewer than three. Only the nearest:
+/// far out one preview pixel spans metres of ground along the line of sight.
+pub fn plan_at(pts: &[GridPoint], grid: (u32, u32), preview: (usize, usize), at: (i64, i64)) -> Option<[f64; 3]> {
+    let (pw, ph) = (preview.0 as f64, preview.1 as f64);
+    if pw == 0.0 || ph == 0.0 || grid.0 == 0 || grid.1 == 0 {
+        return None;
+    }
+    let (fx, fy) = (pw / grid.0 as f64, ph / grid.1 as f64);
+    let wrap = |d: f64| (d + pw / 2.0).rem_euclid(pw) - pw / 2.0;
+    // A grid cell's centre in preview pixels, against the pixel's centre.
+    let off = |g: &GridPoint| wrap((g.col as f64 + 0.5) * fx - (at.0 as f64 + 0.5)).hypot((g.row as f64 + 0.5) * fy - (at.1 as f64 + 0.5));
+    let mut near: Vec<(f64, &GridPoint)> = pts.iter().map(|g| (off(g), g)).filter(|(d, _)| *d <= 2.5).collect();
+    if near.len() < 3 {
+        return None;
+    }
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    near.truncate(5);
+    let mid = |f: &dyn Fn(&GridPoint) -> f32| {
+        let mut v: Vec<f64> = near.iter().map(|(_, g)| f(g) as f64).collect();
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    Some([mid(&|g| g.point.x), mid(&|g| g.point.y), mid(&|g| g.point.z)])
+}
+
+/// The preview pixel holding grid cell `(col, row)`'s centre, or `None`
+/// without a grid or a preview.
+pub fn pixel_of(col: u32, row: u32, grid: (u32, u32), preview: (usize, usize)) -> Option<(i64, i64)> {
+    if preview.0 == 0 || preview.1 == 0 || grid.0 == 0 || grid.1 == 0 {
+        return None;
+    }
+    let x = ((col as f64 + 0.5) * preview.0 as f64 / grid.0 as f64).floor() as i64 % preview.0 as i64;
+    let y = ((row as f64 + 0.5) * preview.1 as f64 / grid.1 as f64).floor().min(preview.1 as f64 - 1.0);
+    Some((x, y as i64))
+}
+
+/// A spot a marker stands on: where (m, the scan's frame), the slope there
+/// (degrees) and the ground's height (m).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MarkerSpot {
+    pub x: f64,
+    pub y: f64,
+    pub slope_deg: f64,
+    pub ground_z: f64,
+}
+
+/// Whether a tripod can stand where the marker at preview pixel `at` is:
+/// judged ([`crate::footing`]) where the scan saw what the pixel shows (up
+/// a hill above the scanner too), on that ground, not on canopy, eaves or a
+/// sign over it. See [`marker_spot`].
+pub fn marker_footing(pts: &[GridPoint], grid: (u32, u32), preview: (usize, usize), at: (i64, i64)) -> Result<MarkerSpot, String> {
+    let shown: Vec<&GridPoint> = pts.iter().filter(|g| pixel_of(g.col, g.row, grid, preview) == Some(at)).collect();
+    let tries = if shown.is_empty() {
+        plan_at(pts, grid, preview, at).into_iter().collect::<Vec<_>>()
+    } else {
+        nearest_first(&shown, grid, preview, at)
+    };
+    let Some(mid) = tries.first() else { return Err("the scan saw nothing at that pixel".into()) };
+    let cells = crate::footing::Cells::new(pts, mid[0], mid[1], MARKER_SPREAD + crate::footing::REACH + 0.2);
+    marker_spot(&tries, &cells)
+}
+
+/// The points a pixel shows, nearest its centre first.
+pub fn nearest_first(shown: &[&GridPoint], grid: (u32, u32), preview: (usize, usize), at: (i64, i64)) -> Vec<[f64; 3]> {
+    let (pw, ph) = (preview.0 as f64, preview.1 as f64);
+    let (fx, fy) = (pw / grid.0.max(1) as f64, ph / grid.1.max(1) as f64);
+    let wrap = |d: f64| (d + pw / 2.0).rem_euclid(pw) - pw / 2.0;
+    let mut v: Vec<(f64, [f64; 3])> = shown
+        .iter()
+        .map(|g| {
+            let d = wrap((g.col as f64 + 0.5) * fx - (at.0 as f64 + 0.5)).hypot((g.row as f64 + 0.5) * fy - (at.1 as f64 + 0.5));
+            (d, [g.point.x as f64, g.point.y as f64, g.point.z as f64])
+        })
+        .collect();
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    v.into_iter().map(|(_, p)| p).collect()
+}
+
+/// The first of `tries` (a pixel's points, nearest its centre first) where a
+/// tripod can stand, judged on `cells`. Far out one pixel spans a metre or
+/// more of ground along the line of sight, so the points within
+/// `MARKER_SPREAD` of the first are tried in turn; a pixel across an edge
+/// (a wall top and the ground far behind it) is not taken for that ground.
+/// Why the first can't take one, otherwise.
+pub fn marker_spot(tries: &[[f64; 3]], cells: &crate::footing::Cells) -> Result<MarkerSpot, String> {
+    let Some(first) = tries.first() else { return Err("the scan saw nothing at that pixel".into()) };
+    let mut why_first = None;
+    for &[x, y, z] in tries.iter().filter(|p| (p[0] - first[0]).hypot(p[1] - first[1]) <= MARKER_SPREAD).take(MARKER_TRIES) {
+        let foot = cells.judge(x, y);
+        let why = match foot.why {
+            Some(why) => format!("a tripod can't stand there: {why}"),
+            None if z > foot.ground_z + 0.3 => format!("it is on something {:.1} m above the ground there (canopy, eaves, a sign), not on the ground", z - foot.ground_z),
+            None => return Ok(MarkerSpot { x, y, slope_deg: foot.slope_deg, ground_z: foot.ground_z }),
+        };
+        why_first.get_or_insert(why);
+    }
+    Err(why_first.unwrap_or_default())
+}
+
+/// The most points of a marker's pixel tried, and how far (m, in plan) from
+/// the one nearest its centre they may be.
+const MARKER_TRIES: usize = 32;
+pub const MARKER_SPREAD: f64 = 2.0;
+
 /// Places on the ground round the marker, and above it, on the canvas.
 struct Tripod {
     g: Ground,
@@ -595,6 +701,29 @@ fn cast(t: &Tripod, w: usize, h: usize) -> Shade {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pixel_across_an_edge_is_not_taken_for_the_ground_behind_it() {
+        use trimble_tzf::Point;
+        let gp = |x: f64, y: f64, z: f64| GridPoint { point: Point { x: x as f32, y: y as f32, z: z as f32, intensity: 0.0 }, row: 0, col: 0 };
+        // A wall top 1 m up at 10 m; open ground from 26 m, the ground between in its shadow.
+        let mut pts: Vec<GridPoint> = Vec::new();
+        for i in 0..=60 {
+            for j in 0..=60 {
+                let (x, y) = (25.0 + i as f64 * 0.05, -1.5 + j as f64 * 0.05);
+                pts.push(gp(x, y, -1.6));
+            }
+            for j in 0..=10 {
+                pts.push(gp(10.0 + i as f64 * 0.003, -0.25 + j as f64 * 0.05, -0.6));
+            }
+        }
+        let cells = crate::footing::Cells::new(&pts, 18.0, 0.0, 12.0);
+        let tries = [[10.05, 0.0, -0.6], [26.5, 0.0, -1.6]];
+        assert!(marker_spot(&tries, &cells).is_err());
+        // The far ground on its own pixel stands.
+        let spot = marker_spot(&[[26.5, 0.0, -1.6]], &cells).unwrap();
+        assert!((spot.x - 26.5).abs() < 1e-9 && (spot.ground_z + 1.6).abs() < 0.01, "{spot:?}");
+    }
+
     use super::*;
 
     fn proposal() -> Proposal {
