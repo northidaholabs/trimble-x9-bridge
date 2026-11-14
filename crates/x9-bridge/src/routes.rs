@@ -731,24 +731,43 @@ async fn put_next_station(State(st): St, h: HeaderMap, Path(id): Path<String>, b
     let (pw, ph, grey) = aim::jpeg_luma(&jpg).map_err(|e| ApiError::invalid(format!("preview: {e}")))?;
     p.check(pw, ph).map_err(ApiError::invalid)?;
     let p2 = p.clone();
-    // The scan, when it decodes, says how far off the marker's ground is.
+    // The scan, when it decodes, says how far off the marker's ground is and
+    // whether a tripod can stand there; a marker it shows can't take one is
+    // refused. A scan that doesn't decode leaves the marker unchecked.
     let tzf = scan_file(&st, &id, FileKind::Tzf).await.ok();
-    let (png, ground) = tokio::task::spawn_blocking(move || {
-        let ground = tzf.and_then(|f| {
+    let (png, ground) = tokio::task::spawn_blocking(move || -> Result<_, String> {
+        let decoded = tzf.and_then(|f| {
             let t = trimble_tzf::Tzf::open(&f).ok()?;
             let meta = t.scan_meta().ok()?;
-            let pts = t.grid_points().ok()?;
-            crate::station::ground_at(&pts, (meta.grid_cols, meta.grid_rows), (pw, ph), (p2.marker.x, p2.marker.y))
+            Some((meta, t.grid_points().ok()?))
         });
-        (crate::station::render(&grey, pw, ph, &p2, ground), ground)
+        let ground = match decoded {
+            None => None,
+            Some((meta, pts)) => {
+                let (grid, at) = ((meta.grid_cols, meta.grid_rows), (p2.marker.x, p2.marker.y));
+                let spot = crate::station::marker_footing(&pts, grid, (pw, ph), at)?;
+                // The tripod is drawn on the spot that takes it, scaled as the scan maps it onto the preview.
+                let g = crate::station::ground_at(&pts, grid, (pw, ph), at).map(|g| crate::station::Ground {
+                    out_m: spot.x.hypot(spot.y),
+                    below_m: -spot.ground_z,
+                    az_rad: spot.y.atan2(spot.x),
+                    ..g
+                });
+                Some((g.filter(|g| g.below_m > 0.0), spot.slope_deg, spot.x.hypot(spot.y)))
+            }
+        };
+        Ok((crate::station::render(&grey, pw, ph, &p2, ground.and_then(|g| g.0)), ground))
     })
     .await
-    .map_err(|e| ApiError::cache(format!("drawing: {e}")))?;
+    .map_err(|e| ApiError::cache(format!("drawing: {e}")))?
+    .map_err(|e| ApiError::invalid(format!("marker: {e}. Put it on open, level ground the scan saw")))?;
     let project_id = scan["project_id"].as_str().unwrap_or("").to_string();
     let mut v = p.to_json();
-    if let Some(g) = ground {
-        v["marker"]["distance_m"] = json!((g.out_m * 10.0).round() / 10.0);
+    if let Some((_, slope, out)) = ground {
+        v["marker"]["distance_m"] = json!((out * 10.0).round() / 10.0);
+        v["marker"]["slope_deg"] = json!((slope * 10.0).round() / 10.0);
     }
+    let ground = ground.and_then(|(g, _, _)| g);
     v["scan_id"] = json!(id);
     v["project_id"] = json!(project_id);
     v["station"] = scan["station"].clone();

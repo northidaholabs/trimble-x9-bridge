@@ -1139,6 +1139,89 @@ async fn a_next_station_proposal_is_checked_drawn_kept_and_listed() {
 }
 
 #[tokio::test]
+async fn a_marker_must_be_on_ground_a_tripod_can_stand_on() {
+    // A room 11 m by 10 m, its floor 1.5 m below the scanner, cast at 1° a
+    // cell: 154 rows from 0.4 rad off the zenith, on a 400 × 200 preview.
+    let b = Bridge::new().await;
+    plant(&b, &format!("scans/{MOCK_SCAN}.jpg"), &grey_jpeg(PREVIEW.0, PREVIEW.1));
+    plant(&b, &format!("scans/{MOCK_SCAN}.tzf"), &crate::export::tests::room_dome(360, [-6.0, -4.0, -1.5], [5.0, 6.0, 3.0]));
+    register_mock_project(&b);
+    let path = format!("/v1/scans/{MOCK_SCAN}/next-station");
+    let at = |y: i64| {
+        let mut p = proposal();
+        p["marker"]["y"] = json!(y);
+        p
+    };
+    // Pixel rows 39, 104 and 127 are grid rows 30 (over the walls: nothing
+    // seen), 80 (the wall below the scanner) and 98 (the floor 2.5 m out).
+    let v = problem(b.call("PUT", &path, Some(AGENT), Some(at(39))).await, StatusCode::BAD_REQUEST, "invalid_request");
+    assert!(v["detail"].as_str().unwrap().contains("saw nothing at that pixel"), "{v}");
+    let v = problem(b.call("PUT", &path, Some(AGENT), Some(at(104))).await, StatusCode::BAD_REQUEST, "invalid_request");
+    assert!(v["detail"].as_str().unwrap().contains("a tripod can't stand there: something stands"), "{v}");
+    problem(b.call("GET", &path, Some(VIEWER), None).await, StatusCode::NOT_FOUND, "not_found");
+    let v = ok(b.call("PUT", &path, Some(AGENT), Some(at(127))).await, StatusCode::OK);
+    assert!(v["marker"]["distance_m"].as_f64().is_some_and(|d| (d - 2.5).abs() < 0.3), "{v}");
+    assert!(v["marker"]["slope_deg"].as_f64().is_some_and(|s| s < 1.0), "{v}");
+}
+
+#[tokio::test]
+async fn a_marker_on_a_counter_top_is_refused() {
+    // The same room with a counter all round, 2 to 3 m out and 0.75 m up:
+    // its top is flat and wide enough, but it isn't the floor.
+    use std::f64::consts::TAU;
+    let room = crate::export::tests::room([-6.0, -4.0, -1.5], [5.0, 6.0, 3.0]);
+    let hit = move |va: f64, ha: f64| {
+        let (h, dz) = (va.sin(), va.cos());
+        if dz < 0.0 {
+            let face = 2.0 / h;
+            if (-1.5..=-0.75).contains(&(face * dz)) {
+                return Some(face);
+            }
+            let top = -0.75 / dz;
+            if (2.0..=3.0).contains(&(top * h)) {
+                return Some(top);
+            }
+        }
+        room(va, ha)
+    };
+    let step = TAU / 360.0;
+    let tzf = crate::export::tests::tzf_bytes(((std::f64::consts::PI - 0.45) / step) as usize, 360, 0.4, 0.0, step, hit);
+    let b = Bridge::new().await;
+    plant(&b, &format!("scans/{MOCK_SCAN}.jpg"), &grey_jpeg(PREVIEW.0, PREVIEW.1));
+    plant(&b, &format!("scans/{MOCK_SCAN}.tzf"), &tzf);
+    register_mock_project(&b);
+    // Pixel row 108 holds grid row 83: the counter top 2.6 m out, its face
+    // 0.6 m nearer.
+    let mut p = proposal();
+    p["marker"]["y"] = json!(108);
+    let v = problem(b.call("PUT", &format!("/v1/scans/{MOCK_SCAN}/next-station"), Some(AGENT), Some(p)).await, StatusCode::BAD_REQUEST, "invalid_request");
+    assert!(v["detail"].as_str().unwrap().contains("raised"), "{v}");
+}
+
+#[tokio::test]
+async fn a_marker_up_a_hill_above_the_scanner_is_judged_where_the_scan_saw_it() {
+    // Ground rising 10° all round from 1.5 m below the scanner: 15 m out it
+    // is 1.1 m above it. A 60° wedge at 0.1° a cell, near the horizon.
+    let step = 0.1f64.to_radians();
+    let k = 10f64.to_radians().tan();
+    let hill = move |va: f64, _ha: f64| {
+        let (h, dz) = (va.sin(), va.cos());
+        (dz - k * h < 0.0).then(|| -1.5 / (dz - k * h))
+    };
+    let tzf = crate::export::tests::tzf_bytes(230, 600, 1.3, 0.0, step, hill);
+    let b = Bridge::new().await;
+    plant(&b, &format!("scans/{MOCK_SCAN}.jpg"), &grey_jpeg(PREVIEW.0, PREVIEW.1));
+    plant(&b, &format!("scans/{MOCK_SCAN}.tzf"), &tzf);
+    register_mock_project(&b);
+    // Grid row 112 looks 4.4° up, at the ground 15 m out: pixel row 97.
+    let mut p = proposal();
+    p["marker"]["y"] = json!(97);
+    let v = ok(b.call("PUT", &format!("/v1/scans/{MOCK_SCAN}/next-station"), Some(AGENT), Some(p)).await, StatusCode::OK);
+    assert!(v["marker"]["distance_m"].as_f64().is_some_and(|d| (d - 15.0).abs() < 1.5), "{v}");
+    assert!(v["marker"]["slope_deg"].as_f64().is_some_and(|s| (s - 10.0).abs() < 2.0), "{v}");
+}
+
+#[tokio::test]
 async fn a_proposal_on_a_preview_that_isnt_a_jpeg_is_refused() {
     let b = Bridge::new().await;
     plant(&b, &format!("scans/{MOCK_SCAN}.jpg"), b"\xff\xd8 not really");

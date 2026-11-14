@@ -11,7 +11,10 @@
 //! the rays below only ever count the ones a candidate would.
 //!
 //! Candidates are ground cells clear of anything standing that a person can
-//! walk to from the tripod over ground the scan saw. From each, rays every
+//! walk to from the tripod over ground the scan saw, never stepping more than
+//! 0.4 m up or down between cells, where a tripod can stand
+//! ([`crate::footing`]: ground seen across its footprint, at most 15° of
+//! slope, even, nothing standing in it). From each, rays every
 //! degree (stopped by standing cells) count the hidden cells it would see,
 //! and the standing cells this station also saw: the shared surfaces the two
 //! stations are registered by. The first pick sees the most hidden ground
@@ -42,6 +45,11 @@ const CELLS_PER_REACH: f64 = 50.0;
 /// clearance a tripod needs from anything standing (m).
 const BLIND: f64 = 1.5;
 const TRIPOD_CLEAR: f64 = 0.3;
+/// The most the ground may rise or fall between neighbouring cells on the
+/// walk (m): a step or a kerb, not a ledge, a table or a loading dock.
+const STEP_UP: f32 = 0.4;
+/// The most spots set aside because a marker on their pixel would be refused.
+const MAX_UNMARKABLE: usize = 30;
 /// Body height above a cell's floor (m): points here make it standing,
 /// if there are enough of them over enough height to be a surface, not
 /// stray returns (a passer-by, the edge of a wall).
@@ -159,10 +167,12 @@ fn bin(x: f64, y: f64) -> usize {
 }
 
 /// Walking cost (tenths of a cell) from the tripod to every ground cell over
-/// ground cells, never cutting a corner past something standing. The walk
+/// ground cells, never cutting a corner past something standing nor stepping
+/// more than `STEP_UP` up or down (`low` is each cell's ground). The walk
 /// starts on the ground round the tripod (the blind circle under it has no
-/// points) that nothing standing separates from it.
-fn walk(g: Grid, kind: &[Kind]) -> Vec<u32> {
+/// points) that nothing standing separates from it, at whatever height
+/// (in a cluttered room the floor estimate can sit on the furniture).
+fn walk(g: Grid, kind: &[Kind], low: &[f32]) -> Vec<u32> {
     let mut cost = vec![u32::MAX; kind.len()];
     let mut heap = std::collections::BinaryHeap::new();
     let open_to_tripod = |x: f64, y: f64, d: f64| {
@@ -186,7 +196,7 @@ fn walk(g: Grid, kind: &[Kind]) -> Vec<u32> {
             continue;
         }
         for (j, diag) in neighbours(i) {
-            if kind[j] != Kind::Ground {
+            if kind[j] != Kind::Ground || (low[j] - low[i]).abs() > STEP_UP {
                 continue;
             }
             if diag {
@@ -323,13 +333,9 @@ pub fn plan(pts: &[GridPoint], grid: (u32, u32), preview: (usize, usize), subjec
 
     let n = SIDE * SIDE;
     let mut zmin = vec![f32::INFINITY; n];
-    let mut low = vec![(0u32, 0u32); n];
     for p in pts {
         if let Some(i) = g.cell_of(p.point.x as f64, p.point.y as f64) {
-            if p.point.z < zmin[i] {
-                zmin[i] = p.point.z;
-                low[i] = (p.col, p.row);
-            }
+            zmin[i] = zmin[i].min(p.point.z);
         }
     }
     let mut near: Vec<f32> = (0..n)
@@ -346,10 +352,20 @@ pub fn plan(pts: &[GridPoint], grid: (u32, u32), preview: (usize, usize), subjec
     let mut body = vec![(0u32, f32::INFINITY, f32::NEG_INFINITY); n];
     let mut top = vec![f32::NEG_INFINITY; n];
     let mut show = vec![(0u32, 0u32, 0f32, 0f32, f32::INFINITY); n];
+    // The ground point nearest each cell's centre: a pick's pixel, so the
+    // marker put on it is judged where the pick was.
+    let mut centre = vec![(0u32, 0u32, f64::INFINITY); n];
     for p in pts {
         let Some(i) = g.cell_of(p.point.x as f64, p.point.y as f64) else { continue };
         let h = (p.point.z - zmin[i]) as f64;
         top[i] = top[i].max(p.point.z);
+        if h < 0.2 {
+            let (cx, cy) = g.centre(i);
+            let d = (p.point.x as f64 - cx).hypot(p.point.y as f64 - cy);
+            if d < centre[i].2 {
+                centre[i] = (p.col, p.row, d);
+            }
+        }
         if (BODY.0..=BODY.1).contains(&h) {
             let b = &mut body[i];
             *b = (b.0 + 1, b.1.min(p.point.z), b.2.max(p.point.z));
@@ -423,7 +439,17 @@ pub fn plan(pts: &[GridPoint], grid: (u32, u32), preview: (usize, usize), subjec
     }
 
     // What each candidate would see.
-    let cost = walk(g, &kind);
+    // The walk steps by each cell's ground: the lower quartile of its 0.1 m
+    // cells' ground, so neither a stray low return nor stray returns at body
+    // height wall a cell off.
+    let cells = crate::footing::Cells::new(pts, 0.0, 0.0, radius + crate::station::MARKER_SPREAD + crate::footing::REACH);
+    let height: Vec<f32> = (0..n)
+        .map(|i| {
+            let (x, y) = g.centre(i);
+            cells.ground_in(x - g.cell / 2.0, y - g.cell / 2.0, g.cell).unwrap_or(zmin[i])
+        })
+        .collect();
+    let cost = walk(g, &kind, &height);
     let k = (TRIPOD_CLEAR / g.cell).ceil() as i64;
     let clear = |i: usize| {
         let (r, c) = ((i / SIDE) as i64, (i % SIDE) as i64);
@@ -437,8 +463,8 @@ pub fn plan(pts: &[GridPoint], grid: (u32, u32), preview: (usize, usize), subjec
             })
     };
     let mut stamp = vec![usize::MAX; n];
-    let mut cands: Vec<(usize, Vec<u32>, usize)> = Vec::new();
-    let (mut most, mut tried) = (0usize, 0usize);
+    let mut cands: Vec<(usize, Vec<u32>, usize, crate::footing::Footing)> = Vec::new();
+    let (mut most, mut tried, mut unstandable) = (0usize, 0usize, 0usize);
     for i in 0..n {
         let (x, y) = g.centre(i);
         let d = x.hypot(y);
@@ -446,6 +472,11 @@ pub fn plan(pts: &[GridPoint], grid: (u32, u32), preview: (usize, usize), subjec
             continue;
         }
         tried += 1;
+        let foot = cells.judge(x, y);
+        if foot.why.is_some() {
+            unstandable += 1;
+            continue;
+        }
         let (mut sees, mut shared) = (Vec::new(), 0usize);
         for k in 0..RAYS {
             let a = k as f64 * TAU / RAYS as f64;
@@ -470,46 +501,88 @@ pub fn plan(pts: &[GridPoint], grid: (u32, u32), preview: (usize, usize), subjec
         }
         most = most.max(sees.len());
         if shared >= min_shared {
-            cands.push((i, sees, shared));
+            cands.push((i, sees, shared, foot));
         }
     }
     base["spots_tried"] = json!(tried);
+    base["spots_unstandable"] = json!(unstandable);
     if tried == 0 {
         return with(base, vec![], Some("no open ground reachable from the tripod a step away"), hidden_cells);
     }
+    if unstandable == tried {
+        return with(base, vec![], Some("no spot a step away where a tripod can stand: the ground there is unseen, steep, uneven or cluttered"), hidden_cells);
+    }
     if most < min_gain {
-        return with(base, vec![], Some(none), hidden_cells);
+        let why = if unstandable > 0 { format!("{none} from a spot where a tripod can stand ({unstandable} of {tried} spots tried can't take one)") } else { none.to_string() };
+        return with(base, vec![], Some(&why), hidden_cells);
     }
 
     // Greedy cover.
     let (label, size) = things(&kind);
     let height: Vec<f64> = (0..n).map(|i| if zmin[i].is_finite() { (top[i] - zmin[i]) as f64 } else { 0.0 }).collect();
-    let px = |col: u32, row: u32| {
-        if preview.0 == 0 || preview.1 == 0 || grid.0 == 0 || grid.1 == 0 {
-            return Value::Null;
+    let marks = |col: u32, row: u32| crate::station::pixel_of(col, row, grid, preview);
+    let px = |col: u32, row: u32| marks(col, row).map_or(Value::Null, |(x, y)| json!([x, y]));
+    // What each candidate's pixel shows, in one pass, for the check a marker
+    // put on it gets.
+    let mut shown: std::collections::HashMap<(i64, i64), Vec<&GridPoint>> =
+        cands.iter().filter_map(|c| marks(centre[c.0].0, centre[c.0].1)).map(|at| (at, Vec::new())).collect();
+    if !shown.is_empty() {
+        // Columns and rows to pixels by table, and the pixels wanted by bit:
+        // this pass sees every point.
+        let (cx, ry): (Vec<i64>, Vec<i64>) = (
+            (0..grid.0).map(|c| marks(c, 0).map_or(-1, |p| p.0)).collect(),
+            (0..grid.1).map(|r| marks(0, r).map_or(-1, |p| p.1)).collect(),
+        );
+        let mut want = vec![false; preview.0 * preview.1];
+        for &(x, y) in shown.keys() {
+            want[y as usize * preview.0 + x as usize] = true;
         }
-        let x = (col as f64 * preview.0 as f64 / grid.0 as f64).round() as i64 % preview.0 as i64;
-        let y = (row as f64 * preview.1 as f64 / grid.1 as f64).round().min(preview.1 as f64 - 1.0);
-        json!([x, y as i64])
+        for p in pts {
+            let (Some(&x), Some(&y)) = (cx.get(p.col as usize), ry.get(p.row as usize)) else { continue };
+            if x >= 0 && y >= 0 && want[y as usize * preview.0 + x as usize] {
+                if let Some(v) = shown.get_mut(&(x, y)) {
+                    v.push(p);
+                }
+            }
+        }
+    }
+    let markable = |at: (i64, i64)| {
+        let tries = crate::station::nearest_first(shown.get(&at).map_or(&[][..], |v| &v[..]), grid, preview, at);
+        crate::station::marker_spot(&tries, &cells).is_ok()
     };
     let mut still = hidden.clone();
     let mut still_cells = hidden_cells;
     let mut picks: Vec<(f64, f64)> = Vec::new();
     let mut out = Vec::new();
-    for rank in 1..=PICKS {
+    // Spots whose pixel, marked as the next station, would be refused: one
+    // preview pixel far out spans a metre or more of ground, not all of it
+    // what the spot was judged on.
+    let mut unmarkable = std::collections::HashSet::new();
+    'rank: for rank in 1..=PICKS {
         let gain = |s: &[u32]| s.iter().filter(|&&j| still[j as usize]).count();
-        let best = cands
-            .iter()
-            .filter(|(i, _, _)| {
-                let (x, y) = g.centre(*i);
-                picks.iter().all(|&(px, py)| (px - x).hypot(py - y) >= min_step)
-            })
-            .map(|c| (gain(&c.1), c))
-            .max_by(|(ga, a), (gb, b)| ga.cmp(gb).then(a.2.cmp(&b.2)).then(cost[b.0].cmp(&cost[a.0])));
-        let Some((gained, &(i, ref sees, shared))) = best else { break };
-        if gained < min_gain {
-            break;
-        }
+        let (gained, &(i, ref sees, shared, ref foot)) = loop {
+            let best = cands
+                .iter()
+                .filter(|(i, _, _, _)| {
+                    let (x, y) = g.centre(*i);
+                    !unmarkable.contains(i) && picks.iter().all(|&(px, py)| (px - x).hypot(py - y) >= min_step)
+                })
+                .map(|c| (gain(&c.1), c))
+                .max_by(|(ga, a), (gb, b)| ga.cmp(gb).then(a.2.cmp(&b.2)).then(cost[b.0].cmp(&cost[a.0])));
+            let Some(best) = best else { break 'rank };
+            if best.0 < min_gain {
+                break 'rank;
+            }
+            let (col, row, _) = centre[best.1 .0];
+            if marks(col, row).is_some_and(|at| !markable(at)) {
+                if unmarkable.len() >= MAX_UNMARKABLE {
+                    break 'rank;
+                }
+                unmarkable.insert(best.1 .0);
+                continue;
+            }
+            break best;
+        };
         for &j in sees {
             if still[j as usize] {
                 still[j as usize] = false;
@@ -529,7 +602,7 @@ pub fn plan(pts: &[GridPoint], grid: (u32, u32), preview: (usize, usize), subjec
                 "preview_px": px(col, row),
             })
         });
-        let (col, row) = low[i];
+        let (col, row, _) = centre[i];
         out.push(json!({
             "rank": rank,
             "xy_m": [r1(x), r1(y)],
@@ -537,11 +610,18 @@ pub fn plan(pts: &[GridPoint], grid: (u32, u32), preview: (usize, usize), subjec
             "walk_m": r1(cost[i] as f64 / 10.0 * g.cell),
             "sees_hidden_m2": g.area(gained),
             "shared_surface_m": r1(shared as f64 * g.cell),
+            "slope_deg": r1(foot.slope_deg),
+            "ground_above_floor_m": ((foot.ground_z - floor) * 100.0).round() / 100.0,
             "preview_px": px(col, row),
             "landmark": landmark,
         }));
     }
-    let reason = out.is_empty().then_some("no reachable spot sees the hidden ground and enough of what this station saw");
+    base["spots_unstandable"] = json!(unstandable + unmarkable.len());
+    let reason = out.is_empty().then_some(if unmarkable.is_empty() {
+        "no reachable spot sees the hidden ground and enough of what this station saw"
+    } else {
+        "the spots that would see the hidden ground can't take a tripod where their pixel in the preview shows"
+    });
     with(base, out, reason, still_cells)
 }
 
@@ -582,6 +662,8 @@ mod tests {
     const GRID: (u32, u32) = (4000, 2000);
     const PREVIEW: (usize, usize) = (2000, 1000);
     const STEP: f64 = TAU / 4000.0;
+    /// Level ground under every cell, for the walk.
+    static FLAT: [f32; SIDE * SIDE] = [0.0; SIDE * SIDE];
 
     /// A vertical surface in plan, `top` metres above the ground. `through`
     /// is a mesh fence: the scanner sees past it, a person cannot.
@@ -878,7 +960,7 @@ mod tests {
         let g = Grid { cell: 0.1 };
         let mid = SIDE / 2;
         let at = |r: usize, c: usize| r * SIDE + c;
-        let open_cost = walk(g, &vec![Kind::Ground; SIDE * SIDE]);
+        let open_cost = walk(g, &vec![Kind::Ground; SIDE * SIDE], &FLAT);
         // Over open ground a step costs 10 straight and 14 on the diagonal.
         assert_eq!(open_cost[at(mid, mid + 61)] - open_cost[at(mid, mid + 60)], 10);
         assert_eq!(open_cost[at(mid + 61, mid + 61)] - open_cost[at(mid + 60, mid + 60)], 14);
@@ -896,12 +978,12 @@ mod tests {
                 kind[at(mid + 41, c)] = Kind::Standing;
             }
         }
-        let cost = walk(g, &kind);
+        let cost = walk(g, &kind, &FLAT);
         assert!(cost[at(mid + 39, mid)] < u32::MAX);
         assert_eq!(cost[at(mid + 42, mid + 1)], u32::MAX, "squeezed through the corner");
         // The same with the gaps in line is a door.
         kind[at(mid + 41, mid)] = Kind::Ground;
-        assert!(walk(g, &kind)[at(mid + 42, mid + 1)] < u32::MAX);
+        assert!(walk(g, &kind, &FLAT)[at(mid + 42, mid + 1)] < u32::MAX);
         // A corridor east from the tripod, then one step that is a diagonal
         // past a single post on either corner: the walk goes round it.
         // Open ground all round, so a corner looked up in the wrong place is
@@ -923,7 +1005,7 @@ mod tests {
             let (open, post) = if post_on_row { (at(mid + 1, mid + 40), at(mid, mid + 41)) } else { (at(mid, mid + 41), at(mid + 1, mid + 40)) };
             kind[open] = Kind::Ground;
             kind[post] = Kind::Standing;
-            let cost = walk(g, &kind);
+            let cost = walk(g, &kind, &FLAT);
             assert!(cost[end] < u32::MAX);
             assert_eq!(cost[to], cost[end] + 20, "cut the corner past the post (post on row: {post_on_row})");
         }
@@ -935,10 +1017,79 @@ mod tests {
                 *k = Kind::Standing;
             }
         }
-        let cost = walk(g, &ring);
+        let cost = walk(g, &ring, &FLAT);
         assert!(cost[at(mid, mid + 12)] < u32::MAX);
         assert_eq!(cost[at(mid, mid + 23)], u32::MAX);
         assert_eq!(cost[at(mid + 16, mid + 16)], u32::MAX);
+    }
+
+    #[test]
+    fn the_walk_takes_a_ramp_but_not_a_ledge() {
+        let g = Grid { cell: 0.5 };
+        let mid = SIDE / 2;
+        let at = |r: usize, c: usize| r * SIDE + c;
+        let kind = vec![Kind::Ground; SIDE * SIDE];
+        // East of the tripod the ground climbs 0.3 m a cell (a steep ramp); a
+        // table top, its floor unseen, stands 0.75 m up to the north.
+        let mut low = vec![0f32; SIDE * SIDE];
+        for r in 0..SIDE {
+            for c in mid + 10..mid + 14 {
+                low[at(r, c)] = 0.3 * (c - mid - 9) as f32;
+            }
+            for c in mid + 14..SIDE {
+                low[at(r, c)] = 1.2;
+            }
+        }
+        for r in mid + 10..mid + 20 {
+            for c in mid - 5..mid + 5 {
+                low[at(r, c)] = 0.75;
+            }
+        }
+        let cost = walk(g, &kind, &low);
+        assert!(cost[at(mid, mid + 20)] < u32::MAX, "up the ramp");
+        assert_eq!(cost[at(mid + 15, mid)], u32::MAX, "onto the table");
+        assert!(cost[at(mid + 25, mid)] < u32::MAX, "round the table");
+    }
+
+    #[test]
+    fn ground_the_scan_barely_saw_is_never_a_pick() {
+        // Past 6 m, one return of the ground every 0.5 m: each cell has one,
+        // so it reads as ground, but no footprint has enough to judge.
+        let (walls, solid) = block(10.0);
+        let on = |v: f64| ((v / 0.5).round() * 0.5 - v).abs() < 1e-6;
+        let sparse: Vec<GridPoint> = scene(&walls, &[solid]).into_iter().filter(|p| {
+            let (x, y) = (p.point.x as f64, p.point.y as f64);
+            x.hypot(y) < 6.0 || p.point.z as f64 > GROUND + 0.1 || (on(x) && on(y))
+        }).collect();
+        let p = plan(&sparse, GRID, PREVIEW, None);
+        assert!(picks(&p).is_empty(), "{p}");
+        assert!(p["spots_unstandable"].as_u64().unwrap() > 0, "{p}");
+        assert!(p["reason"].as_str().unwrap().contains("where a tripod can stand"), "{p}");
+        // Seen properly, the same place has picks, each with its slope.
+        let p = plan(&scene(&walls, &[solid]), GRID, PREVIEW, None);
+        assert!(!picks(&p).is_empty(), "{p}");
+        for c in picks(&p) {
+            assert!(c["slope_deg"].as_f64().unwrap() < 1.0 && c["ground_above_floor_m"].as_f64().unwrap().abs() < 0.05, "{c}");
+        }
+    }
+
+    #[test]
+    fn a_marker_on_a_picks_pixel_is_judged_standable_there() {
+        // What the route does with a marker put on each pick's pixel.
+        let (mut walls, solid) = block(10.0);
+        walls.extend(posts(solid));
+        let pts = scene(&walls, &[solid]);
+        let p = plan(&pts, GRID, PREVIEW, None);
+        assert!(!picks(&p).is_empty(), "{p}");
+        for c in picks(&p) {
+            let px = &c["preview_px"];
+            let at = (px[0].as_i64().unwrap(), px[1].as_i64().unwrap());
+            let spot = crate::station::marker_footing(&pts, GRID, PREVIEW, at).unwrap_or_else(|e| panic!("{e}: {c}"));
+            let (x, y) = (spot.x, spot.y);
+            let (cx, cy) = xy(c);
+            // Within the ground's 0.25 m sampling here.
+            assert!((x - cx).hypot(y - cy) < 0.35, "the pixel is {x:.2},{y:.2}, the pick {cx},{cy}");
+        }
     }
 
     #[test]
