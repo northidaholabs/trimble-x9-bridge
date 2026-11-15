@@ -58,7 +58,10 @@ pub(crate) fn range(p: [f32; 3]) -> f64 {
 pub(crate) static DECODED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 fn decode(f: &Path) -> anyhow::Result<Vec<trimble_tzf::GridPoint>> {
-    let t = trimble_tzf::Tzf::open(f).with_context(|| format!("opening {}", f.display()))?;
+    // Stations are decoded `THREADS` at a time; share the cores between them.
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per = (cores / THREADS.load(Ordering::Relaxed).max(1)).max(1);
+    let t = trimble_tzf::Tzf::open(f).with_context(|| format!("opening {}", f.display()))?.with_threads(per);
     let grid = t.grid_points().with_context(|| format!("{}: decoding", f.display()))?;
     #[cfg(test)]
     DECODED.lock().unwrap_or_else(|e| e.into_inner()).push(f.to_path_buf());
