@@ -1879,6 +1879,7 @@ pub(crate) mod tests {
             start_ha_rad: 0.0,
             start_va_rad: 0.0,
             tilt: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            levelling: trimble_tzf::Levelling::Applied,
         }
     }
 

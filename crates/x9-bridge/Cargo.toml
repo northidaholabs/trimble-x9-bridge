@@ -14,7 +14,7 @@ serde_json = { workspace = true }
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 anyhow = { workspace = true }
-trimble-tzf = { git = "https://github.com/northidaholabs/trimble-tzf", rev = "2bd38dd" }
+trimble-tzf = { git = "https://github.com/northidaholabs/trimble-tzf", rev = "6b60812" }
 zune-jpeg = "0.5"
 miniz_oxide = "0.9"
 crc32fast = "1"

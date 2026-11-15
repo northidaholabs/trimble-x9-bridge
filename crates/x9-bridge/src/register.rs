@@ -369,6 +369,16 @@ pub fn set_thread_cap(n: usize) {
     THREAD_CAP.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Points per chunk in [`chunked`]. Fixed, so a sum over chunks doesn't
+/// depend on how many threads ran it.
+const CHUNK: usize = 2048;
+
+/// Run `f` over `0..n` in chunks of [`CHUNK`] on all cores (or the cap),
+/// collecting each chunk's result in order.
+fn chunked<T: Send>(n: usize, f: impl Fn(std::ops::Range<usize>) -> T + Sync) -> Vec<T> {
+    par_map(n.div_ceil(CHUNK), |c| f(c * CHUNK..((c + 1) * CHUNK).min(n)))
+}
+
 /// Run `f` over `0..n` on all cores (or the cap), collecting results in order.
 fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     let cores = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(1);
@@ -702,29 +712,46 @@ fn icp(a: &Prepared, b: &Prepared, theta: f64, t: [f64; 3]) -> Option<Fit> {
     };
     for dmax in [1.0, 0.5, 0.25, 0.12, 0.08, 0.06, 0.05, 0.05] {
         for _ in 0..4 {
+            // Summed per fixed chunk, then the chunks in order: the same
+            // result on any number of threads.
+            let parts = chunked(sample.len(), |range| {
+                let mut ata = [0f64; 16];
+                let mut atb = [0f64; 4];
+                let mut used = 0usize;
+                for &p in &sample[range] {
+                    let q = moved(&x, p);
+                    let Some((j, _)) = a.tree.nearest([q[0] as f32, q[1] as f32, q[2] as f32], dmax as f32) else { continue };
+                    if !a.planar[j] {
+                        continue;
+                    }
+                    let (aq, n) = (a.pts[j], a.normal[j]);
+                    let nn = [n[0] as f64, n[1] as f64, n[2] as f64];
+                    let r = (q[0] - aq[0] as f64) * nn[0] + (q[1] - aq[1] as f64) * nn[1] + (q[2] - aq[2] as f64) * nn[2];
+                    // d(R p)/d turn about the moved point: (-(y - ty), x - tx, 0).
+                    let (rx, ry) = (q[0] - x[1], q[1] - x[2]);
+                    let jrow = [nn[0] * -ry + nn[1] * rx, nn[0], nn[1], nn[2]];
+                    let w = 1.0 / (r.abs() / (dmax / 3.0)).max(1.0);
+                    for i in 0..4 {
+                        for k in 0..4 {
+                            ata[i * 4 + k] += w * jrow[i] * jrow[k];
+                        }
+                        atb[i] -= w * jrow[i] * r;
+                    }
+                    used += 1;
+                }
+                (ata, atb, used)
+            });
             let mut ata = [0f64; 16];
             let mut atb = [0f64; 4];
             let mut used = 0;
-            for &p in &sample {
-                let q = moved(&x, p);
-                let Some((j, _)) = a.tree.nearest([q[0] as f32, q[1] as f32, q[2] as f32], dmax as f32) else { continue };
-                if !a.planar[j] {
-                    continue;
+            for (pa, pb, pu) in parts {
+                for i in 0..16 {
+                    ata[i] += pa[i];
                 }
-                let (aq, n) = (a.pts[j], a.normal[j]);
-                let nn = [n[0] as f64, n[1] as f64, n[2] as f64];
-                let r = (q[0] - aq[0] as f64) * nn[0] + (q[1] - aq[1] as f64) * nn[1] + (q[2] - aq[2] as f64) * nn[2];
-                // d(R p)/d turn about the moved point: (-(y - ty), x - tx, 0).
-                let (rx, ry) = (q[0] - x[1], q[1] - x[2]);
-                let jrow = [nn[0] * -ry + nn[1] * rx, nn[0], nn[1], nn[2]];
-                let w = 1.0 / (r.abs() / (dmax / 3.0)).max(1.0);
                 for i in 0..4 {
-                    for k in 0..4 {
-                        ata[i * 4 + k] += w * jrow[i] * jrow[k];
-                    }
-                    atb[i] -= w * jrow[i] * r;
+                    atb[i] += pb[i];
                 }
-                used += 1;
+                used += pu;
             }
             if used < 200 {
                 return None;
@@ -738,26 +765,39 @@ fn icp(a: &Prepared, b: &Prepared, theta: f64, t: [f64; 3]) -> Option<Fit> {
             }
         }
     }
-    // Final fit over all of B's points, and what holds it.
+    // Final fit over all of B's points, and what holds it (summed per fixed
+    // chunk, then the chunks in order, as above).
+    let parts = chunked(b.pts.len(), |range| {
+        let (mut ss, mut matches) = (0f64, 0usize);
+        let mut info = [0f64; 16];
+        for &p in &b.pts[range] {
+            let q = moved(&x, p);
+            let Some((j, _)) = a.tree.nearest([q[0] as f32, q[1] as f32, q[2] as f32], 0.05) else { continue };
+            if !a.planar[j] {
+                continue;
+            }
+            let (aq, n) = (a.pts[j], a.normal[j]);
+            let nn = [n[0] as f64, n[1] as f64, n[2] as f64];
+            let r = (q[0] - aq[0] as f64) * nn[0] + (q[1] - aq[1] as f64) * nn[1] + (q[2] - aq[2] as f64) * nn[2];
+            ss += r * r;
+            matches += 1;
+            let (rx, ry) = (q[0] - x[1], q[1] - x[2]);
+            let jrow = [(nn[0] * -ry + nn[1] * rx) / TURN_ARM, nn[0], nn[1], nn[2]];
+            for i in 0..4 {
+                for k in 0..4 {
+                    info[i * 4 + k] += jrow[i] * jrow[k];
+                }
+            }
+        }
+        (ss, matches, info)
+    });
     let (mut ss, mut matches) = (0f64, 0usize);
     let mut info = [0f64; 16];
-    for &p in &b.pts {
-        let q = moved(&x, p);
-        let Some((j, _)) = a.tree.nearest([q[0] as f32, q[1] as f32, q[2] as f32], 0.05) else { continue };
-        if !a.planar[j] {
-            continue;
-        }
-        let (aq, n) = (a.pts[j], a.normal[j]);
-        let nn = [n[0] as f64, n[1] as f64, n[2] as f64];
-        let r = (q[0] - aq[0] as f64) * nn[0] + (q[1] - aq[1] as f64) * nn[1] + (q[2] - aq[2] as f64) * nn[2];
-        ss += r * r;
-        matches += 1;
-        let (rx, ry) = (q[0] - x[1], q[1] - x[2]);
-        let jrow = [(nn[0] * -ry + nn[1] * rx) / TURN_ARM, nn[0], nn[1], nn[2]];
-        for i in 0..4 {
-            for k in 0..4 {
-                info[i * 4 + k] += jrow[i] * jrow[k];
-            }
+    for (ps, pm, pi) in parts {
+        ss += ps;
+        matches += pm;
+        for i in 0..16 {
+            info[i] += pi[i];
         }
     }
     (matches > 0).then(|| Fit { x, rms: (ss / matches as f64).sqrt(), overlap: matches as f64 / b.pts.len().max(1) as f64, matches, info })
