@@ -1,0 +1,193 @@
+#!/bin/sh
+# Bring the bridge on this machine up to the newest release, when it is idle.
+#
+#   x9-bridge-update               update if there is a newer release and the bridge is idle
+#   x9-bridge-update --check       say what it would do; change nothing
+#   x9-bridge-update --tag v0.21.0 install that release, newer or older (to go back)
+#   x9-bridge-update --force       skip the idle checks
+#
+# Idle means no scan or processing job queued or running, no recipe run in
+# progress, and no scanner connected (a connected scanner means a visit; in
+# the field the Pi is on the scanner's Wi-Fi with no internet anyway).
+# The release archive's sha256 is checked before anything changes. After the
+# restart it waits for /v1/health to report the new version; if that doesn't
+# happen it puts the previous binary and scripts back and restarts again.
+# It keeps the replaced binary as x9-bridge.vOLD and the newest
+# X9_UPDATE_KEEP of those (default 3, "all" keeps every one).
+#
+# Runs as root (ops/x9-bridge-update.timer). Settings, all optional, in
+# /etc/x9-bridge/update.env:
+#   X9_UPDATE_REPO   default northidaholabs/trimble-x9-bridge
+#   X9_UPDATE_KEEP   default 3
+#   BRIDGE_URL       default http://127.0.0.1:8795
+# It asks the bridge whether it is idle with the first viewer token in
+# /etc/x9-bridge/tokens, else the first agent token.
+set -eu
+[ ! -r /etc/x9-bridge/update.env ] || . /etc/x9-bridge/update.env
+REPO=${X9_UPDATE_REPO:-northidaholabs/trimble-x9-bridge}
+KEEP=${X9_UPDATE_KEEP:-3}
+URL=${BRIDGE_URL:-http://127.0.0.1:8795}
+DIR=${X9_BRIDGE_DIR:-/opt/x9-bridge}
+TOKENS=${X9_TOKENS:-/etc/x9-bridge/tokens}
+UNITS=${X9_UNITS:-/etc/systemd/system}
+SERVICE=x9-bridge
+# Scripts that live beside the binary and come with each release. Only the
+# ones already installed are replaced.
+SCRIPTS="x9-bridge-run x9-wifi-prefer x9-bridge-update"
+
+check=0 force=0 want=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --check) check=1 ;;
+    --force) force=1 ;;
+    --tag) want=${2:?--tag needs a release, e.g. v0.21.0}; shift ;;
+    -h | --help) sed -n '2,24p' "$0"; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+say() { echo "x9-bridge-update: $*"; }
+
+case $(uname -m) in
+  aarch64 | arm64) target=aarch64-unknown-linux-gnu ;;
+  x86_64) target=x86_64-unknown-linux-gnu ;;
+  *) say "no release is built for $(uname -m)"; exit 1 ;;
+esac
+
+tmp=$(mktemp -d /dev/shm/x9-update.XXXXXX 2>/dev/null || mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+chmod 700 "$tmp"
+
+health() {
+  curl -sf -m 5 "$URL/v1/health" 2>/dev/null |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || true
+}
+
+# Prints why the bridge is not idle, or nothing when it is.
+busy() {
+  tok=$(awk '$2 == "viewer" { print $3; exit }' "$TOKENS" 2>/dev/null || true)
+  [ -n "$tok" ] || tok=$(awk '$2 == "agent" { print $3; exit }' "$TOKENS" 2>/dev/null || true)
+  [ -n "$tok" ] || { echo "there is no viewer or agent token in $TOKENS to ask the bridge with"; return; }
+  # The token goes in a header file, not on the command line.
+  (umask 077; printf 'Authorization: Bearer %s\n' "$tok" > "$tmp/auth")
+  for p in status jobs runs; do
+    curl -sf -m 10 -H @"$tmp/auth" "$URL/v1/$p" > "$tmp/$p.json" 2>/dev/null ||
+      { echo "the bridge did not answer /v1/$p"; return; }
+  done
+  python3 - "$tmp" <<'PY' 2>/dev/null || echo "couldn't read the bridge's answers"
+import json, os, sys
+d = sys.argv[1]
+load = lambda n: json.load(open(os.path.join(d, n + ".json")))
+why = []
+if (load("status").get("scanner") or {}).get("connected"):
+    why.append("a scanner is connected")
+jobs = sum(j.get("state") in ("queued", "running", "awaiting_approval") for j in load("jobs"))
+if jobs:
+    why.append(f"{jobs} job(s) queued or running")
+runs = sum(r.get("state") not in ("succeeded", "failed", "cancelled") for r in load("runs"))
+if runs:
+    why.append(f"{runs} recipe run(s) in progress")
+print("; ".join(why))
+PY
+}
+
+# The backups to remove so that only the newest KEEP remain.
+prunable() {
+  [ "$KEEP" != all ] || return 0
+  ls "$DIR" | sed -n 's/^x9-bridge\.v\([0-9][0-9.]*\)$/\1/p' | sort -V |
+    awk -v keep="$KEEP" '{ v[NR] = $0 } END { for (i = 1; i <= NR - keep; i++) print v[i] }'
+}
+
+newer() { # is $1 newer than $2
+  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]
+}
+
+cur=$(health)
+explicit=0
+if [ -n "$want" ]; then
+  explicit=1
+else
+  # The latest release, from where github.com/.../releases/latest redirects.
+  loc=$(curl -sI -m 15 -o /dev/null -w '%{redirect_url}' "https://github.com/$REPO/releases/latest" 2>/dev/null || true)
+  want=${loc##*/}
+  [ -n "$want" ] || { say "can't reach GitHub; trying again later"; exit 0; }
+fi
+case $want in v[0-9]*) ;; *) say "not a release tag: $want"; exit 1 ;; esac
+new=${want#v}
+
+if [ -z "$cur" ]; then
+  if [ "$force" = 0 ]; then say "the bridge isn't answering on $URL; not updating (--force installs $want anyway)"; exit 1; fi
+  cur=unknown
+fi
+if [ "$new" = "$cur" ]; then say "up to date ($cur)"; exit 0; fi
+if [ "$explicit" = 0 ] && [ "$cur" != unknown ] && ! newer "$new" "$cur"; then say "running $cur, newer than the latest release ($new); leaving it"; exit 0; fi
+
+why=
+[ "$force" = 1 ] || why=$(busy)
+if [ "$check" = 1 ]; then
+  say "would update $cur -> $new${why:+, but not now: $why}"
+  old=$(prunable | sed 's/^/v/' | tr '\n' ' ')
+  [ -z "$old" ] || say "would remove older backups: $old(keeping $KEEP)"
+  exit 0
+fi
+[ -z "$why" ] || { say "$new is out, not updating now: $why"; exit 0; }
+
+f=trimble-x9-bridge-$want-$target
+base=https://github.com/$REPO/releases/download/$want
+say "downloading $f"
+curl -sfL -m 600 -o "$tmp/$f.tar.gz" "$base/$f.tar.gz" &&
+  curl -sfL -m 60 -o "$tmp/$f.tar.gz.sha256" "$base/$f.tar.gz.sha256" ||
+  { say "couldn't download $want for $target"; exit 1; }
+(cd "$tmp" && sha256sum -c --status "$f.tar.gz.sha256") || { say "$f.tar.gz doesn't match its sha256; not installing"; exit 1; }
+tar -xzf "$tmp/$f.tar.gz" -C "$tmp"
+pkg=$tmp/$f
+[ -x "$pkg/x9-bridge" ] || { say "the archive has no x9-bridge"; exit 1; }
+
+# The download took a while; look again.
+[ "$force" = 1 ] || why=$(busy)
+[ -z "$why" ] || { say "$new is out, not updating now: $why"; exit 0; }
+
+# Replace by rename, so a running copy (this script included) keeps its file.
+put() { cp "$1" "$DIR/.$2.new" && chmod 0755 "$DIR/.$2.new" && mv -f "$DIR/.$2.new" "$DIR/$2"; }
+mkdir "$tmp/prev"
+cp -p "$DIR/x9-bridge" "$tmp/prev/"
+for s in $SCRIPTS; do [ ! -f "$DIR/$s" ] || cp -p "$DIR/$s" "$tmp/prev/"; done
+[ "$cur" = unknown ] || [ -e "$DIR/x9-bridge.v$cur" ] || cp -p "$DIR/x9-bridge" "$DIR/x9-bridge.v$cur"
+
+put "$pkg/x9-bridge" x9-bridge
+for s in $SCRIPTS; do
+  if [ -f "$DIR/$s" ] && [ -f "$pkg/ops/$s" ] && ! cmp -s "$pkg/ops/$s" "$DIR/$s"; then
+    put "$pkg/ops/$s" "$s"
+    say "updated $s"
+  fi
+done
+systemctl restart "$SERVICE"
+
+# x9-bridge-run looks for a scanner link for up to 30 s before it starts.
+wait_for() {
+  i=0
+  while [ $i -lt 45 ]; do
+    sleep 2
+    [ "$(health)" != "$1" ] || return 0
+    i=$((i + 1))
+  done
+  return 1
+}
+if ! wait_for "$new"; then
+  say "$new didn't come up (health: $(health || true)); putting $cur back"
+  for s in x9-bridge $SCRIPTS; do [ ! -f "$tmp/prev/$s" ] || put "$tmp/prev/$s" "$s"; done
+  systemctl restart "$SERVICE"
+  if wait_for "$cur"; then say "back on $cur"; else say "$cur isn't answering either; see journalctl -u $SERVICE"; fi
+  exit 1
+fi
+say "updated $cur -> $new"
+
+for v in $(prunable); do rm -f "$DIR/x9-bridge.v$v" && say "removed the x9-bridge.v$v backup"; done
+
+# Unit files are not changed here. Say when the release's differ, comments aside.
+for u in x9-bridge.service x9-wifi-prefer.service x9-wifi-prefer.timer x9-bridge-update.service x9-bridge-update.timer usb-gadget-ncm.service; do
+  if [ -f "$UNITS/$u" ] && [ -f "$pkg/ops/$u" ] && [ "$(grep -v '^#' "$pkg/ops/$u")" != "$(grep -v '^#' "$UNITS/$u")" ]; then
+    say "$u in $new differs from $UNITS/$u; left as it is (see ops/README.md)"
+  fi
+done

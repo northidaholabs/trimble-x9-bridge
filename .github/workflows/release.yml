@@ -1,6 +1,10 @@
 name: release
 on:
   push:
+    # A push to main whose version has no tag yet releases it: the plan job
+    # tags the commit and the build job builds it. A tag pushed by hand
+    # releases too. (The workflow's own tag push starts no second run.)
+    branches: [main]
     tags: ["v*"]
   # Rebuild some platforms for a tag that is already released, for example
   # when a runner image is retired mid-release. Other platforms' archives on
@@ -17,16 +21,22 @@ on:
         default: macos
 permissions:
   contents: write
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.plan.outputs.tag }}
       matrix: ${{ steps.plan.outputs.matrix }}
+      build: ${{ steps.plan.outputs.build }}
     steps:
+      - uses: actions/checkout@v4
       - id: plan
         env:
           EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
           INPUT_TAG: ${{ inputs.tag }}
           PLATFORMS: ${{ inputs.platforms }}
@@ -41,15 +51,31 @@ jobs:
             tag=$INPUT_TAG
             case "$tag" in v[0-9]*) ;; *) echo "not a version tag: $tag"; exit 1 ;; esac
             want=${PLATFORMS:-macos}
+          elif [ "$REF_TYPE" = branch ]; then
+            scripts/version.sh --check
+            tag=v$(scripts/version.sh)
+            if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+              echo "$tag is already tagged; nothing to release"
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "$tag" "$GITHUB_SHA"
+            git push origin "refs/tags/$tag"
+            echo "tagged $GITHUB_SHA as $tag"
+            want=all
           else
             tag=$REF_NAME; want=all
           fi
           matrix=$(jq -c --arg w "$want" '[.[] | select($w == "all" or .family == $w)]' <<<"$all")
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "build=true" >> "$GITHUB_OUTPUT"
           echo "$tag: $matrix"
   build:
     needs: plan
+    if: needs.plan.outputs.build == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -94,6 +120,7 @@ jobs:
           mkdir -p $d/ops
           cp target/${{ matrix.target }}/release/{x9-bridge,x9-mock,x9} $d/
           cp ops/x9-netctl ops/90-x9-bridge ops/x9-bridge-run ops/x9-bridge.service ops/x9-wifi-prefer ops/x9-wifi-prefer.service ops/x9-wifi-prefer.timer \
+             ops/x9-bridge-update ops/x9-bridge-update.service ops/x9-bridge-update.timer \
              ops/usb-gadget-ncm ops/usb-gadget-ncm.service ops/86-usb-gadget-managed.rules ops/x9link-dnsmasq.conf ops/setup-nm-profiles ops/env.example ops/README.md $d/ops/
           cp -r README.md PROVENANCE.md LICENSE NOTICE docs $d/
           tar -czf $d.tar.gz $d

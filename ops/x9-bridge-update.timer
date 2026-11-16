@@ -1,0 +1,10 @@
+[Unit]
+Description=Look for a bridge release 10 minutes after boot and every 6 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

@@ -152,6 +152,33 @@ Check: `curl -s http://10.55.0.1:8795/v1/health` from the laptop prints the
 version; with a token, `/v1/status` shows `"connected": true` when the
 scanner is on.
 
+### Updates
+
+`x9-bridge-update` brings the bridge up to the newest release when it is
+idle: no job queued or running, no recipe run in progress, and no scanner
+connected. It checks the archive's sha256, replaces the binary and the
+scripts beside it, restarts the bridge, and waits for `/v1/health` to report
+the new version. If that doesn't happen, it puts the previous binary back.
+The replaced binary stays as `x9-bridge.vOLD`, and the newest three of those
+are kept. The timer looks 10 minutes after boot and every 6 hours. In the
+field the Pi is on the scanner's Wi-Fi with no internet, so it finds nothing.
+
+```bash
+sudo install -m 0755 ops/x9-bridge-update -t /opt/x9-bridge/
+sudo install -m 0644 ops/x9-bridge-update.service ops/x9-bridge-update.timer /etc/systemd/system/
+sudo systemctl enable --now x9-bridge-update.timer
+```
+
+By hand: `sudo /opt/x9-bridge/x9-bridge-update --check` says what it would
+do, `--tag v0.21.0` installs that release (to go back), and `--force` skips
+the idle checks. `journalctl -u x9-bridge-update` shows what each run did.
+It asks the bridge whether it is idle with the first `viewer` token in
+`/etc/x9-bridge/tokens`, else the `agent` one; a line such as
+`updater viewer <token>` gives it its own. Unit files are left alone; when a
+release's differ from the installed ones, it says so. Settings
+(`X9_UPDATE_KEEP`, `X9_UPDATE_REPO`, `BRIDGE_URL`) go in
+`/etc/x9-bridge/update.env`.
+
 ## 5. The MCP server
 
 The agent drives the bridge through
