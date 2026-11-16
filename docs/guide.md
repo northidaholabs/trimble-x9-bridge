@@ -55,7 +55,7 @@ a `.sha256` file. It contains:
 | `x9-bridge` | The bridge service |
 | `x9-mock` | The scanner simulator ([tools.md](tools.md#x9-mock)) |
 | `x9` | A small CLI over the scanner API ([tools.md](tools.md#the-x9-cli)) |
-| `ops/` | The field-kit build: the bridge service and launcher, the USB-C gadget, NetworkManager profiles, the scanner Wi-Fi preference, `env.example` and `README.md` (a step-by-step build of a field Pi) |
+| `ops/` | The field-kit build: the bridge service and launcher, the USB-C gadget, NetworkManager profiles, the scanner Wi-Fi preference, the updater (`x9-bridge-update`), `env.example` and `README.md` (a step-by-step build of a field Pi) |
 | `docs/` | This guide and the other docs |
 | `README.md`, `PROVENANCE.md`, `LICENSE`, `NOTICE` | |
 

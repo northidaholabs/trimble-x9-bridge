@@ -1,0 +1,13 @@
+# Updates the bridge to the newest release when it is idle (ops/x9-bridge-update).
+# Install (ops/README.md, "Updates"):
+#   sudo install -m 0755 ops/x9-bridge-update -t /opt/x9-bridge/
+#   sudo install -m 0644 ops/x9-bridge-update.service ops/x9-bridge-update.timer /etc/systemd/system/
+#   sudo systemctl enable --now x9-bridge-update.timer
+[Unit]
+Description=Update the X9 bridge to the newest release when it is idle
+Wants=network-online.target
+After=network-online.target x9-bridge.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/x9-bridge/x9-bridge-update

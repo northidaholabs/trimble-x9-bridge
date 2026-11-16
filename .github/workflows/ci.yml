@@ -19,6 +19,8 @@ jobs:
           python-version: "3.13"
       - run: pip install jsonschema==4.23.0
       - run: python3 specs/list-mission/check.py
+      # The version's five places agree (scripts/version.sh).
+      - run: scripts/version.sh --check
   coverage:
     # Line coverage of unit and end-to-end tests. Reported in the job summary
     # and as an artifact; nothing is sent to an outside service.

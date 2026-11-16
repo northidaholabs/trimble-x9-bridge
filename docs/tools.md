@@ -335,3 +335,14 @@ fail on the numbers even when the bridge works.
 `.github/workflows/ci.yml` runs `cargo test --locked`, a release build, and
 `e2e.py` without fixtures on every push and pull request.
 `.github/workflows/release.yml` builds the release archives for tags `v*`.
+
+### Releases
+
+`scripts/release.sh` (or `minor`, or a version such as `0.22.0`) sets the
+version in its five places with `scripts/version.sh`, and opens a pull
+request named for the tag. Merging it releases: on the push to main, the
+release workflow finds a version with no tag yet, tags the merge commit, and
+builds and attaches every platform's archive. `--merge` also waits for the
+checks and merges. CI's `specs` job runs `scripts/version.sh --check`, so a
+version changed by hand in one place but not the others fails there.
+Field Pis pick the release up by themselves (`ops/README.md`, "Updates").
